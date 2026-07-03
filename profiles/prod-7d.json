@@ -1,0 +1,70 @@
+{
+  "name": "prod-7d",
+  "derived_from": {
+    "baseline": "art-baseline.json",
+    "captured_at": "2026-07-02",
+    "prod_app_version": "1.181.0-release-20260630.2",
+    "window": "7d"
+  },
+  "prod_scale_reference": {
+    "active_zero_clients_avg": 668,
+    "active_zero_clients_peak": 1147,
+    "note": "use these as --connections targets when asking capacity questions; per-client behavior below is already prod-rate"
+  },
+  "scale_factor": 1.0,
+  "knobs": {
+    "lifecycle": true,
+    "churn_ms": 186866,
+    "mutations_per_min": 0.0568,
+    "session_mean_s": 1003.1,
+    "abrupt_pct": 0.872,
+    "working_set": 15,
+    "resume_pct": 0.9,
+    "zombie_pct": 0.1,
+    "retire_pct": 0.15
+  },
+  "derivation": {
+    "churn": "2162008 zero_query_called / 7d / 668 avg clients = 0.321/min/client (one per 187s)",
+    "mutations": "382778 zero_mutation_called / 7d / 668 = 0.0568/min/client",
+    "session": "Little's law: 668 avg concurrent * 7d / 530228 connections = 16.7 min mean",
+    "abrupt": "81062 zero_socket_disconnected / 522110 websocket_connection_closed = 87.2%"
+  },
+  "caveats": [
+    "session length is a MEAN via Little's law; the true distribution is heavy-tailed (tab-hide closes: p50 85s, p99 976s vs 16.7min mean) \u2014 replay draws expovariate(mean), which under-represents both very short and multi-hour sessions",
+    "zero_query_called treats every reactive call as a swap (upper bound)",
+    "zombie/retire are NOT prod-mined (no client-side signal); replay defaults kept",
+    "prod-cadence runs need duration >= 15-30min for meaningful churn/mutation sample counts"
+  ],
+  "layer_b": {
+    "source": "raw/session_profile_7d.json (mined 2026-07-03, zero-scoped)",
+    "session": "Little's law over zero_socket_connected: 668 avg concurrent * 7d / 402772 = 16.7 min mean",
+    "abrupt": "observable zero-socket ends: 73328 network-loss giveups vs 10719 clean tab-hides (unobservable ends are also abrupt)",
+    "working_set": "p50 distinct query types per cgid per day = 15",
+    "resume": "p50 cgid connects 20x/day -> nearly every connect is a cookie-resume reconnect",
+    "conns_per_cgid_per_day": {
+      "n": 2375,
+      "p25": 5,
+      "p50": 20,
+      "p75": 45,
+      "p90": 62,
+      "p99": 111,
+      "max": 698,
+      "mean": 27.5
+    },
+    "tab_hide_session_duration_ms": {
+      "p25": 63467.0,
+      "p50": 85243.0,
+      "p75": 156775.0,
+      "p95": 436157.0,
+      "p99": 976157.0,
+      "mean": 155371.47289859128,
+      "n": 10719.0
+    },
+    "connection_attempts_to_success": {
+      "p50": 2.0,
+      "p90": 2.0,
+      "p99": 11.0,
+      "mx": 76.0
+    }
+  }
+}

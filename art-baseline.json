@@ -1,0 +1,3647 @@
+{
+  "art_version": "2.0.0",
+  "name": "Xyne Spaces / zero-cache Application Regression Test baseline (full breadth, 7-day)",
+  "description": "Production-derived workload + SLO baseline covering EVERY query, mutation, and one-shot observed in 7 days of PROD telemetry. Replay this workload (or shadow-compare against it) when validating major changes to zero-cache, the ZQL/IVM query engine, the Zero schema, or the backend; gate on the server SLOs and health thresholds.",
+  "provenance": {
+    "source": "Grafana / Victoria Logs (ds 8) + VictoriaMetrics (ds 7) @ grafana.spaces.xyne.juspay.net",
+    "captured_at": "2026-07-02",
+    "window_counts": "7d (168h) \u2014 full breadth + weekly weights",
+    "window_client_latency": "72h \u2014 7d quantile aggregation over ~3.5M events overloads the log backend",
+    "window_server_histograms": "7d increase (ivm_advance: 1h rate fallback)",
+    "prod_app_version": "1.181.0-release-20260630.2",
+    "retention_note": "7 full days of logs are present. Weekly query volume (2.16M) < 24h*7 because of the weekend dip (~308k/weekend-day vs ~506k/weekday).",
+    "containers": [
+      "xyne-logging-bridge",
+      "xyne-spaces-zero",
+      "xyne-backend"
+    ]
+  },
+  "scale_7d": {
+    "distinct_users": 1544,
+    "distinct_client_group_ids": 6206,
+    "active_zero_clients_avg": 668,
+    "active_zero_clients_peak": 1147,
+    "platform_split_by_query_events": {
+      "electron": {
+        "users": 1419,
+        "cgids": 3932,
+        "events": 1534734
+      },
+      "android": {
+        "users": 403,
+        "cgids": 0,
+        "events": 187207
+      },
+      "web": {
+        "users": 420,
+        "cgids": 965,
+        "events": 185164
+      },
+      "native": {
+        "users": 191,
+        "cgids": 398,
+        "events": 143249
+      },
+      "mobile": {
+        "users": 360,
+        "cgids": 924,
+        "events": 75584
+      },
+      "ios": {
+        "users": 42,
+        "cgids": 0,
+        "events": 36232
+      }
+    },
+    "primary_platform": "electron"
+  },
+  "event_volume_7d": {
+    "api_call_successful": 9061307,
+    "zero_query_called": 2260822,
+    "zero_query_complete": 2162080,
+    "zero_run_called": 425626,
+    "zero_run_complete": 408873,
+    "zero_mutation_called": 382778,
+    "zero_mutation_complete": 364548,
+    "zero_mutation_error": 20026,
+    "websocket_connection_failed": 1803364,
+    "websocket_connection_successful": 530228,
+    "websocket_connection_closed": 522110,
+    "zero_socket_disconnected": 81062,
+    "frontend_error": 894693,
+    "api_call_failed": 192102,
+    "conversation_prefetch_error": 142407
+  },
+  "health_gates": {
+    "_comment": "Derived rates over 7d that the ART must not let regress.",
+    "query_completion_rate": {
+      "value": 0.9563,
+      "num": "zero_query_complete",
+      "den": "zero_query_called",
+      "min_pass": 0.86
+    },
+    "run_completion_rate": {
+      "value": 0.9606,
+      "num": "zero_run_complete",
+      "den": "zero_run_called",
+      "min_pass": 0.88
+    },
+    "mutation_completion_rate": {
+      "value": 0.9524,
+      "num": "zero_mutation_complete",
+      "den": "zero_mutation_called",
+      "min_pass": 0.92
+    },
+    "mutation_error_rate": {
+      "value": 0.0523,
+      "num": "zero_mutation_error",
+      "den": "zero_mutation_called",
+      "max_pass": 0.08
+    },
+    "api_success_rate": {
+      "value": 0.9792,
+      "num": "api_call_successful",
+      "den": "api_call_successful+api_call_failed",
+      "min_pass": 0.95
+    },
+    "backend_log_error_rate": {
+      "value": 0.00348,
+      "num": "backend level:error",
+      "den": "all backend log lines (7d)",
+      "max_pass": 0.01
+    },
+    "socket_failure_ratio_watch": {
+      "value": 3.4,
+      "definition": "websocket_connection_failed / websocket_connection_successful",
+      "note": "Retry-inflated; WATCH not hard-fail. Alert if it worsens >30% vs baseline."
+    }
+  },
+  "server_baselines_ms": {
+    "_comment": "PRIMARY regression signal. zero-cache engine histograms. window=7d increase (ivm_advance=1h rate). A major change must not push p95/p99 past pass_p95/pass_p99.",
+    "zero_sync_hydration_time": {
+      "p50": 20.84,
+      "p95": 1252.34,
+      "p99": 5380.07,
+      "pass_p95": 1502.81,
+      "pass_p99": 6725.09
+    },
+    "zero_sync_advance_time": {
+      "p50": 1.23,
+      "p95": 14.42,
+      "p99": 41.69,
+      "pass_p95": 17.3,
+      "pass_p99": 52.11
+    },
+    "zero_sync_ivm_advance_time": {
+      "p50": 0.55,
+      "p95": 3.04,
+      "p99": 9.19,
+      "pass_p95": 3.65,
+      "pass_p99": 11.49
+    },
+    "zero_sync_poke_time": {
+      "p50": 70.28,
+      "p95": 549.94,
+      "p99": 1604.7,
+      "pass_p95": 659.93,
+      "pass_p99": 2005.88
+    },
+    "zero_sync_cvr_flush_time": {
+      "p50": 29.84,
+      "p95": 370.08,
+      "p99": 481.28,
+      "pass_p95": 444.1,
+      "pass_p99": 601.6
+    },
+    "zero_sync_query_transformation_time": {
+      "p50": 18.5,
+      "p95": 101.9,
+      "p99": 931.17,
+      "pass_p95": 122.28,
+      "pass_p99": 1163.96
+    },
+    "_pass_margin": "pass_p95 = p95*1.20 ; pass_p99 = p99*1.25"
+  },
+  "query_workload": {
+    "_comment": "ALL reactive query types (zero_query_complete). weight_pct = calls_7d / total. args = full argument schema. p*_ms are 72h and CONTAMINATED by backgrounded tabs / socket reconnects (see caveats) \u2014 use p50 as the robust client signal; gate engine regressions on server_baselines_ms. 'watch':true = p95>5s or p99>30s.",
+    "window_counts": "7d",
+    "window_latency": "72h",
+    "total_reactive_calls_7d": 2162008,
+    "distinct_query_types": 151,
+    "coverage": {
+      "queries_for_80pct": 18,
+      "queries_for_95pct": 42
+    },
+    "queries": [
+      {
+        "name": "subTicketsByMappedTicketId",
+        "calls_7d": 296617,
+        "weight_pct": 13.7195,
+        "args": [
+          "mappedTicketId"
+        ],
+        "p50_ms": 148.3,
+        "p95_ms": 1021.4,
+        "p99_ms": 4574.1,
+        "max_ms": 1437040.9
+      },
+      {
+        "name": "channelConversationsPaginatedV3",
+        "calls_7d": 270982,
+        "weight_pct": 12.5338,
+        "args": [
+          "channelId",
+          "direction",
+          "isMember",
+          "limit",
+          "start"
+        ],
+        "p50_ms": 215.1,
+        "p95_ms": 1291.9,
+        "p99_ms": 10118.7,
+        "max_ms": 87932474.6,
+        "also_oneshot_calls_7d": 312827
+      },
+      {
+        "name": "userBookmarks",
+        "calls_7d": 188041,
+        "weight_pct": 8.6975,
+        "args": [],
+        "p50_ms": 49.1,
+        "p95_ms": 8980.1,
+        "p99_ms": 18688.4,
+        "max_ms": 42977992.9,
+        "watch": true
+      },
+      {
+        "name": "channelLatestMultipleConversationsV3",
+        "calls_7d": 157436,
+        "weight_pct": 7.2819,
+        "args": [
+          "channelId",
+          "isMember",
+          "limit"
+        ],
+        "p50_ms": 283.0,
+        "p95_ms": 1569.7,
+        "p99_ms": 9591.4,
+        "max_ms": 46501977.0
+      },
+      {
+        "name": "threadConversation",
+        "calls_7d": 148100,
+        "weight_pct": 6.8501,
+        "args": [
+          "channelId",
+          "conversationId",
+          "isMember"
+        ],
+        "p50_ms": 158.3,
+        "p95_ms": 914.4,
+        "p99_ms": 3675.7,
+        "max_ms": 1720536.3
+      },
+      {
+        "name": "activeCallsInChannel",
+        "calls_7d": 140676,
+        "weight_pct": 6.5067,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 280.3,
+        "p95_ms": 1225.8,
+        "p99_ms": 5704.4,
+        "max_ms": 4331035.2
+      },
+      {
+        "name": "conversationParticipantByConversationId",
+        "calls_7d": 133677,
+        "weight_pct": 6.183,
+        "args": [
+          "conversationId"
+        ],
+        "p50_ms": 159.6,
+        "p95_ms": 900.0,
+        "p99_ms": 3481.9,
+        "max_ms": 1720535.5
+      },
+      {
+        "name": "getCanvas",
+        "calls_7d": 57980,
+        "weight_pct": 2.6818,
+        "args": [
+          "canvasId"
+        ],
+        "p50_ms": 155.9,
+        "p95_ms": 1121.9,
+        "p99_ms": 4480.3,
+        "max_ms": 6524920.2
+      },
+      {
+        "name": "getAllUserGroups",
+        "calls_7d": 56830,
+        "weight_pct": 2.6286,
+        "args": [
+          "lastUpdatedAt"
+        ],
+        "p50_ms": 276.3,
+        "p95_ms": 14448.7,
+        "p99_ms": 167833.7,
+        "max_ms": 66101025.0,
+        "watch": true,
+        "also_oneshot_calls_7d": 9259
+      },
+      {
+        "name": "ticketByIdV2",
+        "calls_7d": 53109,
+        "weight_pct": 2.4565,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 179.6,
+        "p95_ms": 1200.4,
+        "p99_ms": 4262.2,
+        "max_ms": 1436930.9
+      },
+      {
+        "name": "attachmentsByTicket",
+        "calls_7d": 41130,
+        "weight_pct": 1.9024,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 177.2,
+        "p95_ms": 1133.1,
+        "p99_ms": 4614.3,
+        "max_ms": 1437051.2
+      },
+      {
+        "name": "userChannelSections",
+        "calls_7d": 40730,
+        "weight_pct": 1.8839,
+        "args": [],
+        "p50_ms": 32.7,
+        "p95_ms": 947.6,
+        "p99_ms": 5755.9,
+        "max_ms": 1437781.8
+      },
+      {
+        "name": "userActivitiesPaginatedV2",
+        "calls_7d": 37056,
+        "weight_pct": 1.714,
+        "args": [
+          "classification",
+          "isRead",
+          "limit",
+          "start",
+          "types"
+        ],
+        "p50_ms": 342.6,
+        "p95_ms": 11677.9,
+        "p99_ms": 83817.1,
+        "max_ms": 74725428.8,
+        "watch": true,
+        "also_oneshot_calls_7d": 8707
+      },
+      {
+        "name": "channelParticipants",
+        "calls_7d": 27157,
+        "weight_pct": 1.2561,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 977.0,
+        "p95_ms": 14664.4,
+        "p99_ms": 94979.3,
+        "max_ms": 46501993.7,
+        "watch": true,
+        "also_oneshot_calls_7d": 10
+      },
+      {
+        "name": "dmChannelsLatestMessagesPaginated",
+        "calls_7d": 26436,
+        "weight_pct": 1.2228,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 1031.0,
+        "p95_ms": 22608.3,
+        "p99_ms": 168918.9,
+        "max_ms": 40882987.7,
+        "watch": true,
+        "also_oneshot_calls_7d": 5207
+      },
+      {
+        "name": "userActiveCalls",
+        "calls_7d": 26038,
+        "weight_pct": 1.2043,
+        "args": [],
+        "p50_ms": 2844.7,
+        "p95_ms": 20725.8,
+        "p99_ms": 123220.4,
+        "max_ms": 40882747.8,
+        "watch": true,
+        "also_oneshot_calls_7d": 161
+      },
+      {
+        "name": "getConversationByIdWithChannel",
+        "calls_7d": 25144,
+        "weight_pct": 1.163,
+        "args": [
+          "channelId",
+          "conversationId",
+          "isMember"
+        ],
+        "p50_ms": 236.2,
+        "p95_ms": 2000.6,
+        "p99_ms": 7954.7,
+        "max_ms": 893579.7,
+        "also_oneshot_calls_7d": 363
+      },
+      {
+        "name": "kanbanTicketsPage",
+        "calls_7d": 23799,
+        "weight_pct": 1.1008,
+        "args": [
+          "boardId",
+          "columnType",
+          "dynamicFieldDateRanges",
+          "filters",
+          "formEntityValueFieldIds",
+          "groupBy",
+          "limit",
+          "projectId",
+          "showOverdueOnly",
+          "stageName",
+          "start",
+          "viewMode"
+        ],
+        "p50_ms": 38.0,
+        "p95_ms": 7162.4,
+        "p99_ms": 31174.2,
+        "max_ms": 27576677.6,
+        "watch": true
+      },
+      {
+        "name": "userUnreadActivities",
+        "calls_7d": 23136,
+        "weight_pct": 1.0701,
+        "args": [],
+        "p50_ms": 809.3,
+        "p95_ms": 18557.5,
+        "p99_ms": 162860.3,
+        "max_ms": 74725442.1,
+        "watch": true,
+        "also_oneshot_calls_7d": 20261
+      },
+      {
+        "name": "scopedCollections",
+        "calls_7d": 21087,
+        "weight_pct": 0.9753,
+        "args": [
+          "scopeId",
+          "scopeType"
+        ],
+        "p50_ms": 324.1,
+        "p95_ms": 1069.6,
+        "p99_ms": 1444.9,
+        "max_ms": 143151.7
+      },
+      {
+        "name": "userMissedCalls",
+        "calls_7d": 18491,
+        "weight_pct": 0.8553,
+        "args": [],
+        "p50_ms": 1133.4,
+        "p95_ms": 17282.5,
+        "p99_ms": 88556.4,
+        "max_ms": 40882701.0,
+        "watch": true
+      },
+      {
+        "name": "userAllChannels",
+        "calls_7d": 17927,
+        "weight_pct": 0.8292,
+        "args": [
+          "lastUpdatedAt",
+          "updatedAt"
+        ],
+        "p50_ms": 1546.1,
+        "p95_ms": 16442.4,
+        "p99_ms": 384036.1,
+        "max_ms": 66101020.0,
+        "watch": true,
+        "also_oneshot_calls_7d": 336
+      },
+      {
+        "name": "getUsersV2",
+        "calls_7d": 17339,
+        "weight_pct": 0.802,
+        "args": [
+          "lastUpdatedAt",
+          "updatedAt"
+        ],
+        "p50_ms": 2144.1,
+        "p95_ms": 30171.4,
+        "p99_ms": 624505.8,
+        "max_ms": 66100835.0,
+        "watch": true,
+        "also_oneshot_calls_7d": 357
+      },
+      {
+        "name": "userDrafts",
+        "calls_7d": 14632,
+        "weight_pct": 0.6768,
+        "args": [],
+        "p50_ms": 1808.0,
+        "p95_ms": 43266.6,
+        "p99_ms": 876734.1,
+        "max_ms": 42977933.6,
+        "watch": true
+      },
+      {
+        "name": "getUserAssignmentStatesByUserId",
+        "calls_7d": 14340,
+        "weight_pct": 0.6633,
+        "args": [
+          "userId"
+        ],
+        "p50_ms": 99.1,
+        "p95_ms": 4382.5,
+        "p99_ms": 18423.7,
+        "max_ms": 1437788.3
+      },
+      {
+        "name": "userConversationsPaginatedV2",
+        "calls_7d": 13505,
+        "weight_pct": 0.6247,
+        "args": [
+          "limit",
+          "start",
+          "userId"
+        ],
+        "p50_ms": 171.3,
+        "p95_ms": 1060.4,
+        "p99_ms": 4500.5,
+        "max_ms": 12599815.6,
+        "also_oneshot_calls_7d": 8
+      },
+      {
+        "name": "getEmailChannelPreference",
+        "calls_7d": 13474,
+        "weight_pct": 0.6232,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 68.3,
+        "p95_ms": 1335.0,
+        "p99_ms": 5038.7,
+        "max_ms": 3853862.9
+      },
+      {
+        "name": "getUserProfile",
+        "calls_7d": 12747,
+        "weight_pct": 0.5896,
+        "args": [
+          "userId"
+        ],
+        "p50_ms": 319.7,
+        "p95_ms": 15363.6,
+        "p99_ms": 8482654.9,
+        "max_ms": 270038873.3,
+        "watch": true
+      },
+      {
+        "name": "getUserGroupMembers",
+        "calls_7d": 12422,
+        "weight_pct": 0.5746,
+        "args": [
+          "userGroupId"
+        ],
+        "p50_ms": 415.5,
+        "p95_ms": 1832.2,
+        "p99_ms": 2413.6,
+        "max_ms": 8741.1
+      },
+      {
+        "name": "hierarchyCanvases",
+        "calls_7d": 11973,
+        "weight_pct": 0.5538,
+        "args": [
+          "channelId",
+          "folderId",
+          "includeQuartoDocs",
+          "scope"
+        ],
+        "p50_ms": 172.5,
+        "p95_ms": 3361.0,
+        "p99_ms": 9411.2,
+        "max_ms": 4270717.4
+      },
+      {
+        "name": "conversationMessagesV2",
+        "calls_7d": 11814,
+        "weight_pct": 0.5464,
+        "args": [
+          "conversationId"
+        ],
+        "p50_ms": 519.3,
+        "p95_ms": 13194.1,
+        "p99_ms": 32514.4,
+        "max_ms": 3233206.2,
+        "watch": true,
+        "also_oneshot_calls_7d": 2637
+      },
+      {
+        "name": "boardDetailById",
+        "calls_7d": 11637,
+        "weight_pct": 0.5382,
+        "args": [
+          "boardId"
+        ],
+        "p50_ms": 115.3,
+        "p95_ms": 1500.6,
+        "p99_ms": 5945.1,
+        "max_ms": 1364612.1
+      },
+      {
+        "name": "stagesByBoard",
+        "calls_7d": 11124,
+        "weight_pct": 0.5145,
+        "args": [
+          "boardId"
+        ],
+        "p50_ms": 189.8,
+        "p95_ms": 1365.6,
+        "p99_ms": 4491.1,
+        "max_ms": 1364612.2
+      },
+      {
+        "name": "getFormMappingByContextId",
+        "calls_7d": 10032,
+        "weight_pct": 0.464,
+        "args": [
+          "contextId",
+          "contextType",
+          "entityType"
+        ],
+        "p50_ms": 152.9,
+        "p95_ms": 1301.8,
+        "p99_ms": 4490.0,
+        "max_ms": 1364611.2
+      },
+      {
+        "name": "channelCanvasFolders",
+        "calls_7d": 9543,
+        "weight_pct": 0.4414,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 139.1,
+        "p95_ms": 3258.2,
+        "p99_ms": 8215.0,
+        "max_ms": 3191692.5
+      },
+      {
+        "name": "ticketActivities",
+        "calls_7d": 9532,
+        "weight_pct": 0.4409,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 296.9,
+        "p95_ms": 1489.9,
+        "p99_ms": 5370.5,
+        "max_ms": 1364611.2
+      },
+      {
+        "name": "getFormEntityValuesByEntityId",
+        "calls_7d": 9250,
+        "weight_pct": 0.4278,
+        "args": [
+          "entityId"
+        ],
+        "p50_ms": 263.9,
+        "p95_ms": 1762.1,
+        "p99_ms": 6466.8,
+        "max_ms": 1364688.4
+      },
+      {
+        "name": "ticketDetailsByIdV2",
+        "calls_7d": 9154,
+        "weight_pct": 0.4234,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 263.3,
+        "p95_ms": 1747.8,
+        "p99_ms": 6376.0,
+        "max_ms": 1364692.5
+      },
+      {
+        "name": "subTicketsForTicket",
+        "calls_7d": 9047,
+        "weight_pct": 0.4185,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 270.5,
+        "p95_ms": 1789.2,
+        "p99_ms": 6544.4,
+        "max_ms": 1364688.4
+      },
+      {
+        "name": "getCurrentUserPreference",
+        "calls_7d": 9047,
+        "weight_pct": 0.4185,
+        "args": [],
+        "p50_ms": 725.3,
+        "p95_ms": 5834.7,
+        "p99_ms": 265270.6,
+        "max_ms": 34100535.7,
+        "watch": true
+      },
+      {
+        "name": "getUserGroupMappingsByUserId",
+        "calls_7d": 8728,
+        "weight_pct": 0.4037,
+        "args": [],
+        "p50_ms": 757.4,
+        "p95_ms": 6280.2,
+        "p99_ms": 265272.6,
+        "max_ms": 34100538.0,
+        "watch": true
+      },
+      {
+        "name": "userDelayedMessages",
+        "calls_7d": 8481,
+        "weight_pct": 0.3923,
+        "args": [],
+        "p50_ms": 815.7,
+        "p95_ms": 6279.3,
+        "p99_ms": 384701.9,
+        "max_ms": 34100537.0,
+        "watch": true
+      },
+      {
+        "name": "userVisibleChannelsV3",
+        "calls_7d": 8481,
+        "weight_pct": 0.3923,
+        "args": [],
+        "p50_ms": 818.7,
+        "p95_ms": 6291.3,
+        "p99_ms": 384703.4,
+        "max_ms": 34100538.3,
+        "watch": true
+      },
+      {
+        "name": "userCallHistory",
+        "calls_7d": 7988,
+        "weight_pct": 0.3695,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 6018.7,
+        "p95_ms": 33716.6,
+        "p99_ms": 620135.6,
+        "max_ms": 40882748.8,
+        "watch": true,
+        "also_oneshot_calls_7d": 466
+      },
+      {
+        "name": "channelRecaps",
+        "calls_7d": 7913,
+        "weight_pct": 0.366,
+        "args": [
+          "channelIds",
+          "recapDate"
+        ],
+        "p50_ms": 69.7,
+        "p95_ms": 3384.3,
+        "p99_ms": 16684.1,
+        "max_ms": 5910814.9
+      },
+      {
+        "name": "userScheduledCalls",
+        "calls_7d": 7878,
+        "weight_pct": 0.3644,
+        "args": [],
+        "p50_ms": 6045.9,
+        "p95_ms": 33785.4,
+        "p99_ms": 649070.7,
+        "max_ms": 40882748.4,
+        "watch": true,
+        "also_oneshot_calls_7d": 161
+      },
+      {
+        "name": "userVisibleChannelsV2",
+        "calls_7d": 7278,
+        "weight_pct": 0.3366,
+        "args": [],
+        "p50_ms": 5158.6,
+        "p95_ms": 28248.1,
+        "p99_ms": 187284.3,
+        "max_ms": 40881661.2,
+        "watch": true
+      },
+      {
+        "name": "boardsListByProject",
+        "calls_7d": 5416,
+        "weight_pct": 0.2505,
+        "args": [
+          "projectId"
+        ],
+        "p50_ms": 200.6,
+        "p95_ms": 4951.3,
+        "p99_ms": 25104.2,
+        "max_ms": 256672.7
+      },
+      {
+        "name": "getDraftForConversation",
+        "calls_7d": 4208,
+        "weight_pct": 0.1946,
+        "args": [
+          "conversationId"
+        ],
+        "p50_ms": 217.4,
+        "p95_ms": 1426.1,
+        "p99_ms": 4848.5,
+        "max_ms": 79438.8
+      },
+      {
+        "name": "getMessageForActivityV2",
+        "calls_7d": 3916,
+        "weight_pct": 0.1811,
+        "args": [
+          "messageId"
+        ],
+        "p50_ms": 331.8,
+        "p95_ms": 1489.6,
+        "p99_ms": 4833.6,
+        "max_ms": 11739.3
+      },
+      {
+        "name": "projectById",
+        "calls_7d": 3091,
+        "weight_pct": 0.143,
+        "args": [
+          "projectId"
+        ],
+        "p50_ms": 192.9,
+        "p95_ms": 1042.6,
+        "p99_ms": 3273.4,
+        "max_ms": 12478.0
+      },
+      {
+        "name": "projectTagsByProjectId",
+        "calls_7d": 2841,
+        "weight_pct": 0.1314,
+        "args": [
+          "projectId"
+        ],
+        "p50_ms": 141.6,
+        "p95_ms": 5241.0,
+        "p99_ms": 20049.9,
+        "max_ms": 313838.5,
+        "watch": true
+      },
+      {
+        "name": "lookupValuesByType",
+        "calls_7d": 2452,
+        "weight_pct": 0.1134,
+        "args": [
+          "type"
+        ],
+        "p50_ms": 166.5,
+        "p95_ms": 6356.1,
+        "p99_ms": 42205.0,
+        "max_ms": 267698.5,
+        "watch": true
+      },
+      {
+        "name": "channelStats",
+        "calls_7d": 2303,
+        "weight_pct": 0.1065,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 210.7,
+        "p95_ms": 3433.8,
+        "p99_ms": 48313.9,
+        "max_ms": 9995401.1,
+        "watch": true,
+        "also_oneshot_calls_7d": 47587
+      },
+      {
+        "name": "getAllProjects",
+        "calls_7d": 2246,
+        "weight_pct": 0.1039,
+        "args": [],
+        "p50_ms": 157.8,
+        "p95_ms": 1580.5,
+        "p99_ms": 5893.1,
+        "max_ms": 52987.9
+      },
+      {
+        "name": "ticketsByIds",
+        "calls_7d": 2009,
+        "weight_pct": 0.0929,
+        "args": [
+          "ticketIds"
+        ],
+        "p50_ms": 152.8,
+        "p95_ms": 972.7,
+        "p99_ms": 4143.0,
+        "max_ms": 64230.3
+      },
+      {
+        "name": "projectCanvasFolders",
+        "calls_7d": 1917,
+        "weight_pct": 0.0887,
+        "args": [
+          "projectId"
+        ],
+        "p50_ms": 193.6,
+        "p95_ms": 64800.5,
+        "p99_ms": 1839112.8,
+        "max_ms": 64752905.3,
+        "watch": true
+      },
+      {
+        "name": "supportTicketDetail",
+        "calls_7d": 1917,
+        "weight_pct": 0.0887,
+        "args": [
+          "channelId",
+          "id",
+          "isMember",
+          "workspaceId",
+          "xyneId"
+        ],
+        "p50_ms": 271.9,
+        "p95_ms": 1425.8,
+        "p99_ms": 7063.1,
+        "max_ms": 79504.1
+      },
+      {
+        "name": "collectionItems",
+        "calls_7d": 1897,
+        "weight_pct": 0.0877,
+        "args": [
+          "collectionId"
+        ],
+        "p50_ms": 65.4,
+        "p95_ms": 991.7,
+        "p99_ms": 2390.2,
+        "max_ms": 143141.3
+      },
+      {
+        "name": "supportTicketsPageV3",
+        "calls_7d": 1825,
+        "weight_pct": 0.0844,
+        "args": [
+          "channelId",
+          "dir",
+          "isMember",
+          "limit",
+          "start"
+        ],
+        "p50_ms": 159.5,
+        "p95_ms": 1825.4,
+        "p99_ms": 5388.8,
+        "max_ms": 3853795.7,
+        "also_oneshot_calls_7d": 282
+      },
+      {
+        "name": "userVisibleEmailChannels",
+        "calls_7d": 1821,
+        "weight_pct": 0.0842,
+        "args": [],
+        "p50_ms": 8718.8,
+        "p95_ms": 2272110.0,
+        "p99_ms": 16123079.1,
+        "max_ms": 110990064.6,
+        "watch": true
+      },
+      {
+        "name": "ticketById",
+        "calls_7d": 1754,
+        "weight_pct": 0.0811,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 327.1,
+        "p95_ms": 12352.2,
+        "p99_ms": 563387.0,
+        "max_ms": 563393.7,
+        "watch": true
+      },
+      {
+        "name": "getConversationById",
+        "calls_7d": 1406,
+        "weight_pct": 0.065,
+        "args": [
+          "conversationId"
+        ],
+        "p50_ms": 460.4,
+        "p95_ms": 10926.8,
+        "p99_ms": 37014.4,
+        "max_ms": 573268.4,
+        "watch": true
+      },
+      {
+        "name": "channelParticipantsPaginated",
+        "calls_7d": 1395,
+        "weight_pct": 0.0645,
+        "args": [
+          "channelId",
+          "limit",
+          "start"
+        ],
+        "p50_ms": 192.1,
+        "p95_ms": 872.0,
+        "p99_ms": 3147.4,
+        "max_ms": 18427.9
+      },
+      {
+        "name": "userEmailSignatures",
+        "calls_7d": 1293,
+        "weight_pct": 0.0598,
+        "args": [],
+        "p50_ms": 32.7,
+        "p95_ms": 1606.4,
+        "p99_ms": 4112.2,
+        "max_ms": 47425.2
+      },
+      {
+        "name": "collectionSubfolders",
+        "calls_7d": 1203,
+        "weight_pct": 0.0556,
+        "args": [
+          "rootCollectionId"
+        ],
+        "p50_ms": 101.1,
+        "p95_ms": 895.6,
+        "p99_ms": 2562.6,
+        "max_ms": 143141.6
+      },
+      {
+        "name": "conversationMessages",
+        "calls_7d": 1166,
+        "weight_pct": 0.0539,
+        "args": [
+          "conversationId"
+        ],
+        "p50_ms": 526.0,
+        "p95_ms": 10252.8,
+        "p99_ms": 22479.6,
+        "max_ms": 23810.3,
+        "watch": true
+      },
+      {
+        "name": "getStagesByBoardIds",
+        "calls_7d": 1105,
+        "weight_pct": 0.0511,
+        "args": [
+          "boardIds"
+        ],
+        "p50_ms": 594.5,
+        "p95_ms": 1804.1,
+        "p99_ms": 5370.0,
+        "max_ms": 36780.9
+      },
+      {
+        "name": "savedConfigsByBoard",
+        "calls_7d": 1067,
+        "weight_pct": 0.0494,
+        "args": [
+          "boardId"
+        ],
+        "p50_ms": 151.1,
+        "p95_ms": 5440.6,
+        "p99_ms": 22056.9,
+        "max_ms": 313812.6,
+        "watch": true
+      },
+      {
+        "name": "getChannelUserStatus",
+        "calls_7d": 960,
+        "weight_pct": 0.0444,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 237.2,
+        "p95_ms": 2173.6,
+        "p99_ms": 695538.3,
+        "max_ms": 9995399.7,
+        "watch": true
+      },
+      {
+        "name": "searchChannelParticipants",
+        "calls_7d": 902,
+        "weight_pct": 0.0417,
+        "args": [
+          "channelId",
+          "searchQuery"
+        ],
+        "p50_ms": 111.8,
+        "p95_ms": 442.1,
+        "p99_ms": 1753.6,
+        "max_ms": 10082.8
+      },
+      {
+        "name": "getStageTransitionsByBoardId",
+        "calls_7d": 824,
+        "weight_pct": 0.0381,
+        "args": [
+          "boardId"
+        ],
+        "p50_ms": 52.5,
+        "p95_ms": 2005.1,
+        "p99_ms": 12137.1,
+        "max_ms": 8150785.3,
+        "also_oneshot_calls_7d": 133
+      },
+      {
+        "name": "projectsByIds",
+        "calls_7d": 801,
+        "weight_pct": 0.037,
+        "args": [
+          "projectIds"
+        ],
+        "p50_ms": 687.5,
+        "p95_ms": 4410.3,
+        "p99_ms": 10507.5,
+        "max_ms": 4270718.4
+      },
+      {
+        "name": "myChannelParticipations",
+        "calls_7d": 775,
+        "weight_pct": 0.0358,
+        "args": [],
+        "p50_ms": 753.5,
+        "p95_ms": 12556.5,
+        "p99_ms": 925054.8,
+        "max_ms": 4270718.1,
+        "watch": true
+      },
+      {
+        "name": "personalCanvasFolders",
+        "calls_7d": 731,
+        "weight_pct": 0.0338,
+        "args": [],
+        "p50_ms": 723.2,
+        "p95_ms": 4705.2,
+        "p99_ms": 10496.0,
+        "max_ms": 4270717.6
+      },
+      {
+        "name": "automationsList",
+        "calls_7d": 651,
+        "weight_pct": 0.0301,
+        "args": [
+          "workspaceId"
+        ],
+        "p50_ms": 152.6,
+        "p95_ms": 1596.9,
+        "p99_ms": 3118.4,
+        "max_ms": 15628.7
+      },
+      {
+        "name": "getAllAppsPaginated",
+        "calls_7d": 631,
+        "weight_pct": 0.0292,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 124.3,
+        "p95_ms": 580.4,
+        "p99_ms": 4387.2,
+        "max_ms": 30487.4
+      },
+      {
+        "name": "getBoardById",
+        "calls_7d": 586,
+        "weight_pct": 0.0271,
+        "args": [
+          "boardId"
+        ],
+        "p50_ms": 38.7,
+        "p95_ms": 2128.6,
+        "p99_ms": 10613.4,
+        "max_ms": 174540.8
+      },
+      {
+        "name": "automationById",
+        "calls_7d": 563,
+        "weight_pct": 0.026,
+        "args": [
+          "id",
+          "workspaceId"
+        ],
+        "p50_ms": 113.1,
+        "p95_ms": 1010.0,
+        "p99_ms": 7676.5,
+        "max_ms": 59920.0
+      },
+      {
+        "name": "ticketDetailsById",
+        "calls_7d": 487,
+        "weight_pct": 0.0225,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 292.9,
+        "p95_ms": 1797.7,
+        "p99_ms": 18972.2,
+        "max_ms": 559865.6
+      },
+      {
+        "name": "getWorkspaceInstalledApps",
+        "calls_7d": 431,
+        "weight_pct": 0.0199,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 140.4,
+        "p95_ms": 78378.9,
+        "p99_ms": 466281.1,
+        "max_ms": 5013879.3,
+        "watch": true
+      },
+      {
+        "name": "getAllBoardsList",
+        "calls_7d": 419,
+        "weight_pct": 0.0194,
+        "args": [],
+        "p50_ms": 49.4,
+        "p95_ms": 1604.6,
+        "p99_ms": 9780.0,
+        "max_ms": 9780.3
+      },
+      {
+        "name": "supportTicketsFilteredV3",
+        "calls_7d": 405,
+        "weight_pct": 0.0187,
+        "args": [
+          "assignedTo",
+          "channelId",
+          "isMember"
+        ],
+        "p50_ms": 22.6,
+        "p95_ms": 3207.2,
+        "p99_ms": 16181.1,
+        "max_ms": 174078.3
+      },
+      {
+        "name": "userRecordings",
+        "calls_7d": 371,
+        "weight_pct": 0.0172,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 820.1,
+        "p95_ms": 6237.3,
+        "p99_ms": 9484.6,
+        "max_ms": 109882.6,
+        "watch": true
+      },
+      {
+        "name": "boardFullDetailById",
+        "calls_7d": 333,
+        "weight_pct": 0.0154,
+        "args": [
+          "boardId"
+        ],
+        "p50_ms": 10.9,
+        "p95_ms": 419.1,
+        "p99_ms": 2377.5,
+        "max_ms": 7241.0
+      },
+      {
+        "name": "getFormsByContextType",
+        "calls_7d": 294,
+        "weight_pct": 0.0136,
+        "args": [
+          "contextType"
+        ],
+        "p50_ms": 26.4,
+        "p95_ms": 906.1,
+        "p99_ms": 1997.1,
+        "max_ms": 9779.2
+      },
+      {
+        "name": "savedConfigsByUser",
+        "calls_7d": 265,
+        "weight_pct": 0.0123,
+        "args": [
+          "userId"
+        ],
+        "p50_ms": 58.3,
+        "p95_ms": 2925.6,
+        "p99_ms": 41048.0,
+        "max_ms": 210680.3,
+        "watch": true
+      },
+      {
+        "name": "getWorkflowForTicket",
+        "calls_7d": 252,
+        "weight_pct": 0.0117,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 372.0,
+        "p95_ms": 2031.8,
+        "p99_ms": 14305.0,
+        "max_ms": 30701.6
+      },
+      {
+        "name": "getUserProfilesByIds",
+        "calls_7d": 245,
+        "weight_pct": 0.0113,
+        "args": [
+          "userIds"
+        ],
+        "p50_ms": 127.8,
+        "p95_ms": 571.9,
+        "p99_ms": 1178.3,
+        "max_ms": 2858.4
+      },
+      {
+        "name": "getOrgApps",
+        "calls_7d": 226,
+        "weight_pct": 0.0105,
+        "args": [
+          "limit",
+          "orgId",
+          "start"
+        ],
+        "p50_ms": 119.8,
+        "p95_ms": 54143.1,
+        "p99_ms": 279183.7,
+        "max_ms": 5011291.1,
+        "watch": true
+      },
+      {
+        "name": "applicationsByProjectId",
+        "calls_7d": 212,
+        "weight_pct": 0.0098,
+        "args": [
+          "projectId"
+        ],
+        "p50_ms": 115.3,
+        "p95_ms": 1809.0,
+        "p99_ms": 6222.1,
+        "max_ms": 10568.0
+      },
+      {
+        "name": "getPinnedMessegesV2",
+        "calls_7d": 211,
+        "weight_pct": 0.0098,
+        "args": [
+          "channelId",
+          "isMember"
+        ],
+        "p50_ms": 164.3,
+        "p95_ms": 574.4,
+        "p99_ms": 770.8,
+        "max_ms": 1851.7
+      },
+      {
+        "name": "getClassificationMappings",
+        "calls_7d": 203,
+        "weight_pct": 0.0094,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 1456.1,
+        "p95_ms": 6516.9,
+        "p99_ms": 25801.5,
+        "max_ms": 38172.2,
+        "watch": true
+      },
+      {
+        "name": "getConversationAttachements",
+        "calls_7d": 164,
+        "weight_pct": 0.0076,
+        "args": [
+          "channelId",
+          "direction",
+          "limit",
+          "start"
+        ],
+        "p50_ms": 355.2,
+        "p95_ms": 1474.6,
+        "p99_ms": 2421.7,
+        "max_ms": 3022.7
+      },
+      {
+        "name": "channelLatestConversation",
+        "calls_7d": 163,
+        "weight_pct": 0.0075,
+        "args": [
+          "channelId",
+          "isMember"
+        ],
+        "p50_ms": 155.7,
+        "p95_ms": 572.2,
+        "p99_ms": 951.0,
+        "max_ms": 1597.3
+      },
+      {
+        "name": "getWorkspaceById",
+        "calls_7d": 160,
+        "weight_pct": 0.0074,
+        "args": [
+          "workspaceId"
+        ],
+        "p50_ms": 187.7,
+        "p95_ms": 1073.8,
+        "p99_ms": 19003.8,
+        "max_ms": 140664.0
+      },
+      {
+        "name": "stagesByBoards",
+        "calls_7d": 159,
+        "weight_pct": 0.0074,
+        "args": [
+          "boardType",
+          "projectId"
+        ],
+        "p50_ms": 46.2,
+        "p95_ms": 964.1,
+        "p99_ms": 1909.8,
+        "max_ms": 4976.9
+      },
+      {
+        "name": "getAllFormsList",
+        "calls_7d": 157,
+        "weight_pct": 0.0073,
+        "args": [],
+        "p50_ms": 132.7,
+        "p95_ms": 598.0,
+        "p99_ms": 1044.0,
+        "max_ms": 1165.9
+      },
+      {
+        "name": "userCanvasesPaginated",
+        "calls_7d": 147,
+        "weight_pct": 0.0068,
+        "args": [
+          "includeQuartoDocs",
+          "limit",
+          "start"
+        ],
+        "p50_ms": 872.1,
+        "p95_ms": 9678.8,
+        "p99_ms": 14889.4,
+        "max_ms": 14889.4,
+        "watch": true
+      },
+      {
+        "name": "ticketsByProject",
+        "calls_7d": 122,
+        "weight_pct": 0.0056,
+        "args": [
+          "projectId"
+        ],
+        "p50_ms": 64.0,
+        "p95_ms": 2402.9,
+        "p99_ms": 35986.3,
+        "max_ms": 35986.3,
+        "watch": true
+      },
+      {
+        "name": "channelLinks",
+        "calls_7d": 122,
+        "weight_pct": 0.0056,
+        "args": [
+          "channelId"
+        ],
+        "p50_ms": 155.6,
+        "p95_ms": 576.5,
+        "p99_ms": 1761.7,
+        "max_ms": 1761.7
+      },
+      {
+        "name": "getFormFieldsByFormId",
+        "calls_7d": 102,
+        "weight_pct": 0.0047,
+        "args": [
+          "formId"
+        ],
+        "p50_ms": 178.0,
+        "p95_ms": 892.3,
+        "p99_ms": 1914.7,
+        "max_ms": 1914.7
+      },
+      {
+        "name": "releaseTicketsByProjectId",
+        "calls_7d": 100,
+        "weight_pct": 0.0046,
+        "args": [
+          "projectId"
+        ],
+        "p50_ms": 48.7,
+        "p95_ms": 740.8,
+        "p99_ms": 4977.8,
+        "max_ms": 4977.8
+      },
+      {
+        "name": "ticketsQueryV2",
+        "calls_7d": 95,
+        "weight_pct": 0.0044,
+        "args": [
+          "boardId",
+          "viewMode"
+        ],
+        "p50_ms": 6098.7,
+        "p95_ms": 85763.4,
+        "p99_ms": 189860.9,
+        "max_ms": 189860.9,
+        "watch": true
+      },
+      {
+        "name": "getAllResources",
+        "calls_7d": 93,
+        "weight_pct": 0.0043,
+        "args": [],
+        "p50_ms": 104.0,
+        "p95_ms": 518.5,
+        "p99_ms": 2921.0,
+        "max_ms": 2921.0
+      },
+      {
+        "name": "getResourceAccessForUser",
+        "calls_7d": 93,
+        "weight_pct": 0.0043,
+        "args": [
+          "userId"
+        ],
+        "p50_ms": 109.8,
+        "p95_ms": 518.4,
+        "p99_ms": 2921.2,
+        "max_ms": 2921.2
+      },
+      {
+        "name": "attachmentsByInitialMessage",
+        "calls_7d": 89,
+        "weight_pct": 0.0041,
+        "args": [
+          "initialMessageId"
+        ],
+        "p50_ms": 305.5,
+        "p95_ms": 1790.8,
+        "p99_ms": 6165.2,
+        "max_ms": 6165.2
+      },
+      {
+        "name": "getTicketStageRequests",
+        "calls_7d": 88,
+        "weight_pct": 0.0041,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 172.9,
+        "p95_ms": 891.5,
+        "p99_ms": 1914.3,
+        "max_ms": 1914.3,
+        "also_oneshot_calls_7d": 15
+      },
+      {
+        "name": "getAllDashboards",
+        "calls_7d": 85,
+        "weight_pct": 0.0039,
+        "args": [],
+        "p50_ms": 15.7,
+        "p95_ms": 369.6,
+        "p99_ms": 10392.7,
+        "max_ms": 10392.7
+      },
+      {
+        "name": "releaseAttributionsByTicketId",
+        "calls_7d": 71,
+        "weight_pct": 0.0033,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 111.7,
+        "p95_ms": 425.4,
+        "p99_ms": 510.9,
+        "max_ms": 510.9
+      },
+      {
+        "name": "rcaByTicketId",
+        "calls_7d": 70,
+        "weight_pct": 0.0032,
+        "args": [
+          "ticketId"
+        ],
+        "p50_ms": 114.3,
+        "p95_ms": 426.1,
+        "p99_ms": 511.8,
+        "max_ms": 511.8
+      },
+      {
+        "name": "ticketsQuery",
+        "calls_7d": 69,
+        "weight_pct": 0.0032,
+        "args": [
+          "viewMode"
+        ],
+        "p50_ms": 561.3,
+        "p95_ms": 22056.6,
+        "p99_ms": 52129.2,
+        "max_ms": 52129.2,
+        "watch": true
+      },
+      {
+        "name": "userConversationsPaginated",
+        "calls_7d": 60,
+        "weight_pct": 0.0028,
+        "args": [
+          "limit",
+          "start",
+          "userId"
+        ],
+        "p50_ms": 703.6,
+        "p95_ms": 15120.3,
+        "p99_ms": 15160.4,
+        "max_ms": 15160.4,
+        "watch": true
+      },
+      {
+        "name": "userSentMessagesPaginated",
+        "calls_7d": 59,
+        "weight_pct": 0.0027,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 209.3,
+        "p95_ms": 2925.2,
+        "p99_ms": 5843.5,
+        "max_ms": 5843.5
+      },
+      {
+        "name": "applicationReleaseTicketsByReleaseId",
+        "calls_7d": 59,
+        "weight_pct": 0.0027,
+        "args": [
+          "limit",
+          "releaseId",
+          "start"
+        ],
+        "p50_ms": 225.1,
+        "p95_ms": 1480.8,
+        "p99_ms": 1910.2,
+        "max_ms": 1910.2,
+        "also_oneshot_calls_7d": 1
+      },
+      {
+        "name": "releaseChangeFormValuesByReleaseId",
+        "calls_7d": 59,
+        "weight_pct": 0.0027,
+        "args": [
+          "releaseId"
+        ],
+        "p50_ms": 224.6,
+        "p95_ms": 1480.3,
+        "p99_ms": 1910.1,
+        "max_ms": 1910.1
+      },
+      {
+        "name": "releaseChangesByReleaseId",
+        "calls_7d": 59,
+        "weight_pct": 0.0027,
+        "args": [
+          "releaseId"
+        ],
+        "p50_ms": 224.8,
+        "p95_ms": 1480.3,
+        "p99_ms": 1910.2,
+        "max_ms": 1910.2
+      },
+      {
+        "name": "getAllTicketTags",
+        "calls_7d": 55,
+        "weight_pct": 0.0025,
+        "args": [],
+        "p50_ms": 531.2,
+        "p95_ms": 40421.7,
+        "p99_ms": 52129.1,
+        "max_ms": 52129.1,
+        "watch": true
+      },
+      {
+        "name": "getDashboardById",
+        "calls_7d": 50,
+        "weight_pct": 0.0023,
+        "args": [
+          "dashboardId"
+        ],
+        "p50_ms": 105.0,
+        "p95_ms": 585.9,
+        "p99_ms": 2048.6,
+        "max_ms": 2048.6
+      },
+      {
+        "name": "getUserExpertiseMappings",
+        "calls_7d": 47,
+        "weight_pct": 0.0022,
+        "args": [
+          "boardId",
+          "userGroupId"
+        ],
+        "p50_ms": 187.7,
+        "p95_ms": 1265.8,
+        "p99_ms": 10636.1,
+        "max_ms": 10636.1
+      },
+      {
+        "name": "userUnreadThreadActivities",
+        "calls_7d": 36,
+        "weight_pct": 0.0017,
+        "args": [],
+        "p50_ms": 58.7,
+        "p95_ms": 336.4,
+        "p99_ms": 868.6,
+        "max_ms": 868.6
+      },
+      {
+        "name": "canvasParticipants",
+        "calls_7d": 32,
+        "weight_pct": 0.0015,
+        "args": [
+          "canvasId"
+        ],
+        "p50_ms": 191.3,
+        "p95_ms": 24053.3,
+        "p99_ms": 550079.8,
+        "max_ms": 550079.8,
+        "watch": true
+      },
+      {
+        "name": "getConversationByCallId",
+        "calls_7d": 31,
+        "weight_pct": 0.0014,
+        "args": [
+          "callId"
+        ],
+        "p50_ms": 151.3,
+        "p95_ms": 2467.1,
+        "p99_ms": 3481.6,
+        "max_ms": 3481.6
+      },
+      {
+        "name": "canvasVersions",
+        "calls_7d": 28,
+        "weight_pct": 0.0013,
+        "args": [
+          "canvasId"
+        ],
+        "p50_ms": 27412.0,
+        "p95_ms": 538535.7,
+        "p99_ms": 6269770.3,
+        "max_ms": 6269770.3,
+        "watch": true
+      },
+      {
+        "name": "channelCanvasesPaginated",
+        "calls_7d": 26,
+        "weight_pct": 0.0012,
+        "args": [
+          "channelId",
+          "includeQuartoDocs",
+          "limit",
+          "start"
+        ],
+        "p50_ms": 426.2,
+        "p95_ms": 25078.2,
+        "p99_ms": 25078.2,
+        "max_ms": 25078.2,
+        "watch": true
+      },
+      {
+        "name": "releaseTicketsSearch",
+        "calls_7d": 26,
+        "weight_pct": 0.0012,
+        "args": [
+          "limit"
+        ],
+        "p50_ms": 142.2,
+        "p95_ms": 2540.0,
+        "p99_ms": 4211.8,
+        "max_ms": 4211.8
+      },
+      {
+        "name": "getMarketplaceApps",
+        "calls_7d": 25,
+        "weight_pct": 0.0012,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 10415.3,
+        "p95_ms": 75808.2,
+        "p99_ms": 280312.1,
+        "max_ms": 280312.1,
+        "watch": true
+      },
+      {
+        "name": "getAllProjectsList",
+        "calls_7d": 24,
+        "weight_pct": 0.0011,
+        "args": [],
+        "p50_ms": 4526.7,
+        "p95_ms": 85054.7,
+        "p99_ms": 123990.0,
+        "max_ms": 123990.0,
+        "watch": true
+      },
+      {
+        "name": "getUserGroupById",
+        "calls_7d": 23,
+        "weight_pct": 0.0011,
+        "args": [
+          "userGroupId"
+        ],
+        "p50_ms": 236.8,
+        "p95_ms": 1759.3,
+        "p99_ms": 1759.3,
+        "max_ms": 1759.3
+      },
+      {
+        "name": "getUserAssignmentStates",
+        "calls_7d": 23,
+        "weight_pct": 0.0011,
+        "args": [
+          "userGroupId"
+        ],
+        "p50_ms": 237.0,
+        "p95_ms": 1759.3,
+        "p99_ms": 1759.3,
+        "max_ms": 1759.3
+      },
+      {
+        "name": "getBoardComplexityScores",
+        "calls_7d": 23,
+        "weight_pct": 0.0011,
+        "args": [
+          "userGroupId"
+        ],
+        "p50_ms": 237.0,
+        "p95_ms": 1759.4,
+        "p99_ms": 1759.4,
+        "max_ms": 1759.4
+      },
+      {
+        "name": "userEmailsSent",
+        "calls_7d": 20,
+        "weight_pct": 0.0009,
+        "args": [
+          "channelId",
+          "limit",
+          "scope",
+          "start"
+        ],
+        "p50_ms": 2.5,
+        "p95_ms": 492.1,
+        "p99_ms": 492.1,
+        "max_ms": 492.1
+      },
+      {
+        "name": "userEmailDrafts",
+        "calls_7d": 19,
+        "weight_pct": 0.0009,
+        "args": [
+          "channelId",
+          "limit",
+          "start"
+        ],
+        "p50_ms": 135.6,
+        "p95_ms": 2880.7,
+        "p99_ms": 2880.7,
+        "max_ms": 2880.7,
+        "also_oneshot_calls_7d": 5
+      },
+      {
+        "name": "getAllInvitations",
+        "calls_7d": 13,
+        "weight_pct": 0.0006,
+        "args": [],
+        "p50_ms": 163.4,
+        "p95_ms": 480.4,
+        "p99_ms": 480.4,
+        "max_ms": 480.4
+      },
+      {
+        "name": "releaseChangeLogValuesByReleaseId",
+        "calls_7d": 13,
+        "weight_pct": 0.0006,
+        "args": [
+          "releaseId"
+        ],
+        "p50_ms": 9918.9,
+        "p95_ms": 33026.1,
+        "p99_ms": 33026.1,
+        "max_ms": 33026.1,
+        "watch": true
+      },
+      {
+        "name": "getAllForms",
+        "calls_7d": 13,
+        "weight_pct": 0.0006,
+        "args": [],
+        "p50_ms": 827.8,
+        "p95_ms": 917.1,
+        "p99_ms": 917.1,
+        "max_ms": 917.1
+      },
+      {
+        "name": "ticketsSearch",
+        "calls_7d": 12,
+        "weight_pct": 0.0006,
+        "args": [
+          "limit"
+        ],
+        "p50_ms": 1896.0,
+        "p95_ms": 4211.3,
+        "p99_ms": 4211.3,
+        "max_ms": 4211.3
+      },
+      {
+        "name": "getOrgMemberById",
+        "calls_7d": 12,
+        "weight_pct": 0.0006,
+        "args": [
+          "memberId"
+        ],
+        "p50_ms": 84.8,
+        "p95_ms": 202.6,
+        "p99_ms": 202.6,
+        "max_ms": 202.6
+      },
+      {
+        "name": "workspaceOrganizations",
+        "calls_7d": 10,
+        "weight_pct": 0.0005,
+        "args": [
+          "workspaceId"
+        ],
+        "p50_ms": 121.3,
+        "p95_ms": 202.6,
+        "p99_ms": 202.6,
+        "max_ms": 202.6
+      },
+      {
+        "name": "getOrgMembers",
+        "calls_7d": 8,
+        "weight_pct": 0.0004,
+        "args": [
+          "orgId"
+        ],
+        "p50_ms": 94.6,
+        "p95_ms": 2187.5,
+        "p99_ms": 2187.5,
+        "max_ms": 2187.5
+      },
+      {
+        "name": "allRCAsPaginated",
+        "calls_7d": 6,
+        "weight_pct": 0.0003,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 526.4,
+        "p95_ms": 1616.7,
+        "p99_ms": 1616.7,
+        "max_ms": 1616.7
+      },
+      {
+        "name": "userQuartoDocsPaginated",
+        "calls_7d": 6,
+        "weight_pct": 0.0003,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "p50_ms": 285.4,
+        "p95_ms": 5495.8,
+        "p99_ms": 5495.8,
+        "max_ms": 5495.8,
+        "watch": true
+      },
+      {
+        "name": "projectRecaps",
+        "calls_7d": 4,
+        "weight_pct": 0.0002,
+        "args": [
+          "recapDate"
+        ],
+        "p50_ms": 125.7,
+        "p95_ms": 229.3,
+        "p99_ms": 229.3,
+        "max_ms": 229.3
+      },
+      {
+        "name": "workflowsPaginated",
+        "calls_7d": 3,
+        "weight_pct": 0.0001,
+        "args": [
+          "limit",
+          "start"
+        ],
+        "latency_72h": null
+      },
+      {
+        "name": "ticketAssignmentsByTicketId",
+        "calls_7d": 3,
+        "weight_pct": 0.0001,
+        "args": [
+          "ticketId"
+        ],
+        "latency_72h": null
+      },
+      {
+        "name": "getBoardSlaPolicies",
+        "calls_7d": 2,
+        "weight_pct": 0.0001,
+        "args": [
+          "boardId"
+        ],
+        "p50_ms": 93.7,
+        "p95_ms": 93.7,
+        "p99_ms": 93.7,
+        "max_ms": 93.7
+      },
+      {
+        "name": "recurringSeriesById",
+        "calls_7d": 2,
+        "weight_pct": 0.0001,
+        "args": [
+          "seriesId"
+        ],
+        "p50_ms": 159.8,
+        "p95_ms": 159.8,
+        "p99_ms": 159.8,
+        "max_ms": 159.8
+      },
+      {
+        "name": "supportTicketsFilteredV2",
+        "calls_7d": 1,
+        "weight_pct": 0.0,
+        "args": [
+          "channelId",
+          "isMember"
+        ],
+        "p50_ms": 383.6,
+        "p95_ms": 383.6,
+        "p99_ms": 383.6,
+        "max_ms": 383.6
+      },
+      {
+        "name": "attachmentsByImpact",
+        "calls_7d": 1,
+        "weight_pct": 0.0,
+        "args": [
+          "impactId"
+        ],
+        "p50_ms": 188.6,
+        "p95_ms": 188.6,
+        "p99_ms": 188.6,
+        "max_ms": 188.6
+      },
+      {
+        "name": "rcaById",
+        "calls_7d": 1,
+        "weight_pct": 0.0,
+        "args": [
+          "rcaId"
+        ],
+        "p50_ms": 14.9,
+        "p95_ms": 14.9,
+        "p99_ms": 14.9,
+        "max_ms": 14.9
+      },
+      {
+        "name": "attachmentsByImpactIds",
+        "calls_7d": 1,
+        "weight_pct": 0.0,
+        "args": [
+          "impactIds"
+        ],
+        "p50_ms": 29.6,
+        "p95_ms": 29.6,
+        "p99_ms": 29.6,
+        "max_ms": 29.6
+      }
+    ]
+  },
+  "oneshot_workload": {
+    "_comment": "One-shot .run() queries (zero_run_complete). Fired imperatively, not reactive.",
+    "total_calls_7d": 408876,
+    "distinct_types": 21,
+    "queries": [
+      {
+        "name": "channelConversationsPaginatedV3",
+        "calls_7d": 312827,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "channelStats",
+        "calls_7d": 47587,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userUnreadActivities",
+        "calls_7d": 20261,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "getAllUserGroups",
+        "calls_7d": 9259,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userActivitiesPaginatedV2",
+        "calls_7d": 8707,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "dmChannelsLatestMessagesPaginated",
+        "calls_7d": 5207,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "conversationMessagesV2",
+        "calls_7d": 2637,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userCallHistory",
+        "calls_7d": 466,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "getConversationByIdWithChannel",
+        "calls_7d": 363,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "getUsersV2",
+        "calls_7d": 357,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userAllChannels",
+        "calls_7d": 336,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "supportTicketsPageV3",
+        "calls_7d": 282,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userActiveCalls",
+        "calls_7d": 161,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userScheduledCalls",
+        "calls_7d": 161,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "getStageTransitionsByBoardId",
+        "calls_7d": 133,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "unknown",
+        "calls_7d": 93,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "getTicketStageRequests",
+        "calls_7d": 15,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "channelParticipants",
+        "calls_7d": 10,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userConversationsPaginatedV2",
+        "calls_7d": 8,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "userEmailDrafts",
+        "calls_7d": 5,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      {
+        "name": "applicationReleaseTicketsByReleaseId",
+        "calls_7d": 1,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null
+      }
+    ]
+  },
+  "mutation_workload": {
+    "_comment": "ALL mutation types (zero_mutation_complete; fields mutation + duration ms). auto_fired = read-tracking fired by the client automatically. critical_ux = user-perceived writes. 'watch':true = p95>20s or p99>60s.",
+    "window_counts": "7d",
+    "total_calls_7d": 364565,
+    "distinct_mutation_types": 151,
+    "mutations": [
+      {
+        "name": "channel.markChannelAsViewed",
+        "calls_7d": 144050,
+        "weight_pct": 39.5128,
+        "p50_ms": 352.9,
+        "p95_ms": 3006.3,
+        "p99_ms": 17256.7,
+        "max_ms": 958192.1,
+        "auto_fired": true
+      },
+      {
+        "name": "activities.markThreadActivitiesAsReadV2",
+        "calls_7d": 140953,
+        "weight_pct": 38.6633,
+        "p50_ms": 295.9,
+        "p95_ms": 1960.5,
+        "p99_ms": 12624.2,
+        "max_ms": 272078.5,
+        "auto_fired": true
+      },
+      {
+        "name": "activities.markAsRead",
+        "calls_7d": 20419,
+        "weight_pct": 5.6009,
+        "p50_ms": 260.7,
+        "p95_ms": 2066.5,
+        "p99_ms": 12105.1,
+        "max_ms": 385145.0
+      },
+      {
+        "name": "conversations.send",
+        "calls_7d": 18557,
+        "weight_pct": 5.0902,
+        "p50_ms": 650.4,
+        "p95_ms": 1633.1,
+        "p99_ms": 7489.2,
+        "max_ms": 950497.2,
+        "critical_ux": true
+      },
+      {
+        "name": "messages.send",
+        "calls_7d": 15221,
+        "weight_pct": 4.1751,
+        "p50_ms": 545.9,
+        "p95_ms": 1826.3,
+        "p99_ms": 7894.0,
+        "max_ms": 121280.9,
+        "critical_ux": true
+      },
+      {
+        "name": "messages.react",
+        "calls_7d": 5328,
+        "weight_pct": 1.4615,
+        "p50_ms": 286.0,
+        "p95_ms": 1733.2,
+        "p99_ms": 7255.4,
+        "max_ms": 69593.6,
+        "critical_ux": true
+      },
+      {
+        "name": "draft.createAttachments",
+        "calls_7d": 4917,
+        "weight_pct": 1.3487,
+        "p50_ms": 224.1,
+        "p95_ms": 956.1,
+        "p99_ms": 5154.4,
+        "max_ms": 961958.8
+      },
+      {
+        "name": "messages.update",
+        "calls_7d": 1533,
+        "weight_pct": 0.4205,
+        "p50_ms": 403.3,
+        "p95_ms": 1117.4,
+        "p99_ms": 8202.2,
+        "max_ms": 103092.5,
+        "critical_ux": true
+      },
+      {
+        "name": "ticket.update",
+        "calls_7d": 1517,
+        "weight_pct": 0.4161,
+        "p50_ms": 482.5,
+        "p95_ms": 6816.1,
+        "p99_ms": 12708.6,
+        "max_ms": 105455.3
+      },
+      {
+        "name": "canvasVersion.save",
+        "calls_7d": 1221,
+        "weight_pct": 0.3349,
+        "p50_ms": 172.4,
+        "p95_ms": 1667.7,
+        "p99_ms": 10268.7,
+        "max_ms": 41114.3
+      },
+      {
+        "name": "emailRead.markAsRead",
+        "calls_7d": 1203,
+        "weight_pct": 0.33,
+        "p50_ms": 282.2,
+        "p95_ms": 1036.4,
+        "p99_ms": 4628.7,
+        "max_ms": 20347.8
+      },
+      {
+        "name": "activities.markMissedCallsAsRead",
+        "calls_7d": 1201,
+        "weight_pct": 0.3294,
+        "p50_ms": 2027.8,
+        "p95_ms": 10183.3,
+        "p99_ms": 26749.4,
+        "max_ms": 82318.2
+      },
+      {
+        "name": "notificationSettings.setChannelNotificationLevel",
+        "calls_7d": 744,
+        "weight_pct": 0.2041,
+        "p50_ms": 201.6,
+        "p95_ms": 1670.1,
+        "p99_ms": 34586.3,
+        "max_ms": 154846.2
+      },
+      {
+        "name": "messages.delete",
+        "calls_7d": 558,
+        "weight_pct": 0.1531,
+        "p50_ms": 349.7,
+        "p95_ms": 1054.7,
+        "p99_ms": 6533.0,
+        "max_ms": 33499.8,
+        "critical_ux": true
+      },
+      {
+        "name": "channel.closeDm",
+        "calls_7d": 484,
+        "weight_pct": 0.1328,
+        "p50_ms": 192.7,
+        "p95_ms": 446.6,
+        "p99_ms": 7642.8,
+        "max_ms": 10972.3
+      },
+      {
+        "name": "messageAttachment.delete",
+        "calls_7d": 453,
+        "weight_pct": 0.1243,
+        "p50_ms": 204.7,
+        "p95_ms": 889.7,
+        "p99_ms": 6198.2,
+        "max_ms": 33939.5
+      },
+      {
+        "name": "userPresence.upsert",
+        "calls_7d": 448,
+        "weight_pct": 0.1229,
+        "p50_ms": 456.8,
+        "p95_ms": 3634.9,
+        "p99_ms": 23465.4,
+        "max_ms": 94212.0
+      },
+      {
+        "name": "activities.markAsReadByFilter",
+        "calls_7d": 431,
+        "weight_pct": 0.1182,
+        "p50_ms": 280.5,
+        "p95_ms": 1898.2,
+        "p99_ms": 36044.8,
+        "max_ms": 888991.8
+      },
+      {
+        "name": "emailDraft.upsert",
+        "calls_7d": 297,
+        "weight_pct": 0.0815,
+        "p50_ms": 235.9,
+        "p95_ms": 631.4,
+        "p99_ms": 1985.3,
+        "max_ms": 6467.4
+      },
+      {
+        "name": "channel.addParticipants",
+        "calls_7d": 287,
+        "weight_pct": 0.0787,
+        "p50_ms": 553.3,
+        "p95_ms": 2027.3,
+        "p99_ms": 13495.0,
+        "max_ms": 28721.8
+      },
+      {
+        "name": "channel.moveToSection",
+        "calls_7d": 283,
+        "weight_pct": 0.0776,
+        "p50_ms": 571.9,
+        "p95_ms": 2053.6,
+        "p99_ms": 18387.3,
+        "max_ms": 19357.6
+      },
+      {
+        "name": "messages.handleNonParticipantAction",
+        "calls_7d": 275,
+        "weight_pct": 0.0754,
+        "p50_ms": 468.5,
+        "p95_ms": 1775.8,
+        "p99_ms": 8148.1,
+        "max_ms": 9873.6
+      },
+      {
+        "name": "board.update",
+        "calls_7d": 233,
+        "weight_pct": 0.0639,
+        "p50_ms": 224.0,
+        "p95_ms": 1264.0,
+        "p99_ms": 3518.9,
+        "max_ms": 5847.5
+      },
+      {
+        "name": "userPreference.setGlobalNotificationSettings",
+        "calls_7d": 183,
+        "weight_pct": 0.0502,
+        "p50_ms": 195.8,
+        "p95_ms": 1034.0,
+        "p99_ms": 15980.4,
+        "max_ms": 17082.3
+      },
+      {
+        "name": "channelSection.update",
+        "calls_7d": 165,
+        "weight_pct": 0.0453,
+        "p50_ms": 170.6,
+        "p95_ms": 435.4,
+        "p99_ms": 2666.0,
+        "max_ms": 3555.6
+      },
+      {
+        "name": "channel.toggleStarred",
+        "calls_7d": 143,
+        "weight_pct": 0.0392,
+        "p50_ms": 207.0,
+        "p95_ms": 2571.3,
+        "p99_ms": 17162.9,
+        "max_ms": 54171.2
+      },
+      {
+        "name": "bookmark.updateMetadata",
+        "calls_7d": 143,
+        "weight_pct": 0.0392,
+        "p50_ms": 272.8,
+        "p95_ms": 885.2,
+        "p99_ms": 13488.9,
+        "max_ms": 31551.6
+      },
+      {
+        "name": "formEntityValue.create",
+        "calls_7d": 143,
+        "weight_pct": 0.0392,
+        "p50_ms": 691.5,
+        "p95_ms": 3349.5,
+        "p99_ms": 59530.0,
+        "max_ms": 71191.3
+      },
+      {
+        "name": "bookmark.add",
+        "calls_7d": 138,
+        "weight_pct": 0.0379,
+        "p50_ms": 259.9,
+        "p95_ms": 704.1,
+        "p99_ms": 33347.1,
+        "max_ms": 97872.8
+      },
+      {
+        "name": "channel.updateSelectedBoardId",
+        "calls_7d": 137,
+        "weight_pct": 0.0376,
+        "p50_ms": 425.1,
+        "p95_ms": 23685.9,
+        "p99_ms": 72107.0,
+        "max_ms": 78548.4,
+        "watch": true
+      },
+      {
+        "name": "emailDraft.delete",
+        "calls_7d": 127,
+        "weight_pct": 0.0348,
+        "p50_ms": 306.8,
+        "p95_ms": 816.3,
+        "p99_ms": 5271.9,
+        "max_ms": 6710.9
+      },
+      {
+        "name": "channel.joinChannel",
+        "calls_7d": 127,
+        "weight_pct": 0.0348,
+        "p50_ms": 1627.5,
+        "p95_ms": 7630.2,
+        "p99_ms": 13876.7,
+        "max_ms": 39418.7
+      },
+      {
+        "name": "recap.markChannelRecapAsRead",
+        "calls_7d": 122,
+        "weight_pct": 0.0335,
+        "p50_ms": 243.4,
+        "p95_ms": 701.7,
+        "p99_ms": 9817.8,
+        "max_ms": 17269.8
+      },
+      {
+        "name": "canvas.update",
+        "calls_7d": 117,
+        "weight_pct": 0.0321,
+        "p50_ms": 222.0,
+        "p95_ms": 5229.8,
+        "p99_ms": 14762.7,
+        "max_ms": 16702.8
+      },
+      {
+        "name": "activities.markAsUnread",
+        "calls_7d": 109,
+        "weight_pct": 0.0299,
+        "p50_ms": 266.6,
+        "p95_ms": 63322.5,
+        "p99_ms": 68269.1,
+        "max_ms": 70477.2,
+        "watch": true
+      },
+      {
+        "name": "ticket.updateAssignment",
+        "calls_7d": 104,
+        "weight_pct": 0.0285,
+        "p50_ms": 708.2,
+        "p95_ms": 1710.7,
+        "p99_ms": 8555.4,
+        "max_ms": 11232.6
+      },
+      {
+        "name": "calls.reject",
+        "calls_7d": 104,
+        "weight_pct": 0.0285,
+        "p50_ms": 262.3,
+        "p95_ms": 2379.2,
+        "p99_ms": 8344.3,
+        "max_ms": 21447.5
+      },
+      {
+        "name": "channel.markChannelUnreadFrom",
+        "calls_7d": 100,
+        "weight_pct": 0.0274,
+        "p50_ms": 295.5,
+        "p95_ms": 996.5,
+        "p99_ms": 34967.9,
+        "max_ms": 34967.9
+      },
+      {
+        "name": "calls.invite",
+        "calls_7d": 97,
+        "weight_pct": 0.0266,
+        "p50_ms": 226.2,
+        "p95_ms": 816.4,
+        "p99_ms": 45010.5,
+        "max_ms": 45010.5
+      },
+      {
+        "name": "bookmark.remove",
+        "calls_7d": 96,
+        "weight_pct": 0.0263,
+        "p50_ms": 220.2,
+        "p95_ms": 828.7,
+        "p99_ms": 5945.8,
+        "max_ms": 5945.8
+      },
+      {
+        "name": "nonLinear.syncTransitions",
+        "calls_7d": 93,
+        "weight_pct": 0.0255,
+        "p50_ms": 154.8,
+        "p95_ms": 870.6,
+        "p99_ms": 4342.2,
+        "max_ms": 4342.2
+      },
+      {
+        "name": "form.update",
+        "calls_7d": 84,
+        "weight_pct": 0.023,
+        "p50_ms": 271.5,
+        "p95_ms": 1092.3,
+        "p99_ms": 2591.6,
+        "max_ms": 2591.6
+      },
+      {
+        "name": "recap.markSeen",
+        "calls_7d": 83,
+        "weight_pct": 0.0228,
+        "p50_ms": 282.8,
+        "p95_ms": 678.1,
+        "p99_ms": 903.1,
+        "max_ms": 903.1
+      },
+      {
+        "name": "channel.leaveChannel",
+        "calls_7d": 69,
+        "weight_pct": 0.0189,
+        "p50_ms": 1671.4,
+        "p95_ms": 4196.3,
+        "p99_ms": 25588.8,
+        "max_ms": 25588.8
+      },
+      {
+        "name": "conversation.markThreadUnreadFrom",
+        "calls_7d": 68,
+        "weight_pct": 0.0187,
+        "p50_ms": 269.7,
+        "p95_ms": 1368.4,
+        "p99_ms": 7735.9,
+        "max_ms": 7735.9
+      },
+      {
+        "name": "conversations.subscribeToConversation",
+        "calls_7d": 56,
+        "weight_pct": 0.0154,
+        "p50_ms": 184.1,
+        "p95_ms": 735.6,
+        "p99_ms": 4733.0,
+        "max_ms": 4733.0
+      },
+      {
+        "name": "channelSection.create",
+        "calls_7d": 50,
+        "weight_pct": 0.0137,
+        "p50_ms": 221.0,
+        "p95_ms": 1474.8,
+        "p99_ms": 9464.0,
+        "max_ms": 9464.0
+      },
+      {
+        "name": "recap.setCustomRecapPrompt",
+        "calls_7d": 49,
+        "weight_pct": 0.0134,
+        "p50_ms": 835.1,
+        "p95_ms": 1330.5,
+        "p99_ms": 1354.0,
+        "max_ms": 1354.0
+      },
+      {
+        "name": "ticketStageRequest.deleteByTicketId",
+        "calls_7d": 48,
+        "weight_pct": 0.0132,
+        "p50_ms": 260.5,
+        "p95_ms": 1731.8,
+        "p99_ms": 11270.2,
+        "max_ms": 11270.2
+      },
+      {
+        "name": "conversations.togglePin",
+        "calls_7d": 48,
+        "weight_pct": 0.0132,
+        "p50_ms": 222.5,
+        "p95_ms": 1596.0,
+        "p99_ms": 5528.7,
+        "max_ms": 5528.7
+      },
+      {
+        "name": "conversations.unsubscribeFromConversation",
+        "calls_7d": 48,
+        "weight_pct": 0.0132,
+        "p50_ms": 173.5,
+        "p95_ms": 625.9,
+        "p99_ms": 2666.1,
+        "max_ms": 2666.1
+      },
+      {
+        "name": "channel.reopenDm",
+        "calls_7d": 48,
+        "weight_pct": 0.0132,
+        "p50_ms": 313.5,
+        "p95_ms": 691.1,
+        "p99_ms": 1783.8,
+        "max_ms": 1783.8
+      },
+      {
+        "name": "resourceAccess.grant",
+        "calls_7d": 47,
+        "weight_pct": 0.0129,
+        "p50_ms": 136.7,
+        "p95_ms": 1074.0,
+        "p99_ms": 3414.4,
+        "max_ms": 3414.4
+      },
+      {
+        "name": "userProfile.upsert",
+        "calls_7d": 41,
+        "weight_pct": 0.0112,
+        "p50_ms": 268.6,
+        "p95_ms": 904.9,
+        "p99_ms": 1529.0,
+        "max_ms": 1529.0
+      },
+      {
+        "name": "nonLinear.transition",
+        "calls_7d": 39,
+        "weight_pct": 0.0107,
+        "p50_ms": 489.8,
+        "p95_ms": 7231.1,
+        "p99_ms": 9976.2,
+        "max_ms": 9976.2
+      },
+      {
+        "name": "formEntityValue.update",
+        "calls_7d": 39,
+        "weight_pct": 0.0107,
+        "p50_ms": 301.7,
+        "p95_ms": 5806.6,
+        "p99_ms": 8534.3,
+        "max_ms": 8534.3
+      },
+      {
+        "name": "messageAttachment.deleteMany",
+        "calls_7d": 35,
+        "weight_pct": 0.0096,
+        "p50_ms": 443.5,
+        "p95_ms": 31293.2,
+        "p99_ms": 31920.4,
+        "max_ms": 31920.4,
+        "watch": true
+      },
+      {
+        "name": "apps.update",
+        "calls_7d": 35,
+        "weight_pct": 0.0096,
+        "p50_ms": 179.6,
+        "p95_ms": 1020.1,
+        "p99_ms": 1271.7,
+        "max_ms": 1271.7
+      },
+      {
+        "name": "automations.createProposal",
+        "calls_7d": 33,
+        "weight_pct": 0.0091,
+        "p50_ms": 158.0,
+        "p95_ms": 3121.4,
+        "p99_ms": 3816.6,
+        "max_ms": 3816.6
+      },
+      {
+        "name": "draftMessages.delete",
+        "calls_7d": 33,
+        "weight_pct": 0.0091,
+        "p50_ms": 198.0,
+        "p95_ms": 517.4,
+        "p99_ms": 1451.0,
+        "max_ms": 1451.0
+      },
+      {
+        "name": "ticketTagV2.create",
+        "calls_7d": 33,
+        "weight_pct": 0.0091,
+        "p50_ms": 516.5,
+        "p95_ms": 4886.8,
+        "p99_ms": 7403.7,
+        "max_ms": 7403.7
+      },
+      {
+        "name": "automations.submitForApproval",
+        "calls_7d": 31,
+        "weight_pct": 0.0085,
+        "p50_ms": 137.1,
+        "p95_ms": 628.7,
+        "p99_ms": 963.4,
+        "max_ms": 963.4
+      },
+      {
+        "name": "ticketStageEta.update",
+        "calls_7d": 30,
+        "weight_pct": 0.0082,
+        "p50_ms": 599.9,
+        "p95_ms": 2658.5,
+        "p99_ms": 3152.9,
+        "max_ms": 3152.9
+      },
+      {
+        "name": "subTicket.create",
+        "calls_7d": 27,
+        "weight_pct": 0.0074,
+        "p50_ms": 530.9,
+        "p95_ms": 4158.7,
+        "p99_ms": 8596.0,
+        "max_ms": 8596.0
+      },
+      {
+        "name": "subTicket.update",
+        "calls_7d": 27,
+        "weight_pct": 0.0074,
+        "p50_ms": 539.1,
+        "p95_ms": 4158.6,
+        "p99_ms": 8596.0,
+        "max_ms": 8596.0
+      },
+      {
+        "name": "canvas.addParticipants",
+        "calls_7d": 27,
+        "weight_pct": 0.0074,
+        "p50_ms": 207.1,
+        "p95_ms": 3007.7,
+        "p99_ms": 9155.2,
+        "max_ms": 9155.2
+      },
+      {
+        "name": "automations.approve",
+        "calls_7d": 25,
+        "weight_pct": 0.0069,
+        "p50_ms": 229.3,
+        "p95_ms": 1493.3,
+        "p99_ms": 1493.3,
+        "max_ms": 1493.3
+      },
+      {
+        "name": "messages.updateShowInChannel",
+        "calls_7d": 23,
+        "weight_pct": 0.0063,
+        "p50_ms": 612.4,
+        "p95_ms": 812.0,
+        "p99_ms": 1085.1,
+        "max_ms": 1085.1
+      },
+      {
+        "name": "classificationMapping.create",
+        "calls_7d": 22,
+        "weight_pct": 0.006,
+        "p50_ms": 573.9,
+        "p95_ms": 639.8,
+        "p99_ms": 639.8,
+        "max_ms": 639.8
+      },
+      {
+        "name": "cleanupStageApprovals",
+        "calls_7d": 20,
+        "weight_pct": 0.0055,
+        "p50_ms": 208.4,
+        "p95_ms": 3438.5,
+        "p99_ms": 3438.5,
+        "max_ms": 3438.5
+      },
+      {
+        "name": "resourceAccess.update",
+        "calls_7d": 20,
+        "weight_pct": 0.0055,
+        "p50_ms": 141.7,
+        "p95_ms": 1076.9,
+        "p99_ms": 1076.9,
+        "max_ms": 1076.9
+      },
+      {
+        "name": "automations.activate",
+        "calls_7d": 19,
+        "weight_pct": 0.0052,
+        "p50_ms": 192.3,
+        "p95_ms": 516.3,
+        "p99_ms": 516.3,
+        "max_ms": 516.3
+      },
+      {
+        "name": "assignmentConfig.batchUpdate",
+        "calls_7d": 19,
+        "weight_pct": 0.0052,
+        "p50_ms": 796.4,
+        "p95_ms": 6505.2,
+        "p99_ms": 6505.2,
+        "max_ms": 6505.2
+      },
+      {
+        "name": "channel.updateParticipantRole",
+        "calls_7d": 18,
+        "weight_pct": 0.0049,
+        "p50_ms": 435.0,
+        "p95_ms": 835.1,
+        "p99_ms": 835.1,
+        "max_ms": 835.1
+      },
+      {
+        "name": "channel.removeParticipant",
+        "calls_7d": 16,
+        "weight_pct": 0.0044,
+        "p50_ms": 427.2,
+        "p95_ms": 1599.8,
+        "p99_ms": 1599.8,
+        "max_ms": 1599.8
+      },
+      {
+        "name": "dashboardComponent.updatePositions",
+        "calls_7d": 16,
+        "weight_pct": 0.0044,
+        "p50_ms": 122.2,
+        "p95_ms": 1348.3,
+        "p99_ms": 1348.3,
+        "max_ms": 1348.3
+      },
+      {
+        "name": "canvas.delete",
+        "calls_7d": 15,
+        "weight_pct": 0.0041,
+        "p50_ms": 577.3,
+        "p95_ms": 6364.6,
+        "p99_ms": 6364.6,
+        "max_ms": 6364.6
+      },
+      {
+        "name": "canvas.addChannelParticipant",
+        "calls_7d": 15,
+        "weight_pct": 0.0041,
+        "p50_ms": 348.8,
+        "p95_ms": 8962.9,
+        "p99_ms": 8962.9,
+        "max_ms": 8962.9
+      },
+      {
+        "name": "calls.approveLobbyRequest",
+        "calls_7d": 15,
+        "weight_pct": 0.0041,
+        "p50_ms": 190.1,
+        "p95_ms": 418.5,
+        "p99_ms": 418.5,
+        "max_ms": 418.5
+      },
+      {
+        "name": "query.upsert",
+        "calls_7d": 14,
+        "weight_pct": 0.0038,
+        "p50_ms": 119.9,
+        "p95_ms": 516.6,
+        "p99_ms": 516.6,
+        "max_ms": 516.6
+      },
+      {
+        "name": "ticketStageRequest.upsert",
+        "calls_7d": 13,
+        "weight_pct": 0.0036,
+        "p50_ms": 548.9,
+        "p95_ms": 4490.0,
+        "p99_ms": 4490.0,
+        "max_ms": 4490.0
+      },
+      {
+        "name": "recap.saveSubscriptions",
+        "calls_7d": 13,
+        "weight_pct": 0.0036,
+        "p50_ms": 301.3,
+        "p95_ms": 860.1,
+        "p99_ms": 860.1,
+        "max_ms": 860.1
+      },
+      {
+        "name": "userGroup.update",
+        "calls_7d": 13,
+        "weight_pct": 0.0036,
+        "p50_ms": 540.4,
+        "p95_ms": 7594.7,
+        "p99_ms": 7594.7,
+        "max_ms": 7594.7
+      },
+      {
+        "name": "calls.requestToJoin",
+        "calls_7d": 13,
+        "weight_pct": 0.0036,
+        "p50_ms": 206.9,
+        "p95_ms": 1696.0,
+        "p99_ms": 1696.0,
+        "max_ms": 1696.0
+      },
+      {
+        "name": "userPreference.setAllowThreadBroadcastMentions",
+        "calls_7d": 12,
+        "weight_pct": 0.0033,
+        "p50_ms": 246.6,
+        "p95_ms": 68377.1,
+        "p99_ms": 68377.1,
+        "max_ms": 68377.1,
+        "watch": true
+      },
+      {
+        "name": "conversations.forwardMessage",
+        "calls_7d": 12,
+        "weight_pct": 0.0033,
+        "p50_ms": 827.9,
+        "p95_ms": 1878.4,
+        "p99_ms": 1878.4,
+        "max_ms": 1878.4
+      },
+      {
+        "name": "userPreference.setChannelSortOrder",
+        "calls_7d": 12,
+        "weight_pct": 0.0033,
+        "p50_ms": 215.9,
+        "p95_ms": 902.1,
+        "p99_ms": 902.1,
+        "max_ms": 902.1
+      },
+      {
+        "name": "userGroup.addUsers",
+        "calls_7d": 11,
+        "weight_pct": 0.003,
+        "p50_ms": 212.1,
+        "p95_ms": 549.2,
+        "p99_ms": 549.2,
+        "max_ms": 549.2
+      },
+      {
+        "name": "canvasFolder.create",
+        "calls_7d": 10,
+        "weight_pct": 0.0027,
+        "p50_ms": 184.2,
+        "p95_ms": 8373.1,
+        "p99_ms": 8373.1,
+        "max_ms": 8373.1
+      },
+      {
+        "name": "recap.markChannelRecapAsUnread",
+        "calls_7d": 10,
+        "weight_pct": 0.0027,
+        "p50_ms": 178.0,
+        "p95_ms": 755.6,
+        "p99_ms": 755.6,
+        "max_ms": 755.6
+      },
+      {
+        "name": "canvasFolder.delete",
+        "calls_7d": 9,
+        "weight_pct": 0.0025,
+        "p50_ms": 146.0,
+        "p95_ms": 228.1,
+        "p99_ms": 228.1,
+        "max_ms": 228.1
+      },
+      {
+        "name": "formContextMapping.upsert",
+        "calls_7d": 9,
+        "weight_pct": 0.0025,
+        "p50_ms": 141.3,
+        "p95_ms": 5450.2,
+        "p99_ms": 5450.2,
+        "max_ms": 5450.2
+      },
+      {
+        "name": "userPreference.setEnterSendsMessage",
+        "calls_7d": 9,
+        "weight_pct": 0.0025,
+        "p50_ms": 147.8,
+        "p95_ms": 5308.3,
+        "p99_ms": 5308.3,
+        "max_ms": 5308.3
+      },
+      {
+        "name": "canvasUserStatus.toggleStarred",
+        "calls_7d": 8,
+        "weight_pct": 0.0022,
+        "p50_ms": 454.4,
+        "p95_ms": 331883.1,
+        "p99_ms": 331883.1,
+        "max_ms": 331883.1,
+        "watch": true
+      },
+      {
+        "name": "collection.createCollection",
+        "calls_7d": 8,
+        "weight_pct": 0.0022,
+        "p50_ms": 250.9,
+        "p95_ms": 512.1,
+        "p99_ms": 512.1,
+        "max_ms": 512.1
+      },
+      {
+        "name": "delayedMessages.create",
+        "calls_7d": 8,
+        "weight_pct": 0.0022,
+        "p50_ms": 205.3,
+        "p95_ms": 437.4,
+        "p99_ms": 437.4,
+        "max_ms": 437.4
+      },
+      {
+        "name": "rca.create",
+        "calls_7d": 8,
+        "weight_pct": 0.0022,
+        "p50_ms": 2104.2,
+        "p95_ms": 4235.5,
+        "p99_ms": 4235.5,
+        "max_ms": 4235.5
+      },
+      {
+        "name": "project.saveReleaseBoardConfig",
+        "calls_7d": 7,
+        "weight_pct": 0.0019,
+        "p50_ms": 379.6,
+        "p95_ms": 3227.0,
+        "p99_ms": 3227.0,
+        "max_ms": 3227.0
+      },
+      {
+        "name": "automations.revoke",
+        "calls_7d": 7,
+        "weight_pct": 0.0019,
+        "p50_ms": 254.4,
+        "p95_ms": 1041.7,
+        "p99_ms": 1041.7,
+        "max_ms": 1041.7
+      },
+      {
+        "name": "emailChannelPreference.upsertClassificationConfig",
+        "calls_7d": 6,
+        "weight_pct": 0.0016,
+        "p50_ms": 262.7,
+        "p95_ms": 296.0,
+        "p99_ms": 296.0,
+        "max_ms": 296.0
+      },
+      {
+        "name": "emailChannelPreference.upsert",
+        "calls_7d": 6,
+        "weight_pct": 0.0016,
+        "p50_ms": 926.6,
+        "p95_ms": 988.3,
+        "p99_ms": 988.3,
+        "max_ms": 988.3
+      },
+      {
+        "name": "boardSlaPolicy.upsert",
+        "calls_7d": 6,
+        "weight_pct": 0.0016,
+        "p50_ms": 116.5,
+        "p95_ms": 197.3,
+        "p99_ms": 197.3,
+        "max_ms": 197.3
+      },
+      {
+        "name": "userGroup.removeUsers",
+        "calls_7d": 6,
+        "weight_pct": 0.0016,
+        "p50_ms": 196.7,
+        "p95_ms": 312.8,
+        "p99_ms": 312.8,
+        "max_ms": 312.8
+      },
+      {
+        "name": "automations.disable",
+        "calls_7d": 6,
+        "weight_pct": 0.0016,
+        "p50_ms": 257.4,
+        "p95_ms": 18330.8,
+        "p99_ms": 18330.8,
+        "max_ms": 18330.8
+      },
+      {
+        "name": "links.create",
+        "calls_7d": 5,
+        "weight_pct": 0.0014,
+        "p50_ms": 133.1,
+        "p95_ms": 220.6,
+        "p99_ms": 220.6,
+        "max_ms": 220.6
+      },
+      {
+        "name": "channel.archiveChannel",
+        "calls_7d": 5,
+        "weight_pct": 0.0014,
+        "p50_ms": 587.2,
+        "p95_ms": 985.9,
+        "p99_ms": 985.9,
+        "max_ms": 985.9
+      },
+      {
+        "name": "dashboard.upsert",
+        "calls_7d": 5,
+        "weight_pct": 0.0014,
+        "p50_ms": 148.0,
+        "p95_ms": 2073.2,
+        "p99_ms": 2073.2,
+        "max_ms": 2073.2
+      },
+      {
+        "name": "orgMember.add",
+        "calls_7d": 5,
+        "weight_pct": 0.0014,
+        "p50_ms": 348.8,
+        "p95_ms": 402.9,
+        "p99_ms": 402.9,
+        "max_ms": 402.9
+      },
+      {
+        "name": "ticketReference.create",
+        "calls_7d": 4,
+        "weight_pct": 0.0011,
+        "p50_ms": 215.7,
+        "p95_ms": 320.4,
+        "p99_ms": 320.4,
+        "max_ms": 320.4
+      },
+      {
+        "name": "rca.update",
+        "calls_7d": 4,
+        "weight_pct": 0.0011,
+        "p50_ms": 438.2,
+        "p95_ms": 2208.1,
+        "p99_ms": 2208.1,
+        "max_ms": 2208.1
+      },
+      {
+        "name": "ticketReference.updateRelationType",
+        "calls_7d": 4,
+        "weight_pct": 0.0011,
+        "p50_ms": 205.2,
+        "p95_ms": 210.6,
+        "p99_ms": 210.6,
+        "max_ms": 210.6
+      },
+      {
+        "name": "coe.update",
+        "calls_7d": 4,
+        "weight_pct": 0.0011,
+        "p50_ms": 150.5,
+        "p95_ms": 323.9,
+        "p99_ms": 323.9,
+        "max_ms": 323.9
+      },
+      {
+        "name": "emailChannelPreference.upsertPriorityClassificationConfig",
+        "calls_7d": 3,
+        "weight_pct": 0.0008,
+        "p50_ms": 260.0,
+        "p95_ms": 268.3,
+        "p99_ms": 268.3,
+        "max_ms": 268.3
+      },
+      {
+        "name": "channelSection.remove",
+        "calls_7d": 3,
+        "weight_pct": 0.0008,
+        "p50_ms": 226.3,
+        "p95_ms": 374.4,
+        "p99_ms": 374.4,
+        "max_ms": 374.4
+      },
+      {
+        "name": "emailRead.bulkMarkAsRead",
+        "calls_7d": 3,
+        "weight_pct": 0.0008,
+        "p50_ms": 466.7,
+        "p95_ms": 497.9,
+        "p99_ms": 497.9,
+        "max_ms": 497.9
+      },
+      {
+        "name": "automations.update",
+        "calls_7d": 3,
+        "weight_pct": 0.0008,
+        "p50_ms": 259.8,
+        "p95_ms": 285.8,
+        "p99_ms": 285.8,
+        "max_ms": 285.8
+      },
+      {
+        "name": "canvas.updateParticipantRole",
+        "calls_7d": 3,
+        "weight_pct": 0.0008,
+        "p50_ms": 211.4,
+        "p95_ms": 456.9,
+        "p99_ms": 456.9,
+        "max_ms": 456.9
+      },
+      {
+        "name": "users.updateRole",
+        "calls_7d": 3,
+        "weight_pct": 0.0008,
+        "p50_ms": 202.6,
+        "p95_ms": 388.9,
+        "p99_ms": 388.9,
+        "max_ms": 388.9
+      },
+      {
+        "name": "collection.deleteCollection",
+        "calls_7d": 3,
+        "weight_pct": 0.0008,
+        "p50_ms": 8219.0,
+        "p95_ms": 9272.3,
+        "p99_ms": 9272.3,
+        "max_ms": 9272.3
+      },
+      {
+        "name": "collection.deleteItem",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 378.9,
+        "p95_ms": 378.9,
+        "p99_ms": 378.9,
+        "max_ms": 378.9
+      },
+      {
+        "name": "channel.renameChannel",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 284.7,
+        "p95_ms": 284.7,
+        "p99_ms": 284.7,
+        "max_ms": 284.7
+      },
+      {
+        "name": "emailSignature.update",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 931.8,
+        "p95_ms": 931.8,
+        "p99_ms": 931.8,
+        "max_ms": 931.8
+      },
+      {
+        "name": "collection.grantPermission",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 564.9,
+        "p95_ms": 564.9,
+        "p99_ms": 564.9,
+        "max_ms": 564.9
+      },
+      {
+        "name": "channel.promoteToChannel",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 2420.0,
+        "p95_ms": 2420.0,
+        "p99_ms": 2420.0,
+        "max_ms": 2420.0
+      },
+      {
+        "name": "ticketReference.delete",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 232.1,
+        "p95_ms": 232.1,
+        "p99_ms": 232.1,
+        "max_ms": 232.1
+      },
+      {
+        "name": "savedUserConfiguration.create",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 168.7,
+        "p95_ms": 168.7,
+        "p99_ms": 168.7,
+        "max_ms": 168.7
+      },
+      {
+        "name": "coe.create",
+        "calls_7d": 2,
+        "weight_pct": 0.0005,
+        "p50_ms": 668.1,
+        "p95_ms": 668.1,
+        "p99_ms": 668.1,
+        "max_ms": 668.1
+      },
+      {
+        "name": "emailSignature.create",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 971.9,
+        "p95_ms": 971.9,
+        "p99_ms": 971.9,
+        "max_ms": 971.9
+      },
+      {
+        "name": "assignmentConfig.toggleGroupAutoRotation",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 602.3,
+        "p95_ms": 602.3,
+        "p99_ms": 602.3,
+        "max_ms": 602.3
+      },
+      {
+        "name": "emailSignature.delete",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 605.3,
+        "p95_ms": 605.3,
+        "p99_ms": 605.3,
+        "max_ms": 605.3
+      },
+      {
+        "name": "delayedMessages.edit",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 231.9,
+        "p95_ms": 231.9,
+        "p99_ms": 231.9,
+        "max_ms": 231.9
+      },
+      {
+        "name": "calls.rejectLobbyRequest",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 187.2,
+        "p95_ms": 187.2,
+        "p99_ms": 187.2,
+        "max_ms": 187.2
+      },
+      {
+        "name": "impact.update",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 135.0,
+        "p95_ms": 135.0,
+        "p99_ms": 135.0,
+        "max_ms": 135.0
+      },
+      {
+        "name": "canvas.updateChannelParticipantRole",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 173.0,
+        "p95_ms": 173.0,
+        "p99_ms": 173.0,
+        "max_ms": 173.0
+      },
+      {
+        "name": "emailRead.bulkMarkAsUnread",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 2105.6,
+        "p95_ms": 2105.6,
+        "p99_ms": 2105.6,
+        "max_ms": 2105.6
+      },
+      {
+        "name": "query.delete",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 1367.2,
+        "p95_ms": 1367.2,
+        "p99_ms": 1367.2,
+        "max_ms": 1367.2
+      },
+      {
+        "name": "emailSignature.setDefault",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 1111.1,
+        "p95_ms": 1111.1,
+        "p99_ms": 1111.1,
+        "max_ms": 1111.1
+      },
+      {
+        "name": "delayedMessages.convertToDraft",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 152.0,
+        "p95_ms": 152.0,
+        "p99_ms": 152.0,
+        "max_ms": 152.0
+      },
+      {
+        "name": "canvasVersion.rename",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 183.6,
+        "p95_ms": 183.6,
+        "p99_ms": 183.6,
+        "max_ms": 183.6
+      },
+      {
+        "name": "collection.createFolder",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 145.1,
+        "p95_ms": 145.1,
+        "p99_ms": 145.1,
+        "max_ms": 145.1
+      },
+      {
+        "name": "collection.updateCollection",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 132.6,
+        "p95_ms": 132.6,
+        "p99_ms": 132.6,
+        "max_ms": 132.6
+      },
+      {
+        "name": "channel.updateDescription",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 706.8,
+        "p95_ms": 706.8,
+        "p99_ms": 706.8,
+        "max_ms": 706.8
+      },
+      {
+        "name": "releaseAttribution.create",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 400.6,
+        "p95_ms": 400.6,
+        "p99_ms": 400.6,
+        "max_ms": 400.6
+      },
+      {
+        "name": "project.update",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 227.3,
+        "p95_ms": 227.3,
+        "p99_ms": 227.3,
+        "max_ms": 227.3
+      },
+      {
+        "name": "delayedMessages.reschedule",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 234.8,
+        "p95_ms": 234.8,
+        "p99_ms": 234.8,
+        "max_ms": 234.8
+      },
+      {
+        "name": "impact.create",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 357.2,
+        "p95_ms": 357.2,
+        "p99_ms": 357.2,
+        "max_ms": 357.2
+      },
+      {
+        "name": "channel.updateAddUserPolicy",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 190.5,
+        "p95_ms": 190.5,
+        "p99_ms": 190.5,
+        "max_ms": 190.5
+      },
+      {
+        "name": "canvas.create",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 2028.7,
+        "p95_ms": 2028.7,
+        "p99_ms": 2028.7,
+        "max_ms": 2028.7
+      },
+      {
+        "name": "automations.archive",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 131.5,
+        "p95_ms": 131.5,
+        "p99_ms": 131.5,
+        "max_ms": 131.5
+      },
+      {
+        "name": "canvasFolder.update",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 159.4,
+        "p95_ms": 159.4,
+        "p99_ms": 159.4,
+        "max_ms": 159.4
+      },
+      {
+        "name": "automations.delete",
+        "calls_7d": 1,
+        "weight_pct": 0.0003,
+        "p50_ms": 134.8,
+        "p95_ms": 134.8,
+        "p99_ms": 134.8,
+        "max_ms": 134.8
+      }
+    ]
+  },
+  "regression_watchlist": {
+    "_comment": "Highest-value assertions. A good change should improve these; none should worsen them.",
+    "highest_impact_client_tail": [
+      "userVisibleEmailChannels (calls_7d=1821, p95=2272110.0ms, p99=16123079.1ms)",
+      "userBookmarks (calls_7d=188041, p95=8980.1ms, p99=18688.4ms)",
+      "getAllUserGroups (calls_7d=56830, p95=14448.7ms, p99=167833.7ms)",
+      "userDrafts (calls_7d=14632, p95=43266.6ms, p99=876734.1ms)",
+      "dmChannelsLatestMessagesPaginated (calls_7d=26436, p95=22608.3ms, p99=168918.9ms)",
+      "userActiveCalls (calls_7d=26038, p95=20725.8ms, p99=123220.4ms)",
+      "getUsersV2 (calls_7d=17339, p95=30171.4ms, p99=624505.8ms)",
+      "userActivitiesPaginatedV2 (calls_7d=37056, p95=11677.9ms, p99=83817.1ms)",
+      "userUnreadActivities (calls_7d=23136, p95=18557.5ms, p99=162860.3ms)",
+      "channelParticipants (calls_7d=27157, p95=14664.4ms, p99=94979.3ms)",
+      "channelConversationsPaginatedV3 (calls_7d=270982, p95=1291.9ms, p99=10118.7ms)",
+      "userMissedCalls (calls_7d=18491, p95=17282.5ms, p99=88556.4ms)"
+    ],
+    "suspicious_identical_maxima": "Many queries share identical max latencies (~1,437,0xx ms / ~34,100,5xx ms / ~66,101,0xx ms). Recur across unrelated queries => backgrounded/suspended tabs resolving on refocus, not compute. Exclude client max/p99 from hard gates.",
+    "socket_instability": "websocket_connection_failed (1803364/7d) vs successful (530228/7d). Root cause of most client-perceived query tail. Any change to the socket/reconnect path must move this ratio DOWN."
+  },
+  "caveats": [
+    "Client-perceived latency (zero_query_complete.latency) != server engine time. The zero-cache engine is HEALTHY (7d: hydration p99 ~5.4s, advance p99 ~42ms, poke p99 ~1.6s). Multi-second/minute client tails are dominated by socket reconnects and backgrounded tabs.",
+    "Gate engine regressions on server_baselines_ms (PRIMARY) and health_gates. Client p50 = robust user signal; client p95/p99 = directional WATCH only.",
+    "Client latency percentiles are 72h (not 7d): the 7d quantile aggregation over ~3.5M query events overloads the Victoria Logs backend and returns empty. Counts/weights ARE true 7d.",
+    "ivm_advance server histogram is a 1h rate sample (increase[7d] returns null for that series).",
+    "'skewed:true' on many client events = client/server clock skew; absolute latency on skewed samples is not authoritative.",
+    "Refresh weekly and after each release; recompute pass_* margins if the traffic mix shifts."
+  ]
+}

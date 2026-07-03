@@ -1,0 +1,29 @@
+# --- Secrets / credentials — NEVER commit ---
+# minted JWTs (real signed tokens)
+harness/auth-pool.json
+*.jwt
+.env
+.env.*
+
+# --- Real data / PII-adjacent — do not commit ---
+# real PROD entity IDs
+harness/id-pool.json
+harness/id-pool.prod.json
+# sandbox entity IDs (regenerate: tools/gen_id_pool_db.py)
+harness/id-pool.sandbox.json
+# raw telemetry pulls (log samples contain user emails)
+raw/
+
+# --- Generated / environment-specific — regenerable per rig ---
+# harvested via run-art-local.sh --refresh
+harness/client-schema.json
+# fitted via tools/fit_remote_schema.py
+harness/client-schema.remote.json
+# run/gate reports, logs, blessed local baselines, heap snapshots
+reports/
+
+# --- Local tooling ---
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
