@@ -50,9 +50,9 @@ from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from workload import (  # noqa: E402
-    ArgResolver, WeightedSampler, MutationSampler, load_baseline,
+    ArgResolver, WeightedSampler, MutationSampler, ImpactIndex, load_baseline,
     query_put, query_del, change_desired_queries_message, init_connection_message,
-    custom_mutation, push_message,
+    custom_mutation, push_message, MUTATION_ARG_BUILDERS,
 )
 
 # Current mono protocol version (packages/zero-protocol/src/protocol-version.ts).
@@ -102,6 +102,9 @@ class Config:
     auth_pool: Optional[list] = None  # [{token, userID}] assigned round-robin
     zipf_s: float = 0.0               # recorded in the run config for G5 shape matching
     profile: Optional[str] = None     # behavior profile name (G5 shape component)
+    # --- impact-aware mutation targeting (G14; see workload.ImpactIndex) ---
+    impact_path: Optional[str] = None
+    impact_bias: float = 0.75         # P(aim at a subscribed query's entity)
 
 
 @dataclass
@@ -132,10 +135,21 @@ class Stats:
     # separately so steady-state latency stays a clean regression signal.
     latencies_initial_ms: list[float] = field(default_factory=list)
     per_query: dict[str, int] = field(default_factory=dict)
+    # steady-state hydration latency per query NAME — the attribution that
+    # turns "p50 regressed 24x" into "THESE queries regressed" (2026-07-06:
+    # Go 837ms vs TS 34ms steady p50 on identical 50c mixes needed exactly
+    # this to be diagnosable). Initial-phase samples are excluded, same as
+    # client_latency_steady_ms.
+    lat_by_query: dict[str, list] = field(default_factory=dict)
     hydrated_queries: set[str] = field(default_factory=set)  # names that got a gotQueriesPatch put
     per_mutation: dict[str, int] = field(default_factory=dict)
     per_error: dict[str, int] = field(default_factory=dict)
     per_tag: dict[str, int] = field(default_factory=dict)
+    # impact-edge coverage (G14): (query, mutator) edges where the mutator
+    # fired while the query was subscribed on the same client.
+    impact_edges: set = field(default_factory=set)
+    impact_targeted: int = 0
+    impact_fallback: int = 0
 
     def merge(self, o: "Stats") -> None:
         self.opened += o.opened
@@ -160,8 +174,13 @@ class Stats:
         self.latencies_ms.extend(o.latencies_ms)
         self.latencies_initial_ms.extend(o.latencies_initial_ms)
         self.hydrated_queries |= o.hydrated_queries
+        self.impact_edges |= o.impact_edges
+        self.impact_targeted += o.impact_targeted
+        self.impact_fallback += o.impact_fallback
         for k, v in o.per_query.items():
             self.per_query[k] = self.per_query.get(k, 0) + v
+        for k, v in o.lat_by_query.items():
+            self.lat_by_query.setdefault(k, []).extend(v)
         for k, v in o.per_mutation.items():
             self.per_mutation[k] = self.per_mutation.get(k, 0) + v
         for k, v in o.per_error.items():
@@ -237,6 +256,7 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
     desired: set[str] = set()  # every hash ever desired — CVR keeps them per
                                # client group across sessions, so this must too
     hash_name: dict[str, str] = {}  # hash -> query name (for coverage tracking)
+    hash_args: dict[str, dict] = {}  # hash -> args obj (impact-targeted mutations)
     retired_pending: list[str] = []  # old clientIDs to announce in deleted.clientIDs
     first_session = True
     is_zombie = cfg.lifecycle and rng.random() < cfg.zombie_pct
@@ -310,6 +330,7 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
             active.append(put["hash"])
             desired.add(put["hash"])
             hash_name[put["hash"]] = name
+            hash_args[put["hash"]] = (put.get("args") or [{}])[0]
             stats.puts_sent += 1
             stats.per_query[name] = stats.per_query.get(name, 0) + 1
 
@@ -354,8 +375,20 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                     await asyncio.sleep(rng.uniform(0, interval))
                     while time.perf_counter() < session_deadline and not stop.is_set():
                         now_ms = int(time.time() * 1000)
-                        built = msampler.build(resolver, now_ms)
+                        if msampler.impact is not None:
+                            sub = [(hash_name[h], hash_args.get(h))
+                                   for h in active if h in hash_name]
+                            built, edges, targeted = msampler.build_targeted(
+                                sub, resolver, now_ms, rng, cfg.impact_bias)
+                        else:
+                            built, edges, targeted = msampler.build(resolver, now_ms), set(), False
                         if built is not None:
+                            if msampler.impact is not None:
+                                if targeted:
+                                    stats.impact_targeted += 1
+                                else:
+                                    stats.impact_fallback += 1
+                                stats.impact_edges |= edges
                             name, args = built
                             mid += 1
                             msg = push_message(
@@ -488,6 +521,9 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                                         stats.latencies_initial_ms.append(dt)
                                     else:
                                         stats.latencies_ms.append(dt)
+                                        if h in hash_name:
+                                            stats.lat_by_query.setdefault(
+                                                hash_name[h], []).append(dt)
 
                 await asyncio.gather(churn(), reader(), mutator())
 
@@ -625,7 +661,8 @@ def dry_run(cfg: Config, sampler, resolver, n: int,
     print("\nOK: plan is valid. Add --target + auth and drop --dry-run to drive load.")
 
 
-def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_dir: str) -> str:
+def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_dir: str,
+                  impact: Optional[ImpactIndex] = None) -> str:
     def dist(vals: list[float]) -> dict:
         s = sorted(vals)
         def pct(p):
@@ -664,6 +701,14 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
         "client_latency_steady_ms": dist(stats.latencies_ms),
         "client_latency_initial_ms": dist(stats.latencies_initial_ms),
         "top_queries_driven": sorted(stats.per_query.items(), key=lambda kv: -kv[1])[:15],
+        # steady-phase latency dist per query name (>=5 samples) — diff two
+        # runs' maps to attribute an aggregate regression to specific queries.
+        "latency_by_query": {
+            name: dist(v)
+            for name, v in sorted(stats.lat_by_query.items(),
+                                  key=lambda kv: -sorted(kv[1])[len(kv[1]) // 2])
+            if len(v) >= 5
+        },
         "coverage": {
             # driven = distinct query names we desired; hydrated = names that
             # got at least one gotQueriesPatch ack. never_hydrated is the
@@ -678,6 +723,24 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
                 "resume catch-up. PRIMARY regression signal is server histograms "
                 "via evaluate_gates.py.",
     }
+    # G14 impact-edge coverage: reachable = impact edges whose query AND
+    # mutator were both driven this run; exercised = fired co-active on one
+    # client (MutationSampler.build_targeted). uncovered_sample names concrete
+    # (query <- mutator) pairs to chase — actionable, not just a percentage.
+    if impact is not None:
+        reachable = {(q, m) for (q, m) in impact.edges
+                     if q in stats.per_query and m in stats.per_mutation}
+        exercised = stats.impact_edges & reachable
+        uncovered = sorted(reachable - exercised)
+        summary["impact"] = {
+            "map": os.path.basename(impact.path),
+            "edges_in_map": len(impact.edges),
+            "edges_reachable": len(reachable),
+            "edges_exercised": len(exercised),
+            "targeted_picks": stats.impact_targeted,
+            "fallback_picks": stats.impact_fallback,
+            "uncovered_sample": uncovered[:8],
+        }
     os.makedirs(os.path.abspath(out_dir), exist_ok=True)
     path = os.path.join(os.path.abspath(out_dir),
                         "run-" + time.strftime("%Y%m%d-%H%M%S") + ".json")
@@ -719,6 +782,11 @@ def main() -> int:
                          "requires --i-know-this-writes)")
     ap.add_argument("--i-know-this-writes", action="store_true",
                     help="confirm you understand --enable-mutations writes to the target DB")
+    ap.add_argument("--impact", default=None,
+                    help="query-mutator impact matrix json (tools/gen_impact_matrix.sh): "
+                         "impact-aware mutation targeting + G14 edge coverage")
+    ap.add_argument("--impact-bias", type=float, default=0.75,
+                    help="P(aim a mutation at a subscribed query's own entity) (default 0.75)")
     ap.add_argument("--mutations-per-min", type=float, default=None,
                     help="mutations per client per minute when enabled (default 4)")
     ap.add_argument("--lifecycle", action="store_true", default=None,
@@ -808,6 +876,8 @@ def main() -> int:
         auth_pool=auth_pool,
         zipf_s=a.zipf_s,
         profile=profile_name,
+        impact_path=a.impact,
+        impact_bias=a.impact_bias,
     )
 
     rng = random.Random(a.seed)
@@ -830,8 +900,22 @@ def main() -> int:
         print(f"MUTATIONS ON: {len(msampler.supported)} types "
               f"({supported_pct:.0f}% of prod write volume), "
               f"{a.mutations_per_min}/min per client — writes as the authenticated user")
+        if a.impact:
+            idx = ImpactIndex.from_file(a.impact, set(MUTATION_ARG_BUILDERS))
+            if idx is None:
+                print(f"WARN: --impact {a.impact} unreadable — targeting off, "
+                      "G14 will SKIP", file=sys.stderr)
+                cfg.impact_path = None
+            else:
+                msampler.impact = idx
+                print(f"IMPACT TARGETING ON: {len(idx.edges)} query-mutator edges "
+                      f"for the {len(msampler.supported)} buildable mutators "
+                      f"(bias {a.impact_bias:.0%})")
     else:
         msampler = None
+        if a.impact:
+            print("NOTE: --impact has no effect without --enable-mutations", file=sys.stderr)
+            cfg.impact_path = None
 
     if cfg.lifecycle:
         print(f"LIFECYCLE ON: mean session {cfg.session_mean_s:.0f}s, "
@@ -858,7 +942,8 @@ def main() -> int:
         return 2
     end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
 
-    path = write_summary(cfg, stats, start_iso, end_iso, a.out_dir)
+    path = write_summary(cfg, stats, start_iso, end_iso, a.out_dir,
+                         impact=msampler.impact if msampler else None)
     window_min = max(1, (a.duration + 120) // 60)
     print(f"\nrun summary: {path}")
     print(f"opened={stats.opened}/{cfg.connections} puts={stats.puts_sent} "
@@ -873,6 +958,9 @@ def main() -> int:
               f"invariant_violations={stats.invariants}")
     elif stats.invariants:
         print(f"INVARIANT VIOLATIONS: {stats.invariants}")
+    if msampler is not None and msampler.impact is not None:
+        print(f"impact: edges exercised={len(stats.impact_edges)} "
+              f"targeted={stats.impact_targeted} fallback={stats.impact_fallback}")
     if stats.per_error:
         print("error kinds:")
         for k, v in sorted(stats.per_error.items(), key=lambda kv: -kv[1])[:8]:

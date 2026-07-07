@@ -30,6 +30,15 @@
 #                                                        #   churn ~1/3min, muts ~1/18min, 12.7min sessions,
 #                                                        #   lifecycle on — vs the default ~250x-hot torture
 #                                                        #   shape; needs >=15-30min to accumulate samples)
+#   ./run-art-local.sh --trace raw/traces/trace-last10m.ndjson --clean
+#                                                        # TRACE-FAITHFUL replay (harness/trace_replay.py):
+#                                                        #   real prod session sequences/timing/interleaving,
+#                                                        #   101-identity auth pool, unscoped trace id-pool,
+#                                                        #   auto-seeds user_groups/canvases (artseed-%).
+#                                                        #   G13 log window + gate wired like any run.
+#                                                        #   --clean strongly recommended: accumulated art-%
+#                                                        #   CVR groups poison trace latencies (52ms->26s class)
+#   ./run-art-local.sh --trace T --time-compress 4       # same trace at 4x intensity
 #   ./run-art-local.sh --sandbox other-name --refresh    # different sandbox / re-harvest
 #
 # Every run samples zero-cache resources (docker stats + pprof + CVR rows) and
@@ -41,9 +50,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
 SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
-MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0
-PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0
-CONNS_SET=0; DUR_SET=0
+MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
+PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
+CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
@@ -54,7 +63,10 @@ while [ $# -gt 0 ]; do
     --mutations) MUTATIONS=1; shift;;
     --mutations-per-min) MUT_RATE="$2"; MUT_SET=1; shift 2;;
     --prod-profile) PROFILE="profiles/prod-7d.json"; shift;;
+    --swap) SWAP=1; shift;;
     --profile) PROFILE="$2"; shift 2;;
+    --trace) TRACE="$2"; shift 2;;
+    --time-compress) TCOMPRESS="$2"; shift 2;;
     --user-id) USER_ID="$2"; shift 2;;
     --users) USERS="$2"; shift 2;;
     --lifecycle) LIFECYCLE=1; shift;;
@@ -64,11 +76,30 @@ while [ $# -gt 0 ]; do
     --oracle) ORACLE=1; shift;;
     --chaos) CHAOS=1; LIFECYCLE=1; shift;;
     --negative) NEGATIVE=1; shift;;
+    --mutation-matrix) MUTMATRIX=1; shift;;
     --refresh) REFRESH=1; shift;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+# Trace mode replays REAL prod sessions — every statistical-shape knob would
+# be silently ignored; make the conflict loud instead.
+if [ -n "$TRACE" ]; then
+  [ -f "$TRACE" ] || { echo "ERROR: trace file not found: $TRACE" >&2; exit 2; }
+  if [ -n "$PROFILE" ] || [ "$ZIPF" != "0" ] || [ "$LIFECYCLE" = "1" ] || \
+     [ "$SOAK" = "1" ] || [ "$CONNS_SET" = "1" ] || [ "$WS_SET" = "1" ] || \
+     [ "$CHURN_SET" = "1" ] || [ "$MUT_SET" = "1" ] || [ "$DUR_SET" = "1" ]; then
+    echo "ERROR: --trace is incompatible with statistical-shape flags" >&2
+    echo "  (--profile/--prod-profile/--zipf/--lifecycle/--soak/--connections/" >&2
+    echo "   --working-set/--churn-ms/--mutations-per-min/--duration — the" >&2
+    echo "   trace itself defines shape, timing and duration)" >&2
+    exit 2
+  fi
+  if [ "$CLEAN" = "0" ]; then
+    echo "NOTE: --trace without --clean — accumulated art-% CVR groups skew" >&2
+    echo "  trace latencies (the 52ms->26s class); pass --clean for A/B runs" >&2
+  fi
+fi
 # --soak defaults (20 conns / 1h) yield to explicit flags so a smoke sweep can
 # shrink the window (leak slopes still need >=15min to be gated, see G6).
 if [ "$SOAK" = "1" ]; then
@@ -84,7 +115,24 @@ PG="xyne-sandbox-postgres"
 DB="sandbox_${SLUG}_db"
 CVR_SCHEMA="sandbox_${SLUG}_0/cvr"
 TARGET="ws://${SANDBOX}.localhost/zero"
+MIRROR_POD="xyne-sandbox-${SANDBOX}-zero-cache-ts"
+MIRROR_URL="ws://${SANDBOX}.localhost/zero-ts"
+PPROF_FLAGS=()
+if [ "$SWAP" = "1" ]; then
+  # --swap: TS 1.7 becomes the PRIMARY (replay/negative/sampler/clean target),
+  # Go becomes the oracle MIRROR. Validates the reference itself: TS latency
+  # profile, TS error semantics under the negative suite, and the symmetric
+  # G8 comparison. NB: G5 then compares TS against the Go-blessed baseline —
+  # read it as the A/B ratio gate, not an absolute regression.
+  ZCACHE="xyne-sandbox-${SANDBOX}-zero-cache-ts"
+  CVR_SCHEMA="sandbox_${SLUG}_ts_0/cvr"
+  TARGET="ws://${SANDBOX}.localhost/zero-ts"
+  MIRROR_POD="xyne-sandbox-${SANDBOX}-zero-cache"
+  MIRROR_URL="ws://${SANDBOX}.localhost/zero"
+  PPROF_FLAGS=(--pprof '')   # TS pod is Node — no Go pprof endpoint
+fi
 POOL="harness/id-pool.sandbox.json"
+if [ -n "$TRACE" ]; then POOL="harness/id-pool.trace.json"; fi
 CSCHEMA="harness/client-schema.json"
 PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
 
@@ -130,15 +178,26 @@ SECRET="$(docker exec "$BACKEND" printenv ZERO_AUTH_SECRET)"
 
 # --- 1b) optional clean slate ---------------------------------------------------
 if [ "$CLEAN" = "1" ]; then
-  echo "== purging art-% CVR rows + restarting zero-cache =="
-  psql_q "DELETE FROM \"$CVR_SCHEMA\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null
+  echo "== purging art-% CVR rows (both pods) + restarting primary =="
+  psql_q "DELETE FROM \"sandbox_${SLUG}_0/cvr\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+  psql_q "DELETE FROM \"sandbox_${SLUG}_ts_0/cvr\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
   docker restart "$ZCACHE" >/dev/null
   for _ in $(seq 1 45); do
     ST="$(docker inspect -f '{{.State.Health.Status}}' "$ZCACHE" 2>/dev/null || echo none)"
     [ "$ST" = "healthy" ] && break
+    # TS pod defines no healthcheck — "running" is the best signal; then let
+    # the replication-drain wait below cover actual readiness.
+    if [ "$ST" = "none" ] || [ -z "$ST" ]; then
+      docker ps --format '{{.Names}}' | grep -qx "$ZCACHE" && { sleep 3; break; }
+    fi
     sleep 2
   done
-  [ "$ST" = "healthy" ] || { echo "ERROR: $ZCACHE not healthy after restart ($ST)" >&2; exit 1; }
+  if [ "$SWAP" = "1" ]; then wait_mirror_ready "$ZCACHE" 120 || true; fi
+  if [ "$ST" != "healthy" ]; then
+    # no-healthcheck pods (TS) pass on "running"
+    docker ps --format '{{.Names}}' | grep -qx "$ZCACHE" \
+      || { echo "ERROR: $ZCACHE not running after restart ($ST)" >&2; exit 1; }
+  fi
 fi
 
 # --- 2) pick the best-connected user(s) (most channel memberships) ------------
@@ -179,21 +238,79 @@ if [ "$N_IDENT" -gt 1 ]; then
 else
   echo "== identity: $FIRST_EMAIL ($FIRST_UID) =="
 fi
+# Trace mode: overwrite the auth pool with the FULL identity sweep (sandbox
+# admin + all bulk users) so prod users map onto distinct real visibilities —
+# the 4x run collapsed 278 prod users onto 2 identities. $JWT/$FIRST_UID from
+# above still serve the oracle/mutation-matrix steps.
+if [ -n "$TRACE" ]; then
+  echo "== trace mode: minting full auth pool (build_auth_pool.py) =="
+  "$PY" tools/build_auth_pool.py --backend-container "$BACKEND" \
+    --pg-container "$PG" --db "$DB"
+  N_IDENT="$("$PY" -c "import json;print(len(json.load(open('$AUTH_POOL'))))")"
+fi
+
+# --- 3b) source-derived arg schemas + impact matrix (from the backend image) ---
+# Both extracted from the DEPLOYED container (same authority rule as the
+# clientSchema step below). arg-schemas kill the stale-scalar class — enum
+# values are derived, not hand-maintained (viewMode:"kanban" survived three
+# backend upgrades as a hand default). The impact matrix powers replay's
+# impact-aware mutation targeting (G14) and matrix_oracle's dark-table
+# attribution. Best-effort: on failure the pool falls back to hand scalars
+# and G14 reads SKIP.
+if [ "$REFRESH" = "1" ] || [ ! -f raw/arg-schemas.source.json ]; then
+  ./tools/gen_arg_schemas.sh "$BACKEND" \
+    || echo "  (arg-schema extraction failed — pool uses hand scalars)" >&2
+fi
+if [ "$REFRESH" = "1" ] || [ ! -f raw/query-mutator-impact.json ]; then
+  ./tools/gen_impact_matrix.sh "$BACKEND" \
+    || echo "  (impact matrix extraction failed — G14 will SKIP)" >&2
+fi
 
 # --- 4) id-pool from the sandbox DB (user-scoped for mutation participation) ---
 # Multi-user: intersect memberships so every identity passes participation checks.
-if [ "$REFRESH" = "1" ] || [ ! -f "$POOL" ] || [ "$N_IDENT" -gt 1 ]; then
+# Trace mode: UNSCOPED harvest into its own pool file — scoping to 101 users'
+# intersection would empty the channel pool; trace replay needs the global
+# hotness ranking for its rank-to-rank id mapping. Also auto-seeds the tables
+# bulk-seed leaves empty (user_groups/canvases; idempotent artseed-% rows) so
+# the top trace keys keep mapping after a BULK_WIPE reseed.
+if [ -n "$TRACE" ]; then
+  "$PY" tools/seed_aux_tables.py --pg-container "$PG" --db "$DB" \
+    --groups 250 --canvases 100 | sed 's/^/  seed: /'
+  if [ "$REFRESH" = "1" ] || [ ! -f "$POOL" ]; then
+    echo "== harvesting UNSCOPED trace id-pool from $DB =="
+    "$PY" tools/gen_id_pool_db.py --container "$PG" --db "$DB" --out "$POOL"
+  fi
+elif [ "$REFRESH" = "1" ] || [ ! -f "$POOL" ] || [ "$N_IDENT" -gt 1 ]; then
   echo "== harvesting id-pool from $DB (users: $N_IDENT) =="
   "$PY" tools/gen_id_pool_db.py --container "$PG" --db "$DB" --user-id "$ALL_UIDS" --out "$POOL"
 fi
 
-# --- 5) clientSchema from the CVR (any previously-connected client group) ------
+# --- 5) clientSchema — authoritative extraction from the backend image ---------
+# The wire clientSchema is derived from the SHARED package schema (@xyne/shared,
+# what the dashboard bundles) via zero's own clientSchemaFrom(). Extracting it
+# from the backend container is authoritative for the DEPLOYED backend commit —
+# no "open the app in a browser first" dependency, and it can never go stale
+# against the running image. Falls back to the legacy CVR extraction (which
+# only knows schemas of clients that already connected) if the exec fails.
 if [ "$REFRESH" = "1" ] || [ ! -f "$CSCHEMA" ]; then
-  echo "== extracting clientSchema from \"$CVR_SCHEMA\".instances =="
-  CS="$(psql_q "SELECT \"clientSchema\" FROM \"$CVR_SCHEMA\".instances
-                WHERE \"clientSchema\" IS NOT NULL ORDER BY \"lastActive\" DESC LIMIT 1;")"
-  [ -n "$CS" ] || { echo "ERROR: CVR has no clientSchema — open the sandbox app once in a browser first" >&2; exit 1; }
-  printf '%s' "$CS" > "$CSCHEMA"
+  echo "== extracting clientSchema from $BACKEND (@xyne/shared -> clientSchemaFrom) =="
+  CS="$(docker exec "$BACKEND" sh -c 'cat > /app/.art-extract-cs.mts << "EOF"
+// @ts-nocheck
+import {clientSchemaFrom} from "./node_modules/@rocicorp/zero/out/zero-schema/src/builder/schema-builder.js";
+import {schema} from "@xyne/shared";
+console.log(JSON.stringify(clientSchemaFrom(schema).clientSchema));
+EOF
+cd /app && npx tsx .art-extract-cs.mts; rc=$?; rm -f /app/.art-extract-cs.mts; exit $rc' 2>/dev/null | tail -1 || true)"
+  if [ -n "$CS" ] && printf '%s' "$CS" | "$PY" -c 'import json,sys; d=json.load(sys.stdin); assert "tables" in d and len(d["tables"])>0' 2>/dev/null; then
+    printf '%s' "$CS" > "$CSCHEMA"
+    echo "  clientSchema: $("$PY" -c "import json;print(len(json.load(open('$CSCHEMA'))['tables']))") tables (from backend image)"
+  else
+    echo "  backend extraction failed — falling back to CVR \"$CVR_SCHEMA\".instances"
+    CS="$(psql_q "SELECT \"clientSchema\" FROM \"$CVR_SCHEMA\".instances
+                  WHERE \"clientSchema\" IS NOT NULL ORDER BY \"lastActive\" DESC LIMIT 1;")"
+    [ -n "$CS" ] || { echo "ERROR: CVR has no clientSchema — open the sandbox app once in a browser first" >&2; exit 1; }
+    printf '%s' "$CS" > "$CSCHEMA"
+  fi
 fi
 
 # --- 6) drive the replay (resource sampler runs alongside) ---------------------
@@ -210,13 +327,36 @@ LIFEFLAGS=()
 if [ "$LIFECYCLE" = "1" ]; then LIFEFLAGS=(--lifecycle); fi
 ZIPFFLAGS=()
 if [ "$ZIPF" != "0" ]; then ZIPFFLAGS=(--zipf-s "$ZIPF"); fi
+# impact-aware mutation targeting (G14) — only meaningful with mutations on
+IMPACTFLAGS=()
+if [ "$MUTATIONS" = "1" ] && [ -f raw/query-mutator-impact.json ]; then
+  IMPACTFLAGS=(--impact raw/query-mutator-impact.json)
+fi
 AUTHFLAGS=(--auth-token "$JWT" --extra-param "userID=$FIRST_UID")
 if [ "$N_IDENT" -gt 1 ]; then AUTHFLAGS=(--auth-pool "$AUTH_POOL"); fi
 
 TAG="$(date +%Y%m%d-%H%M%S)"
 SAMPLES="reports/resources-$TAG.ndjson"
+# Trace mode: run length is the trace's own span / compression (+ tail), not
+# --duration. Compute it so the resource sampler covers the whole run.
+if [ -n "$TRACE" ]; then
+  DURATION="$("$PY" - "$TRACE" "$TCOMPRESS" <<'PYEOF'
+import json, math, sys
+path, compress = sys.argv[1], float(sys.argv[2])
+with open(path) as f:
+    f.readline()
+    end = 0
+    for ln in f:
+        s = json.loads(ln)
+        end = max(end, s["offset_ms"] + (s["events"][-1]["dt"] if s["events"] else 0))
+print(int(math.ceil(end / 1000.0 / compress)) + 60)
+PYEOF
+)"
+  echo "== trace run window: ${DURATION}s (span/compress + tail) =="
+fi
 "$PY" tools/resource_sampler.py --container "$ZCACHE" --pg-container "$PG" \
   --db "$DB" --cvr-schema "$CVR_SCHEMA" --out "$SAMPLES" \
+  ${PPROF_FLAGS[@]+"${PPROF_FLAGS[@]}"} \
   --interval 10 --duration $((DURATION + 60)) &
 SAMPLER_PID=$!
 CHAOS_PID=""
@@ -252,14 +392,34 @@ if [ -n "$PROFILE" ]; then
   if [ "$CHURN_SET" = "1" ]; then SHAPEFLAGS+=(--churn-ms "$CHURN_MS"); fi
 fi
 
-echo "== replaying against $TARGET (${CONNS} conns, ${DURATION}s${PROFILE:+, profile=$PROFILE}) =="
+if [ -n "$TRACE" ]; then
+  echo "== trace-replaying $TRACE against $TARGET (compress ${TCOMPRESS}x, ~${DURATION}s) =="
+else
+  echo "== replaying against $TARGET (${CONNS} conns, ${DURATION}s${PROFILE:+, profile=$PROFILE}) =="
+fi
+# G13 window start: everything the pods log from here until the verdict is
+# attributable to this run (30s pre-margin applied by log_gate.py --since).
+RUN_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e
-"$PY" harness/replay.py \
-  --target "$TARGET" --id-pool "$POOL" --client-schema "$CSCHEMA" \
-  --connections "$CONNS" \
-  --duration "$DURATION" "${AUTHFLAGS[@]}" \
-  ${SHAPEFLAGS[@]+"${SHAPEFLAGS[@]}"} ${PROFILEFLAGS[@]+"${PROFILEFLAGS[@]}"} \
-  ${LIFEFLAGS[@]+"${LIFEFLAGS[@]}"} ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${MUTFLAGS[@]+"${MUTFLAGS[@]}"}
+if [ -n "$TRACE" ]; then
+  # trace mutation timing comes from the trace itself — no rate flag
+  TRACE_MUTFLAGS=()
+  if [ "$MUTATIONS" = "1" ]; then
+    TRACE_MUTFLAGS=(--enable-mutations --i-know-this-writes)
+  fi
+  "$PY" harness/trace_replay.py --trace "$TRACE" --target "$TARGET" \
+    --auth-pool "$AUTH_POOL" --id-pool "$POOL" --client-schema "$CSCHEMA" \
+    --time-compress "$TCOMPRESS" \
+    ${TRACE_MUTFLAGS[@]+"${TRACE_MUTFLAGS[@]}"}
+else
+  "$PY" harness/replay.py \
+    --target "$TARGET" --id-pool "$POOL" --client-schema "$CSCHEMA" \
+    --connections "$CONNS" \
+    --duration "$DURATION" "${AUTHFLAGS[@]}" \
+    ${SHAPEFLAGS[@]+"${SHAPEFLAGS[@]}"} ${PROFILEFLAGS[@]+"${PROFILEFLAGS[@]}"} \
+    ${LIFEFLAGS[@]+"${LIFEFLAGS[@]}"} ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${MUTFLAGS[@]+"${MUTFLAGS[@]}"} \
+    ${IMPACTFLAGS[@]+"${IMPACTFLAGS[@]}"}
+fi
 set -e
 
 # let the sampler catch the post-run settle (GC behavior), then stop it
@@ -287,9 +447,9 @@ fi
 # --- 6b) optional differential oracle (gate G8) ---------------------------------
 ORACLE_REPORT=""
 if [ "$ORACLE" = "1" ]; then
-  ZCACHETS="xyne-sandbox-${SANDBOX}-zero-cache-ts"
+  ZCACHETS="$MIRROR_POD"
   MIRRORFLAGS=()
-  # The TS mirror silently exits whenever the backend is recreated (compose
+  # The mirror pod silently exits whenever the backend is recreated (compose
   # dep) — same failure mode as zero-cache itself. A dead mirror must NOT
   # silently degrade to self-diff: with writes on, self-diff compares the pod
   # against itself across mutations and produces guaranteed false mismatches
@@ -306,7 +466,7 @@ if [ "$ORACLE" = "1" ]; then
     fi
   fi
   if docker ps --format '{{.Names}}' | grep -qx "$ZCACHETS"; then
-    MIRRORFLAGS=(--mirror "ws://${SANDBOX}.localhost/zero-ts")
+    MIRRORFLAGS=(--mirror "$MIRROR_URL")
   elif [ "$MUTATIONS" = "1" ]; then
     echo "NOTE: $ZCACHETS unavailable and mutations are ON — SKIPPING oracle" >&2
     echo "  (self-diff with writes is not a valid oracle; G8 will read SKIP)" >&2
@@ -355,14 +515,56 @@ if [ "$NEGATIVE" = "1" ]; then
   fi
 fi
 
+# --- 6c2) optional mutation matrix (gate G15) -------------------------------------
+# Push-path mutator TYPE coverage: every synthesizable mutator fired through
+# the real client push path, wave-converged Go-vs-TS (harness/mutation_matrix.py).
+# Runs AFTER negative (its pushes must not skew G11's forged-state scenarios)
+# and needs the mirror pod for the diff (same requirement as the oracle).
+MUTMATRIX_REPORT=""
+if [ "$MUTMATRIX" = "1" ]; then
+  if ! docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+    echo "NOTE: $MIRROR_POD not running — SKIPPING mutation matrix (G15 reads SKIP)" >&2
+  else
+    MUTMATRIX_REPORT="reports/mutmatrix-$TAG.json"
+    echo "== mutation matrix (G15) =="
+    set +e
+    "$PY" harness/mutation_matrix.py \
+      --primary "$TARGET" --mirror "$MIRROR_URL" \
+      --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
+      --id-pool "$POOL" --client-schema "$CSCHEMA" \
+      --pg-container "$PG" --pg-user xyne --pg-db "$DB" \
+      --i-know-this-writes \
+      --out "$MUTMATRIX_REPORT"
+    set -e
+  fi
+fi
+
+# --- 6d) server-log health scan (gate G13) ---------------------------------------
+# Adopted from staging-regression (feature/art): client-side gates can't see a
+# sidecar crash + silent fallback-to-TS — which would turn the G8 oracle into a
+# TS-vs-TS no-op and invalidate every A/B latency number. Scan the primary (and
+# the mirror, when it's up — its advance-resets corrupt G8 too) for blocking
+# patterns over exactly this run's window. Always on: it's a 2s docker-logs grep.
+LOG_REPORT="reports/logs-$TAG.json"
+LOG_CONTAINERS="$ZCACHE"
+if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+  LOG_CONTAINERS="$ZCACHE,$MIRROR_POD"
+fi
+set +e
+"$PY" tools/log_gate.py --containers "$LOG_CONTAINERS" \
+  --since "$RUN_START_ISO" --out "$LOG_REPORT"
+set -e
+
 # --- 7) the verdict --------------------------------------------------------------
 echo ""
 set +e
 "$PY" tools/local_gate.py --resources "reports/resources-$TAG.summary.json" \
   --out "reports/gate-$TAG.json" \
+  --logs "$LOG_REPORT" \
   ${ORACLE_REPORT:+--oracle "$ORACLE_REPORT"} \
   ${CHAOS_REPORT:+--chaos "$CHAOS_REPORT"} \
-  ${NEGATIVE_REPORT:+--negative "$NEGATIVE_REPORT"}
+  ${NEGATIVE_REPORT:+--negative "$NEGATIVE_REPORT"} \
+  ${MUTMATRIX_REPORT:+--mut-matrix "$MUTMATRIX_REPORT"}
 GATE=$?
 set -e
 echo ""

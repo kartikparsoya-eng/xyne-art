@@ -91,6 +91,11 @@ def shape_key(config: dict | None) -> str | None:
         key += f"-zipf{config['zipf_s']:g}"
     if config.get("profile"):
         key += f"-{config['profile']}"
+    # trace runs: N x time compression = N x intensity — a 2x run's latencies
+    # are NOT comparable to a 1x baseline of the same trace (measured: steady
+    # p50 83ms @1x vs 128ms @2x on the same build). Separate shape per factor.
+    if config.get("time_compress") and config["time_compress"] != 1:
+        key += f"-x{config['time_compress']:g}"
     return key
 
 
@@ -119,10 +124,18 @@ def main() -> int:
                     help="chaos.py summary json for gate G10 (default: skip)")
     ap.add_argument("--negative", default=None,
                     help="negative.py report json for gate G11 (default: skip)")
+    ap.add_argument("--logs", default=None,
+                    help="log_gate.py report json for gate G13 (default: skip)")
+    ap.add_argument("--mut-matrix", default=None,
+                    help="mutation_matrix.py report json for gate G15 (default: skip)")
     ap.add_argument("--baseline", default=BASELINE_DEFAULT)
     ap.add_argument("--update-baseline", action="store_true",
                     help="bless this run's latencies as the baseline for its shape and exit")
     ap.add_argument("--latency-factor", type=float, default=1.5)
+    ap.add_argument("--per-query-factor", type=float, default=3.0,
+                    help="G5b: flag a query whose steady p50 exceeds baseline "
+                         "by this multiple (+100ms absolute, >=10 samples both "
+                         "sides; default 3.0)")
     ap.add_argument("--out", default=None,
                     help="write verdicts as JSON (consumed by tools/consolidate_gates.py)")
     a = ap.parse_args()
@@ -149,7 +162,12 @@ def main() -> int:
                        "config": run.get("config"),
                        "client_latency_ms": lat,
                        "client_latency_steady_ms": run.get("client_latency_steady_ms"),
-                       "client_latency_initial_ms": run.get("client_latency_initial_ms")}
+                       "client_latency_initial_ms": run.get("client_latency_initial_ms"),
+                       # per-query steady p50/p95 for G5b (>=10 samples only —
+                       # below that the percentiles are noise, not baseline)
+                       "latency_by_query": {
+                           k: v for k, v in (run.get("latency_by_query") or {}).items()
+                           if (v.get("samples") or 0) >= 10}}
         os.makedirs(os.path.dirname(os.path.abspath(a.baseline)), exist_ok=True)
         with open(a.baseline, "w") as f:
             json.dump({"format": 2, "shapes": shapes}, f, indent=2)
@@ -213,6 +231,7 @@ def main() -> int:
                         f"acked {c.get('mutation_ok', 0)}/{sent} ({ratio:.0%})"))
 
     # G5 latency vs the blessed baseline for this run's shape
+    g5_entry = None
     if not os.path.exists(a.baseline):
         results.append(("G5 latency", "SKIP",
                         "no local baseline — run --update-baseline on a good run"))
@@ -228,6 +247,7 @@ def main() -> int:
                             f"{', '.join(sorted(shapes))}) — bless a known-good "
                             "run of this shape with --update-baseline"))
         else:
+            g5_entry = entry
             # steady-state (churn puts) is the clean signal; session-open puts
             # hydrate behind resume catch-up. Compare steady only when both
             # sides have it (old baselines/reports predate the split).
@@ -248,6 +268,44 @@ def main() -> int:
                             f"[{key}/{which}] p50={cur_l.get('p50')} "
                             f"p95={cur_l.get('p95')} (within "
                             f"{a.latency_factor}x of baseline)"))
+
+    # G5b per-query latency multipliers (staging-regression adoption; pairs
+    # with replay.py's latency_by_query attribution). The aggregate G5 p50 can
+    # hide one query regressing 40x behind thousands of cheap puts — exactly
+    # the automationsList-x842 pattern the 2026-07-06 Go-vs-TS diff surfaced.
+    # Offenders need ratio > --per-query-factor AND +100ms absolute AND >=10
+    # samples on both sides AND a >=10ms baseline (3-min windows are noisy at
+    # low counts; sub-10ms baselines make ratios numerically meaningless).
+    # WATCH, not FAIL, while the signal is young.
+    base_pq = (g5_entry or {}).get("latency_by_query") or {}
+    run_pq = run.get("latency_by_query") or {}
+    if not base_pq or not run_pq:
+        results.append(("G5b query-lat", "SKIP",
+                        "blessed shape lacks latency_by_query — re-bless with "
+                        "--update-baseline" if g5_entry else
+                        "no blessed shape for this run"))
+    else:
+        offenders = []
+        compared = 0
+        for qname, b in base_pq.items():
+            r = run_pq.get(qname)
+            if not r or (r.get("samples") or 0) < 10 or (b.get("samples") or 0) < 10:
+                continue
+            bp, rp = b.get("p50") or 0, r.get("p50") or 0
+            if bp < 10:
+                continue
+            compared += 1
+            if rp > bp * a.per_query_factor and rp - bp > 100:
+                offenders.append((rp / bp, qname, bp, rp))
+        offenders.sort(reverse=True)
+        detail = f"{compared} queries compared (>=10 samples both sides)"
+        if offenders:
+            detail += " — " + ", ".join(
+                f"{q} x{ratio:.1f} (p50 {bp:.0f}->{rp:.0f}ms)"
+                for ratio, q, bp, rp in offenders[:4])
+            if len(offenders) > 4:
+                detail += f" (+{len(offenders) - 4} more)"
+        results.append(("G5b query-lat", "WATCH" if offenders else "PASS", detail))
 
     # G6 leak slopes (soak only) + OOM headroom (any window)
     def headroom_findings(res: dict) -> tuple[list[str], list[str]]:
@@ -401,6 +459,81 @@ def main() -> int:
         results.append(("G11 negative", "SKIP",
                         "no negative report (run with --negative)"))
 
+    # G13 server-log health (adopted from staging-regression, feature/art):
+    # blocking patterns — sidecar crash, fallback-to-TS, advance reset,
+    # resetting pipelines, advancement timeout — mean the pod under test
+    # silently stopped being the thing we're testing, which poisons G5/G8
+    # while every client-side gate stays green. FAIL on any blocking hit;
+    # WATCH on slow-SQLite / ERROR-volume thresholds (see tools/log_gate.py).
+    if a.logs and os.path.exists(a.logs):
+        with open(a.logs) as f:
+            lg = json.load(f)
+        v13 = lg.get("verdict", "ERROR")
+        det = "; ".join(lg.get("details", [])[:4]) or \
+            f"{len(lg.get('containers', {}))} container(s) clean"
+        results.append(("G13 log-health", v13, det))
+    else:
+        results.append(("G13 log-health", "SKIP",
+                        "no log report (tools/log_gate.py --containers ...)"))
+
+    # G14 impact-edge coverage (staging-regression adoption): did our writes
+    # actually land on tables that currently-subscribed queries read? Blind
+    # weighted sampling can ace G4 while never advancing a single subscribed
+    # pipeline; the impact matrix makes that coverage measurable and the
+    # uncovered edges nameable.
+    imp = run.get("impact")
+    if not imp:
+        results.append(("G14 impact-cov", "SKIP",
+                        "no impact block in run (needs raw/query-mutator-impact.json "
+                        "+ --mutations)"))
+    elif c.get("mutations_sent", 0) == 0:
+        results.append(("G14 impact-cov", "SKIP", "no mutations driven"))
+    else:
+        ex = imp.get("edges_exercised", 0)
+        reach = imp.get("edges_reachable", 0)
+        pct = ex / reach if reach else 0.0
+        tp, fp = imp.get("targeted_picks", 0), imp.get("fallback_picks", 0)
+        detail = (f"{ex}/{reach} reachable query-mutator edges exercised "
+                  f"({pct:.0%}); targeted {tp}/{tp + fp} picks")
+        unc = imp.get("uncovered_sample") or []
+        if unc:
+            detail += " — uncovered e.g. " + ", ".join(
+                f"{q}<-{m}" for q, m in unc[:3])
+        results.append(("G14 impact-cov",
+                        "PASS" if reach and pct >= 0.5 else "WATCH", detail))
+
+    # G15 mutator matrix (push-path TYPE coverage): every synthesizable
+    # mutator fired through the real push path, wave-converged Go-vs-TS.
+    # FAIL = persistent post-mutation divergence or harness protocol errors
+    # (the tool's own verdict); app-rejections/synth-invalid are coverage
+    # data. WATCH when nothing diverged but the applied fraction is low —
+    # a mostly-rejected matrix exercises validation, not writes.
+    if a.mut_matrix and os.path.exists(a.mut_matrix):
+        with open(a.mut_matrix) as f:
+            mm = json.load(f)
+        b = mm.get("buckets", {})
+        applied = b.get("applied", 0) + b.get("acked-no-detail", 0)
+        fired = mm.get("fired", 0)
+        detail = (f"{fired} fired / {mm.get('planned')} planned "
+                  f"({mm.get('mutators_in_catalog')} in catalog): "
+                  f"applied={applied} app-rej={b.get('app-rejected', 0)} "
+                  f"synth-inv={b.get('synth-invalid', 0)} "
+                  f"not-found={b.get('not-found', 0)} "
+                  f"timeouts={b.get('timeout', 0)}; "
+                  f"diverged_waves={len(mm.get('diverged_waves') or [])}")
+        shared = mm.get("shared_updates_applied") or []
+        if shared:
+            detail += f"; {len(shared)} shared-entity updates (audit report)"
+        v15 = mm.get("verdict", "ERROR")
+        if v15 == "INFRA":
+            v15 = "ERROR"
+        elif v15 == "PASS" and fired and applied / fired < 0.3:
+            v15 = "WATCH"
+        results.append(("G15 mut-matrix", v15, detail))
+    else:
+        results.append(("G15 mut-matrix", "SKIP",
+                        "no mutation-matrix report (run with --mutation-matrix)"))
+
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))
     width = max(len(g) for g, _, _ in results)
@@ -423,7 +556,12 @@ def main() -> int:
                    "chaos": (os.path.basename(a.chaos)
                              if a.chaos and os.path.exists(a.chaos) else None),
                    "negative": (os.path.basename(a.negative)
-                                if a.negative and os.path.exists(a.negative) else None)},
+                                if a.negative and os.path.exists(a.negative) else None),
+                   "logs": (os.path.basename(a.logs)
+                            if a.logs and os.path.exists(a.logs) else None),
+                   "mut_matrix": (os.path.basename(a.mut_matrix)
+                                  if a.mut_matrix and os.path.exists(a.mut_matrix)
+                                  else None)},
                "results": [{"gate": g, "verdict": v, "detail": d}
                            for g, v, d in results],
                "overall": overall}

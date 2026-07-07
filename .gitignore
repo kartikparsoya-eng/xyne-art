@@ -6,19 +6,17 @@ harness/auth-pool.json
 .env.*
 
 # --- Real data / PII-adjacent — do not commit ---
-# real PROD entity IDs
-harness/id-pool.json
-harness/id-pool.prod.json
-# sandbox entity IDs (regenerate: tools/gen_id_pool_db.py)
-harness/id-pool.sandbox.json
+# entity ID pools: PROD (gen_id_pool.py), sandbox/trace (gen_id_pool_db.py) —
+# every real pool variant; only the example ships
+harness/id-pool*.json
+!harness/id-pool.example.json
 # raw telemetry pulls (log samples contain user emails)
 raw/
 
 # --- Generated / environment-specific — regenerable per rig ---
-# harvested via run-art-local.sh --refresh
-harness/client-schema.json
-# fitted via tools/fit_remote_schema.py
-harness/client-schema.remote.json
+# clientSchemas: harvested (run-art-local.sh --refresh), fitted
+# (fit_remote_schema.py), and per-backend-commit snapshots — all of them
+harness/client-schema*.json
 # run/gate reports, logs, blessed local baselines, heap snapshots
 reports/
 

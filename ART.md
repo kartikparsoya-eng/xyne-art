@@ -250,3 +250,103 @@ export GR_KEY='<service-account-token>'   # must be on Juspay VPN
 
 Refresh **weekly** and **after every release**. If the traffic mix shifts materially, the weights and
 `pass_*` margins update automatically on rebuild. Bump `art_version` in `build_baseline.py` per refresh.
+
+## Relationship to `scripts/staging-regression` (xyne-spaces `feature/art`)
+
+A parallel regression effort (XYNE-12332, commit `81c133fa2`) lives in the app repo. The two
+suites are **complementary, not competing** — different isolation models catch different bugs:
+
+| | staging-regression | xyne-art |
+|---|---|---|
+| Model | sequential A/B: TS pass then Go pass, **two isolated DBs** seeded identically, same deterministic mutation log | live mirror: one client → two pods on the **same DB**, byte-diff of materialized state |
+| Client | real Zero JS client (`zero-node` driver) | protocol-v49 reimplementation (cheap 50–200 conns) |
+| Catches | **write-path divergence end-to-end** (a Go push bug that corrupts the DB is invisible to a shared-DB mirror) | load/lifecycle/leak/latency regressions, protocol edges, chaos recovery, adversarial paths |
+| Workload | curated + Zod-synthesized fixtures | prod-mined weights/args/behavior (Grafana) |
+
+Adopted from it (2026-07-06):
+- **G13 log-health gate** (`tools/log_gate.py`, always on in `run-art-local.sh`): scans both pods'
+  docker logs over the exact run window for their release-block list — sidecar crash, fallback-to-TS,
+  `advance reset for clientGroup`, `resetting pipelines`, `Advancement exceeded timeout` (FAIL), plus
+  slow-SQLite/ERROR-volume thresholds (WATCH). Closes the "sidecar died, pod silently fell back to TS,
+  G8 certified TS-vs-TS" hole that no client-side gate can see.
+- **Query→mutator→table impact matrix** (`tools/gen_impact_matrix.sh` runs the vendored
+  `vendor/staging-regression/analyze-impact.mjs` inside the deployed backend container →
+  `raw/query-mutator-impact.json`). First consumer: `matrix_oracle.py --impact` attributes every dark
+  table to an actionable cause (`no-covering-query` / `covering-args-unresolvable` /
+  `covered-but-zero-rows` / `not-in-catalog`) instead of one undifferentiated bucket.
+
+- **Impact-aware mutation targeting + G14 edge coverage** (`replay.py --impact`, auto in
+  `run-art-local.sh --mutations`): with P=0.75 a mutation is aimed at a currently-subscribed query's
+  OWN entity id (channelId/conversationId), so writes provably intersect live pipelines instead of
+  random unwatched rows; G14 gates exercised/reachable query-mutator edges and names uncovered pairs.
+- **Zod-derived arg synthesis** (`tools/gen_arg_schemas.sh` → `raw/arg-schemas.source.json`;
+  `gen_id_pool_db.py` derives enum scalars from it): enum values come from the deployed image's own
+  zod schemas (nativeEnums resolved via @prisma/client, pg_enum fallback), shape-aware
+  (array-of-enum ≠ scalar enum), per-key enum conflicts kept hand-curated. Kills the stale-scalar
+  class (`viewMode:"kanban"` survived three backend upgrades as a hand default).
+- **G5b per-query latency multipliers** (`local_gate.py --per-query-factor`, default 3x + 100ms
+  absolute + ≥10 samples both sides): compares `latency_by_query` steady p50 vs the blessed shape;
+  offenders named with ratios. Validated: a TS-blessed scratch baseline vs the slow Go run flags 50
+  offenders (getUserGroupMappingsByUserId x114.8, ...) that aggregate G5 collapsed into one number.
+
+## G15 — push-path mutator matrix (`harness/mutation_matrix.py`)
+
+Closes the biggest honest coverage gap: mutation TYPE coverage was 2/218 (hand-built args, ~78% of
+prod write *volume* but ~1% of the type surface). The zod-schema-driven synthesizer
+(`workload.SchemaSynthesizer`, fed by `raw/arg-schemas.source.json`) now fires **every
+synthesizable mutator** through the real push path — zero-cache → backend mutator (zod +
+permissions + prisma) → replication → both pods' advance — with a Go-vs-TS byte-diff after every
+wave (equality-twice convergence + persistent-mismatch re-check).
+
+Mechanics: phase-ordered chains (CREATE with fresh `artmx…` ids → UPDATE on pool/overlay entities →
+DESTRUCTIVE on overlay-owned entities ONLY; `org.*` hard-denylisted); per-mutation lmid ack
+barriers make pod-log error lines exactly attributable (this build forwards no `pushResponse`
+frames — the pusher's `returned a mutation error` log line is the only per-mutation detail
+channel); post-run `artmx%` cleanup sweep over the impact matrix's writeTables.
+
+First full run (2026-07-07): **PASS — 146/220 fired, 57 mutator types APPLIED real writes,
+83 app-rejected (validation paths exercised), 6 synth-invalid (synthesizer backlog), 0 diverged
+waves, 0 unmatched error lines, 0 cleanup leftovers.** Push-path write coverage 2 → 57 types.
+
+Caveats: update-phase applied mutators aiming at pool ids mutate SEEDED rows (renames/flags — never
+deletes); the report's `shared_updates_applied` field audits them — re-run `--refresh --clean` and
+re-bless G5 if identities were touched. Skip backlog: 40 destructive-on-shared (by design),
+~30 unresolvable ids (empty tables: calls, forms, nudges…) — seeding unlocks them.
+
+Wired: `run-art-local.sh --mutation-matrix` → `local_gate.py --mut-matrix` (G15; FAIL on
+divergence/protocol errors, WATCH on applied-fraction <30%, app-rejections are coverage data).
+
+## Trace-faithful replay (`tools/mine_traces.py` + `harness/trace_replay.py`)
+
+The third workload tier — beyond statistical (weights) and behavioral (profile): replay REAL prod
+sessions event-for-event. Prod logs carry per-event `clientSessionId`, `zeroClientGroupId`, ms
+timestamps, and (for queries/one-shots) the FULL nested args object in `_msg` — so per-session
+command streams are exactly reconstructable. 10 min of prod = 301 sessions / 14,200 events / 278
+users.
+
+Preserved exactly: sequences, ms timing (optionally `--time-compress N`), session interleaving,
+entity-reuse topology (frequency-ranked bijection: hottest prod channel → hottest pool channel,
+wrap counted), cgid continuity (shared mapped cgid + cookie jar → real resume + real multi-tab).
+Deliberately synthetic: data content (rank-mapped ids), epoch-ms cursors rebased to replay-now,
+mutation args (prod logs none — builders fire where available), removals (TTL-expired).
+
+First A/B (301 real sessions, 4x compression, 2026-07-07):
+
+| | Go | TS 1.7 |
+|---|---|---|
+| sessions opened | 301/301 | 301/301 |
+| pokes | 9,245 | 9,315 |
+| client-visible errors | **81 (reset circuit breaker → CG teardowns)** | **0** |
+| pipeline resets (pod logs) | 1,626 advancement-timeout | 364 |
+| steady p50 / p95 | **1.0s / 11.6s** | 2.6s / 36.4s |
+
+Finding no statistical run produced: at REAL prod session concurrency (301 CGs vs our synthetic
+50), background replication advances hit the economic-abort floor fleet-wide — TS absorbs this as
+self-healing resets; Go escalates 4.5x more resets into 81 client-visible circuit-breaker
+teardowns. (Go is simultaneously 2.5x faster on hydration latency.) Caveat: 4x compression = 4x
+prod intensity; re-run at 1x before treating as a prod-blocking claim.
+
+Usage: `GR_KEY=... tools/mine_traces.py --window 60m` → `harness/trace_replay.py --trace
+raw/traces/trace-<tag>.ndjson --target ws://... [--time-compress N] [--dry-run]`. Run summaries are
+gate-schema-compatible (G5 shape = `trace:<name>`); `scheduling_lag_ms` proves trace fidelity
+(p50 0.5ms) and is itself a slowness signal. Traces live in raw/traces/ (gitignored).

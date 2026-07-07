@@ -65,12 +65,17 @@ SCALARS: dict[str, list] = {
     # cursor + forward/backward literals (see queries.ts) — null = first page.
     "limit": [25, 50], "start": [None], "direction": ["forward", "backward"],
     "isMember": [True], "isRead": [False, True], "showOverdueOnly": [False],
-    "viewMode": ["kanban"], "columnType": ["stage"], "groupBy": ["stage"],
+    # viewMode: ticketsQueryV2 z.enum(['project','board','my-tickets',
+    # 'user-tickets','group-tickets']); boardType: z.nativeEnum(BoardType)
+    # {DEFAULT RELEASE NON_LINEAR}. The old "kanban" values predate both
+    # enums and were masked while the running backend 404'd the queries.
+    "viewMode": ["project", "board", "my-tickets"],
+    "columnType": ["stage"], "groupBy": ["stage"],
     "classification": [[]], "types": [[]], "lastUpdatedAt": [0],
     "updatedAt": [0], "recapDate": [0], "contextType": ["BOARD", "STAGE"],
     "entityType": ["TICKET"], "searchQuery": ["test", "status", "release"],
     "scope": ["channel"], "scopeType": ["channel"], "dir": ["forward", "backward"],
-    "type": ["TICKET_TYPE"], "boardType": ["kanban"],
+    "type": ["TICKET_TYPE"], "boardType": ["DEFAULT", "RELEASE"],
 }
 
 
@@ -96,6 +101,34 @@ def fetch_ranked_channels(a, where: str | None, per_key: int) -> list[str]:
     return run_sql(a, sql)
 
 
+# Signal-ranked pools for keys where a uniform draw mostly hits rows with no
+# dependent data (G9 arg-luck blind spots: getResourceAccessForUser /
+# getUserProfilesByIds returned 0 rows because a random user of 142 usually
+# has no resource_access/user_profiles row; ticketsByProject drew the one
+# project with 0 tickets). Ranking puts high-signal ids at index 0 so Zipf
+# runs favour them, and hydration coverage stops depending on draw luck.
+RANKED_SQL: dict[str, str] = {
+    "userId": (
+        'SELECT u.id FROM public.users u '
+        'LEFT JOIN public.channel_user_status cus ON cus."userId" = u.id '
+        'LEFT JOIN public.resource_access ra ON ra."userId" = u.id '
+        'LEFT JOIN public.user_profiles up ON up."userId" = u.id '
+        'GROUP BY u.id '
+        'ORDER BY (count(DISTINCT ra.id) + count(DISTINCT up.id)) DESC, '
+        'count(cus.id) DESC LIMIT {per_key}'
+    ),
+    "projectId": (
+        'SELECT p.id FROM public.projects p '
+        'LEFT JOIN public.tickets t ON t."projectId" = p.id AND t."isArchived" = false '
+        'GROUP BY p.id ORDER BY count(t.id) DESC LIMIT {per_key}'
+    ),
+}
+
+
+def fetch_ranked(a, key: str, per_key: int) -> list[str]:
+    return run_sql(a, RANKED_SQL[key].format(per_key=per_key))
+
+
 def run_sql(a, sql: str) -> list[str]:
     try:
         out = subprocess.run(psql_cmd(a) + ["-Atc", sql], capture_output=True,
@@ -106,6 +139,84 @@ def run_sql(a, sql: str) -> list[str]:
     if out.returncode != 0:
         return []           # table/column doesn't exist in this env — skip
     return [line for line in out.stdout.splitlines() if line.strip()]
+
+
+def derive_scalars_from_source(a, path: str) -> tuple[dict, list]:
+    """Enum scalar values DERIVED from the deployed backend's own Zod schemas
+    (raw/arg-schemas.source.json, tools/gen_arg_schemas.sh) — adopted from
+    staging-regression's Zod-driven fixture synthesis. Hand-maintained enum
+    defaults rot silently: viewMode:["kanban"] predated the V2 enum and kept
+    poisoning ticketsQueryV2/stagesByBoards through THREE backend upgrades
+    because nothing tied the value back to source. Derivation makes that
+    class impossible: enum drift now fixes itself at pool refresh.
+
+    Only enum-like kinds are derived (z.enum, z.nativeEnum, unions of string
+    literals). Booleans/numbers stay hand-curated — their values encode
+    intent (isMember=True picks rows the identity can actually see), not
+    just validity. nativeEnums missing from the extractor's runtime
+    resolution fall back to pg_enum (authoritative for the target DB).
+    Keys whose enum definitions DISAGREE across queries are left alone
+    (a union would poison half the catalog with the other half's values)."""
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except Exception as e:
+        print(f"  arg-schemas unreadable ({e}) — hand scalars only", file=sys.stderr)
+        return {}, []
+    enums = doc.get("enums") or {}
+    pg_enum_cache: dict[str, list] = {}
+
+    def enum_values(s) -> tuple | None:
+        """Returns (shape, values) — shape is 'scalar' or 'array'. The shape
+        MUST travel with the values: classification is z.array(z.nativeEnum(..))
+        in queries; flattening it to a bare string would replace one stale-value
+        bug with a wrong-shape bug (string where the zod schema wants string[])."""
+        t = s.get("type")
+        if t == "array":
+            inner = enum_values(s.get("element") or {})
+            return ("array", inner[1]) if inner else None
+        if t == "enum":
+            vals = s.get("values") or None
+            return ("scalar", vals) if vals else None
+        if t == "nativeEnum":
+            name = s.get("enum")
+            if not name:
+                return None
+            if name in enums:
+                return ("scalar", enums[name])
+            if name not in pg_enum_cache:
+                pg_enum_cache[name] = run_sql(
+                    a, "SELECT enumlabel FROM pg_enum e JOIN pg_type t "
+                       "ON t.oid = e.enumtypid WHERE t.typname = "
+                       f"'{name.replace(chr(39), '')}' ORDER BY e.enumsortorder")
+            vals = pg_enum_cache[name] or None
+            return ("scalar", vals) if vals else None
+        if t == "union":
+            lits = [v.get("value") for v in s.get("variants", [])
+                    if v.get("type") == "literal" and isinstance(v.get("value"), str)]
+            return ("scalar", lits) if lits else None
+        return None
+
+    per_key: dict[str, set] = {}
+    for section in ("queries", "mutators"):
+        for entry in (doc.get(section) or {}).values():
+            for key, s in (entry.get("args") or {}).items():
+                sv = enum_values(s)
+                if sv:
+                    per_key.setdefault(key, set()).add((sv[0], tuple(sv[1])))
+    derived, conflicts = {}, []
+    for key, variants in per_key.items():
+        if len(variants) == 1:
+            shape, vals = next(iter(variants))
+            if shape == "array":
+                # each pool entry is a complete arg VALUE: exercise the empty
+                # filter and a one-element filter
+                derived[key] = [[], [vals[0]]]
+            else:
+                derived[key] = list(vals)
+        else:
+            conflicts.append((key, len(variants)))
+    return derived, conflicts
 
 
 def main() -> int:
@@ -121,6 +232,10 @@ def main() -> int:
                          "Comma-separate multiple ids to INTERSECT memberships "
                          "(multi-user runs need channels shared by all identities)")
     ap.add_argument("--per-key", type=int, default=300)
+    ap.add_argument("--arg-schemas", default=os.path.join(
+        os.path.dirname(__file__), "..", "raw", "arg-schemas.source.json"),
+        help="source-extracted Zod arg schemas (tools/gen_arg_schemas.sh); "
+             "enum scalars are derived from it when present")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..",
                                                   "harness", "id-pool.json"))
     a = ap.parse_args()
@@ -139,6 +254,25 @@ def main() -> int:
 
     ids: dict[str, list] = {}
     chan_where_opt = chan_where if a.user_id else None
+
+    # scalars: hand defaults, overlaid by source-derived enum values (see
+    # derive_scalars_from_source — the anti-stale-scalar mechanism)
+    scalars = {k: list(v) for k, v in SCALARS.items()}
+    if a.arg_schemas and os.path.exists(a.arg_schemas):
+        derived, conflicts = derive_scalars_from_source(a, a.arg_schemas)
+        drift_fixed = [k for k in derived
+                       if k in scalars and not set(map(str, scalars[k]))
+                       <= set(map(str, derived[k]))]
+        scalars.update(derived)
+        print(f"  scalars: {len(derived)} enum keys derived from source"
+              + (f" — drift-fixed: {', '.join(drift_fixed)}" if drift_fixed else ""))
+        for key, n in conflicts:
+            print(f"  scalar CONFLICT: '{key}' has {n} distinct enum sets "
+                  f"across queries — kept hand value")
+    else:
+        print("  scalars: hand defaults only (no raw/arg-schemas.source.json — "
+              "run tools/gen_arg_schemas.sh)")
+
     for key, spec in mapping.items():
         table, column = spec[0], spec[1]
         where = spec[2] if len(spec) > 2 else None
@@ -146,6 +280,11 @@ def main() -> int:
             # hotness-ranked (participant count DESC) for Zipf sampling
             vals = fetch_ranked_channels(a, chan_where_opt, a.per_key)
             table, column = "channel_user_status", '"channelId" (ranked)'
+        elif key in RANKED_SQL:
+            # signal-ranked (see RANKED_SQL) — falls back to the plain fetch
+            # if the ranking query fails (e.g. table missing in this env)
+            vals = fetch_ranked(a, key, a.per_key) or fetch(a, table, column, where, a.per_key)
+            column = f"{column} (ranked)"
         else:
             vals = fetch(a, table, column, where, a.per_key)
         if vals:
@@ -160,7 +299,7 @@ def main() -> int:
             "note": "DB-harvested id-pool (gen_id_pool_db.py) — env-specific, do not commit",
         },
         "ids": ids,
-        "scalars": SCALARS,
+        "scalars": scalars,
     }
     out = os.path.abspath(a.out)
     with open(out, "w") as f:

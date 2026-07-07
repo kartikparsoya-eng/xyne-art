@@ -128,7 +128,14 @@ DEFAULT_SCALARS: dict[str, list[Any]] = {
     "isMember": [True],
     "isRead": [False, True],
     "showOverdueOnly": [False],
-    "viewMode": ["kanban"],
+    # ticketsQueryV2.viewMode: z.enum(['project','board','my-tickets',
+    # 'user-tickets','group-tickets']) — "kanban" predates the V2 enum and
+    # only surfaced once the main-93410d5c backend actually defined the
+    # query (before that it 404'd at name lookup, masking arg validation).
+    "viewMode": ["project", "board", "my-tickets"],
+    # stagesByBoards.boardType: z.nativeEnum(BoardType) — real labels from
+    # prisma enum BoardType {DEFAULT RELEASE NON_LINEAR}.
+    "boardType": ["DEFAULT", "RELEASE"],
     "columnType": ["stage"],
     "groupBy": ["stage"],
     "classification": [[]],
@@ -198,17 +205,25 @@ class ArgResolver:
             singular = key[:-1]
             if singular in self.ids:
                 return [self._pick(self.ids[singular])], True
-        # Unknown key: record and emit null so the query still forms.
+        # Unknown key: record it and OMIT the key entirely. Real clients omit
+        # optional args they don't use; sending an explicit null fails zod
+        # .optional() schemas (optional != nullable) and no real client sends
+        # null IDs for required fields either — so a null teaches us nothing
+        # beyond the validation error path. Omission lets optional-arg queries
+        # hydrate and turns required-arg misses into plain "Required" errors
+        # (same unresolvable-args class as before, cleaner attribution).
         self.unresolved[key] = self.unresolved.get(key, 0) + 1
         return None, False
 
     def resolve(self, op: Op) -> tuple[dict[str, Any], bool]:
-        """Build an args object for `op`. Returns (argsObj, fully_resolved?)."""
+        """Build an args object for `op`. Returns (argsObj, fully_resolved?).
+        Unresolved keys are omitted from the args object (see _resolve_key)."""
         args: dict[str, Any] = {}
         ok = True
         for key in op.args_keys:
             val, resolved = self._resolve_key(key)
-            args[key] = val
+            if resolved:
+                args[key] = val
             ok = ok and resolved
         return args, ok
 
@@ -300,10 +315,13 @@ def stable_participant_id(entity_id: str) -> str:
     return "artpart" + hashlib.sha256(entity_id.encode("utf-8")).hexdigest()[:16]
 
 
-def _args_mark_channel_as_viewed(resolver: "ArgResolver", now_ms: int) -> Optional[dict]:
-    cid, ok = resolver._resolve_key("channelId")
-    if not ok:
-        return None
+def _args_mark_channel_as_viewed(resolver: "ArgResolver", now_ms: int,
+                                 entity_id: Optional[str] = None) -> Optional[dict]:
+    cid = entity_id
+    if cid is None:
+        cid, ok = resolver._resolve_key("channelId")
+        if not ok:
+            return None
     return {
         "channelId": cid,
         "timestamp": now_ms,
@@ -312,10 +330,13 @@ def _args_mark_channel_as_viewed(resolver: "ArgResolver", now_ms: int) -> Option
     }
 
 
-def _args_mark_thread_activities_read(resolver: "ArgResolver", now_ms: int) -> Optional[dict]:
-    cid, ok = resolver._resolve_key("conversationId")
-    if not ok:
-        return None
+def _args_mark_thread_activities_read(resolver: "ArgResolver", now_ms: int,
+                                      entity_id: Optional[str] = None) -> Optional[dict]:
+    cid = entity_id
+    if cid is None:
+        cid, ok = resolver._resolve_key("conversationId")
+        if not ok:
+            return None
     return {
         "conversationId": cid,
         "draftMessageId": stable_draft_id(cid),
@@ -333,6 +354,46 @@ MUTATION_ARG_BUILDERS = {
     "activities.markThreadActivitiesAsReadV2": _args_mark_thread_activities_read,
 }
 
+# ---------------------------------------------------------------------------
+# Impact-aware mutation targeting (adopted from staging-regression,
+# feature/art XYNE-12332). The static query->mutator edge map
+# (raw/query-mutator-impact.json, tools/gen_impact_matrix.sh) records which
+# mutators can affect which queries via read/write table overlap. Blind
+# weighted sampling fires writes at RANDOM pool entities, so the resulting
+# poke usually lands on rows no subscribed query watches — G4 passes while
+# the advance path of the pipelines under test goes nearly unexercised.
+# Targeting flips that: with probability `bias`, pick a mutator that has an
+# edge to a CURRENTLY SUBSCRIBED query on this client and aim it at that
+# query's own entity id, so the write provably intersects a live pipeline.
+# ---------------------------------------------------------------------------
+# Which arg key of a subscribed query's args can seed each mutator's target.
+ENTITY_KEYS = {
+    "channel.markChannelAsViewed": "channelId",
+    "activities.markThreadActivitiesAsReadV2": "conversationId",
+}
+
+
+class ImpactIndex:
+    """(queryName, mutatorName) edges, filtered to mutators the harness can
+    actually build args for. None-safe loader: a missing/stale file just
+    disables targeting (G14 reads SKIP)."""
+
+    def __init__(self, edges: set, path: str):
+        self.edges = edges
+        self.path = path
+
+    @classmethod
+    def from_file(cls, path: str, supported_mutators: set) -> Optional["ImpactIndex"]:
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+        except Exception:
+            return None
+        edges = {(p.get("queryName"), p.get("mutatorName"))
+                 for p in doc.get("pairs", [])
+                 if p.get("mutatorName") in supported_mutators}
+        return cls(edges, path)
+
 
 class MutationSampler:
     """Weighted sampler over the baseline mutations the harness can build args
@@ -344,6 +405,7 @@ class MutationSampler:
             raise ValueError("MutationSampler: no supported mutations in baseline")
         self._sampler = WeightedSampler(supported, rng)
         self.supported = supported
+        self.impact: Optional[ImpactIndex] = None  # set by the driver
 
     def sample(self) -> Op:
         return self._sampler.sample()
@@ -355,6 +417,39 @@ class MutationSampler:
         if args is None:
             return None
         return op.name, args
+
+    def build_targeted(self, subscribed: list, resolver: "ArgResolver",
+                       now_ms: int, rng: random.Random,
+                       bias: float) -> tuple[Optional[tuple[str, dict]], set, bool]:
+        """Impact-aware build. `subscribed` = [(query_name, args_obj)] currently
+        active on this client. With probability `bias` (when >=1 candidate
+        exists) aim a mutator with an impact edge to a subscribed query AT THAT
+        QUERY'S OWN entity id. Returns (built|None, edges_exercised, targeted?).
+        edges_exercised = every (subscribed query, chosen mutator) impact edge
+        co-active at fire time — the G14 coverage numerator."""
+        idx = self.impact
+        cands = []
+        if idx is not None:
+            for qname, qargs in subscribed:
+                for op in self.supported:
+                    ent = (qargs or {}).get(ENTITY_KEYS[op.name])
+                    if ent and isinstance(ent, str) and (qname, op.name) in idx.edges:
+                        cands.append((op, ent))
+        if cands and rng.random() < bias:
+            op, ent = rng.choice(cands)
+            args = MUTATION_ARG_BUILDERS[op.name](resolver, now_ms, entity_id=ent)
+            if args is not None:
+                edges = {(q, op.name) for q, _ in subscribed
+                         if (q, op.name) in idx.edges}
+                return (op.name, args), edges, True
+        built = self.build(resolver, now_ms)
+        if built is None:
+            return None, set(), False
+        edges = set()
+        if idx is not None:
+            edges = {(q, built[0]) for q, _ in subscribed
+                     if (q, built[0]) in idx.edges}
+        return built, edges, False
 
 
 def custom_mutation(mutation_id: int, client_id: str, name: str,
@@ -380,6 +475,230 @@ def push_message(client_group_id: str, mutations: list[dict[str, Any]],
         "timestamp": now_ms,
         "requestID": request_id,
     }]
+
+
+# --------------------------------------------------------------------------- #
+# Schema-driven mutation arg synthesis (push-path matrix, gate G15)
+# --------------------------------------------------------------------------- #
+# MUTATION_ARG_BUILDERS covers 2 mutator types (~78% of prod write VOLUME but
+# ~1% of the TYPE surface). The other ~216 mutators' push path — client push ->
+# zero-cache -> backend mutator (zod validation + prisma writes) -> replication
+# -> BOTH pods' advance — had never been exercised by this harness. This
+# synthesizer generalizes the hand-built approach: it walks each mutator's
+# SOURCE zod arg schema (raw/arg-schemas.source.json, extracted from the
+# deployed backend image by tools/gen_arg_schemas.sh) and builds a best-effort
+# args object from the id-pool, the run identity, entities created earlier in
+# the same run (the overlay), and typed synthetics. Idea adopted from
+# staging-regression's Zod-driven fixture synthesis (feature/art XYNE-12332);
+# implementation is pool-aware and chain-aware where theirs is curated-first.
+#
+# Design rules (each encodes a lesson):
+#   * Unresolvable OPTIONAL key -> omit (zod .optional() != nullable — the
+#     same rule ArgResolver.resolve learned; explicit nulls only measure the
+#     validation error path).
+#   * Unresolvable REQUIRED id -> the whole mutator is SKIPPED, not fired
+#     with a fabricated id: a fabricated id on an update/delete measures only
+#     "entity not found" app-rejections, which teaches nothing new after the
+#     first one.
+#   * CREATE-phase mutators get FRESH "artmx…" ids for their self-id args
+#     (client-generated-id convention) — recorded in the overlay so later
+#     update/delete mutators can target entities THIS RUN owns, and recorded
+#     for post-run SQL cleanup by prefix.
+#   * Destructive mutators are only synthesized when every entity ref resolves
+#     from the overlay (delete what we created; never seeded data).
+FRESH_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+# mutator namespace -> the id-pool key its bare `id` / `<entity>Id` args mean
+NS_ID_KEY = {
+    "channel": "channelId", "channels": "channelId",
+    "conversation": "conversationId", "conversations": "conversationId",
+    "message": "messageId", "messages": "messageId",
+    "ticket": "ticketId", "tickets": "ticketId", "subTicket": "ticketId",
+    "project": "projectId", "projects": "projectId",
+    "board": "boardId", "boards": "boardId",
+    "canvas": "canvasId", "call": "callId", "calls": "callId",
+    "userGroup": "userGroupId", "draftMessages": "draftMessageId",
+    "draft": "draftMessageId", "activities": "activityId",
+    "bookmark": "messageId", "bookmarks": "messageId",
+}
+
+_SYN_STR_BY_KEY = [
+    # (predicate on lowercase key, value factory) — first match wins
+    (lambda k: k in ("name", "title", "label", "tagname"), lambda m: f"art-mx {m}"[:60]),
+    (lambda k: k in ("emoji",), lambda m: "🔥"),
+    (lambda k: "email" in k, lambda m: "art-mx@example.invalid"),
+    (lambda k: "url" in k or "link" in k, lambda m: "https://example.invalid/art-mx"),
+    (lambda k: "color" in k, lambda m: "#8080ff"),
+    (lambda k: k in ("position", "rank", "sortkey", "sortorder"), lambda m: "a0"),
+    (lambda k: "timezone" in k, lambda m: "UTC"),
+    (lambda k: k.endswith("date"), lambda m: "2026-01-01"),
+    (lambda k: True, lambda m: "art matrix synthetic"),
+]
+
+
+def fresh_entity_id(rng: random.Random) -> str:
+    return "artmx" + "".join(rng.choice(FRESH_ID_ALPHABET) for _ in range(19))
+
+
+class SchemaSynthesizer:
+    """Best-effort args from a mutator's serialized zod schema.
+
+    synth() returns (args | None, meta) where meta carries:
+      provenance  {argKey: overlay|pool|identity|fresh|scalar|synthetic|omitted}
+      fresh_ids   [(argKey, id)] newly minted entity ids (record in overlay
+                  + cleanup list only if the mutation is later APPLIED)
+      skip_reason str when args is None
+    """
+
+    def __init__(self, schemas_doc: dict, ids: dict[str, list],
+                 scalars: dict[str, list], identity: dict[str, str],
+                 rng: random.Random):
+        self.mutators = schemas_doc.get("mutators") or {}
+        self.enums = schemas_doc.get("enums") or {}
+        self.ids = ids
+        self.scalars = scalars
+        self.identity = identity          # {"userId":…, "workspaceId":…}
+        self.rng = rng
+        self.overlay: dict[str, list[str]] = {}   # argKey -> created ids (LIFO)
+
+    # -- id resolution ------------------------------------------------------
+    def _entity_id(self, key: str, ns: str, allow_fresh: bool,
+                   overlay_only: bool) -> tuple[Optional[str], str]:
+        """Resolve an id-like arg. Returns (value|None, provenance)."""
+        pool_key = key
+        if key == "id":
+            pool_key = NS_ID_KEY.get(ns, key)
+        # own-run entities first: chains (create -> update -> delete) must
+        # target what we made, and destructive phases may ONLY use these
+        for k in (key, pool_key):
+            if self.overlay.get(k):
+                return self.overlay[k][-1], "overlay"
+        if overlay_only:
+            return None, "unresolved"
+        if key in ("userId", "workspaceId") and self.identity.get(key):
+            return self.identity[key], "identity"
+        for k in (key, pool_key):
+            vals = self.ids.get(k)
+            if vals:
+                return vals[self.rng.randrange(len(vals))], "pool"
+        if allow_fresh:
+            return None, "want-fresh"     # caller mints + records
+        return None, "unresolved"
+
+    # -- schema walk ---------------------------------------------------------
+    def _value(self, key: str, s: dict, ns: str, now_ms: int, meta: dict,
+               allow_fresh: bool, overlay_only: bool, depth: int = 0):
+        """Returns (value, ok). ok=False => caller omits (optional) or skips."""
+        t = s.get("type")
+        lk = key.lower()
+        if t == "literal":
+            return s.get("value"), True
+        if t == "boolean":
+            return False, True
+        if t == "enum":
+            vals = s.get("values") or []
+            return (vals[0], True) if vals else (None, False)
+        if t == "nativeEnum":
+            vals = self.enums.get(s.get("enum") or "")
+            if vals:
+                return vals[0], True
+            sc = self.scalars.get(key)
+            if sc:
+                return sc[0], True
+            return None, False
+        if t == "number":
+            if "timestamp" in lk or lk.endswith("at") or lk.endswith("time"):
+                return now_ms, True
+            if lk in ("position", "order", "index", "offset"):
+                return 0, True
+            return 1, True
+        if t == "string":
+            if key == "id" or key.endswith("Id"):
+                val, prov = self._entity_id(key, ns, allow_fresh, overlay_only)
+                if prov == "want-fresh":
+                    fid = fresh_entity_id(self.rng)
+                    meta["fresh_ids"].append((key, fid))
+                    meta["provenance"][key] = "fresh"
+                    return fid, True
+                if val is None:
+                    return None, False
+                meta["provenance"][key] = prov
+                return val, True
+            sc = self.scalars.get(key)
+            if sc and isinstance(sc[0], str):
+                meta["provenance"][key] = "scalar"
+                return sc[0], True
+            for pred, mk in _SYN_STR_BY_KEY:
+                if pred(lk):
+                    meta["provenance"][key] = "synthetic"
+                    return mk(meta["mutator"]), True
+        if t == "array":
+            el = s.get("element") or {}
+            singular = key[:-1] if key.endswith("s") else key
+            v, ok = self._value(singular, el, ns, now_ms, meta,
+                                allow_fresh=False, overlay_only=overlay_only,
+                                depth=depth + 1)
+            if ok:
+                return [v], True
+            # zod z.array() accepts [] unless .nonempty(); the extractor
+            # records nonempty as a modifier we don't parse — [] is the best
+            # available shot and a rejection is classified, not fatal.
+            return [], True
+        if t == "object":
+            keys = s.get("keys") or {}
+            out = {}
+            for k2, s2 in keys.items():
+                v, ok = self._value(k2, s2, ns, now_ms, meta, allow_fresh,
+                                    overlay_only, depth + 1)
+                if ok:
+                    out[k2] = v
+                elif not (s2.get("optional") or s2.get("hasDefault")):
+                    return None, False
+                else:
+                    meta["provenance"][k2] = "omitted"
+            return out, True
+        if t == "union":
+            for v2 in s.get("variants") or []:
+                v, ok = self._value(key, v2, ns, now_ms, meta, allow_fresh,
+                                    overlay_only, depth + 1)
+                if ok:
+                    return v, ok
+            return None, False
+        if t in ("record", "any", "unknown"):
+            # z.record()/z.any() accept {} — the cheapest valid instance
+            return {}, True
+        return None, False                # date/bigint/tuple/opaque
+
+    def synth(self, name: str, now_ms: int, allow_fresh: bool = False,
+              overlay_only: bool = False) -> tuple[Optional[dict], dict]:
+        meta = {"mutator": name, "provenance": {}, "fresh_ids": [],
+                "skip_reason": None}
+        entry = self.mutators.get(name)
+        if entry is None:
+            meta["skip_reason"] = "not-in-arg-schemas"
+            return None, meta
+        args_schema = entry.get("args")
+        if args_schema is None:
+            meta["skip_reason"] = f"non-object-args:{(entry.get('schema') or {}).get('type')}"
+            return None, meta
+        ns = name.split(".")[0]
+        out: dict[str, Any] = {}
+        for key, s in args_schema.items():
+            v, ok = self._value(key, s, ns, now_ms, meta, allow_fresh,
+                                overlay_only)
+            if ok:
+                out[key] = v
+            elif s.get("optional") or s.get("hasDefault"):
+                meta["provenance"][key] = "omitted"
+            else:
+                meta["skip_reason"] = f"required-arg-unresolvable:{key}"
+                return None, meta
+        return out, meta
+
+    def commit_fresh(self, fresh_ids: list[tuple[str, str]]) -> None:
+        """Record APPLIED creations so later phases can target them."""
+        for key, fid in fresh_ids:
+            self.overlay.setdefault(key, []).append(fid)
 
 
 # --------------------------------------------------------------------------- #
