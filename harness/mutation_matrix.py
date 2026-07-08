@@ -71,8 +71,8 @@ from diff_oracle import (  # noqa: E402
 )
 from workload import (  # noqa: E402
     ArgResolver, SchemaSynthesizer, change_desired_queries_message,
-    custom_mutation, init_connection_message, load_baseline, push_message,
-    query_put,
+    custom_mutation, fresh_entity_id, init_connection_message, load_baseline,
+    push_message, query_put,
 )
 from replay import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
 
@@ -92,10 +92,233 @@ ZOD_MSG_RE = re.compile(
 # entity not-founds ("Canvas folder not found") are app rejections, not drift
 NOT_FOUND_RE = re.compile(r"mutator .*not (found|registered)|unknown mutator|"
                           r"no such mutator", re.I)
+# permission-path rejections. Checked BEFORE ZOD_MSG_RE: "Admin access
+# required" matched the zod \brequired\b fingerprint and was misfiled as
+# synth-invalid — but the args were fine; the CALLER lacked privilege. That's
+# real coverage of the backend's permission path, not a synthesizer bug.
+PERM_RE = re.compile(
+    r"access required|permission|not allowed|forbidden|unauthorized|"
+    r"admin access|only .{0,60}\bcan\b", re.I)
+
+# Client-generated row PKs per mutator: these args are the PRIMARY KEY of the
+# row the mutation CREATES — a pool value is an existing PK and guarantees a
+# duplicate-key rejection (observed: conversations_pkey, messages_pkey,
+# sub_tickets_pkey, conversation_participants_pkey, resource_access unique).
+# The zod schema cannot express this (both look like plain string ids), so
+# it's matrix curation, keyed by observed backend behavior.
+FORCE_FRESH: dict[str, set] = {
+    "conversations.send": {"conversationId", "messageId"},
+    "messages.send": {"messageId", "childConversationId"},
+    "channel.updateDescription": {"messageId", "conversationId",
+                                  "conversationParticipantId"},
+    "subTicket.create": {"subTicketId", "mappingId"},
+    "delayedMessages.create": {"id"},
+    "repo.create": {"id"},
+    "resourceAccess.grant": {"id"},
+    "conversations.subscribeToConversation": {"participantId"},
+    "messages.react": {"reactionId", "countId"},
+    # --- write-path push (G15 audit round 3): every entry below hit a
+    # duplicate-key rejection because its client-minted PK arg drew a pool
+    # value (= an existing row's PK).
+    "emailSignature.create": {"id"},
+    "links.create": {"id"},
+    "ticketTagV2.create": {"tagId", "mappingId"},
+    "query.upsert": {"id"},
+    "channel.promoteToChannel": {"conversationId", "messageId"},
+    "conversations.forwardMessage": {"conversationId", "messageId"},
+    "orgMember.add": {"memberId"},
+    "emailRead.markAsRead": {"id"},
+    "activities.markThreadActivitiesAsReadV2": {"participantId",
+                                                "draftMessageId"},
+    "calls.initiate": {"callId", "creatorParticipantId", "externalId"},
+    "channel.joinChannel": {"channelParticipantId", "channelUserStatusId"},
+    "coe.create": {"id"},
+    "rca.create": {"id"},
+    "canvas.create": {"id"},
+    # upsert-style mutators whose bare `id` is the client-minted pk of the
+    # row being upserted: ns-strict resolution has no pool key for these
+    # per-user rows (user_preferences etc.) — fresh mint IS the correct
+    # semantics (insert path of the upsert)
+    "canvasUserStatus.toggleStarred": {"id"},
+    "ticketStageRequest.upsert": {"id"},
+    "userPreference.setAllowThreadBroadcastMentions": {"id"},
+    "userPreference.setChannelSortOrder": {"id"},
+    "userPreference.setEnterSendsMessage": {"id"},
+    "userPreference.setGlobalNotificationSettings": {"id"},
+    "userPreference.setNotificationKeywords": {"id"},
+}
+
+# Post-synth arg overrides for backend contracts invisible to the serialized
+# zod schema. Sentinels: "__fresh__" -> newly minted artmx id (recorded for
+# cleanup), "__identity__" -> the run identity's userId, "__other_user__" ->
+# a pool user that is NOT the identity (self-guards: "cannot change your own
+# role"), "__future_ms__" -> now + 24h ("must be in the future" checks),
+# "__pool:KEY__" -> random draw from that id-pool key, "__omit__" -> remove
+# the key. Literal artseed-* ids reference tools/seed_all_tables.py's
+# deterministic fixture rows (see the LINK step for which state each carries).
+VALUE_OVERRIDES: dict[str, dict] = {
+    "users.updateRole": {"userId": "__other_user__",
+                         "updates": {"role": "MEMBER"}},
+    "users.remove": {"userId": "__other_user__"},
+    "userProfile.upsert": {"userId": "__identity__"},
+    "assignmentConfig.batchUpdate": {
+        "userStates": [{"userId": "__identity__", "onCall": False,
+                        "isActive": True, "stateId": "__fresh__"}]},
+    # validation regexes the generic string synthesizer cannot guess
+    "role.create": {"name": "ART_MATRIX_ROLE"},
+    "userGroup.update": {"alias": "art-matrix-alias"},
+    # "must be in the future" temporal guards
+    "ticketStageEta.update": {"stageEta": "__future_ms__"},
+    "delayedMessages.create": {"scheduledFor": "__future_ms__"},
+    # state-toggle pair: pin both to the same seeded group so deactivate
+    # (active->inactive) and reactivate (inactive->active) BOTH apply
+    "userGroup.deactivate": {"userGroupId": "artseed-ug-000"},
+    "userGroup.reactivate": {"userGroupId": "artseed-ug-000"},
+    # channel-type/state fixtures (seed_all_tables LINK step)
+    "emailChannelPreference.upsert": {"channelId": "artseed-channels-1"},
+    "emailChannelPreference.upsertClassificationConfig":
+        {"channelId": "artseed-channels-1"},
+    "emailChannelPreference.upsertPriorityClassificationConfig":
+        {"channelId": "artseed-channels-1"},
+    "channel.joinChannel": {"channelId": "artseed-channels-4"},
+    "channel.makeChannelPublic": {"channelId": "artseed-channels-0"},
+    "channel.updateAddUserPolicy": {"channelId": "artseed-channels-0"},
+    "channel.updateShowTicketsTabTicketsInChat":
+        {"channelId": "artseed-channels-0"},
+    "channel.unarchiveChannel": {"channelId": "artseed-channels-3"},
+    "channel.leaveChannel": {"channelId": "artseed-channels-2"},
+    # membership-target mutators: channel + target user must actually be
+    # joined — secondMemberId = bulk0, LINK'd into every artseed channel
+    "channel.updateParticipantRole": {"channelId": "artseed-channels-0",
+                                      "targetUserId": "__pool:secondMemberId__"},
+    "channel.removeParticipant": {"channelId": "artseed-channels-2",
+                                  "targetUserId": "__pool:secondMemberId__"},
+    # join-affinity pair (folder-0 pinned to project-0 in the LINK step)
+    "canvas.create": {"folderId": "artseed-canvas_folders-0",
+                      "projectId": "artseed-projects-0"},
+    "apps.update": {"appId": "artseed-apps-0"},
+    # bookmark rows exist only for artseed tickets (LINK step)
+    "bookmark.updateMetadata": {"entityId": "__pool:bookmarkedEntityId__",
+                                "entityType": "TICKET"},
+    "bookmark.remove": {"entityId": "__pool:bookmarkedEntityId__",
+                        "entityType": "TICKET"},
+    # chain heads: the conversation/message and call families cascade from
+    # these two — a random pool channel is rarely one the caller is a member
+    # of ("You need to be a participant", "must be a channel participant to
+    # start calls"), and every downstream overlay draw then chases a dead id
+    "conversations.send": {"channelId": "artseed-channels-0"},
+    "calls.initiate": {"channelId": "artseed-channels-0"},
+    "draftMessages.create": {"channelId": "artseed-channels-0"},
+}
+
+
+def apply_overrides(name: str, args: dict, meta: dict, identity: dict,
+                    rng, pool_ids: dict | None = None) -> dict:
+    ov = VALUE_OVERRIDES.get(name)
+    if not ov:
+        return args
+    pool_ids = pool_ids or {}
+
+    def subst(v):
+        if v == "__fresh__":
+            fid = fresh_entity_id(rng)
+            meta["fresh_ids"].append(("override", fid))
+            return fid
+        if v == "__identity__":
+            return identity.get("userId")
+        if v == "__future_ms__":
+            return int(time.time() * 1000) + 86_400_000
+        if v == "__other_user__":
+            me = identity.get("userId")
+            others = [u for u in pool_ids.get("userId", [])
+                      if u != me and not str(u).startswith("artseed")]
+            return others[rng.randrange(len(others))] if others else me
+        if isinstance(v, str) and v.startswith("__pool:") and v.endswith("__"):
+            vals = pool_ids.get(v[7:-2]) or []
+            return vals[rng.randrange(len(vals))] if vals else v
+        if isinstance(v, dict):
+            return {k: subst(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [subst(x) for x in v]
+        return v
+
+    def merge(dst, src):
+        for k, v in src.items():
+            if v == "__omit__":
+                dst.pop(k, None)
+            elif isinstance(v, dict) and isinstance(dst.get(k), dict):
+                merge(dst[k], subst(v))
+            else:
+                dst[k] = subst(v)
+        return dst
+
+    return merge(dict(args), ov)
 
 
 def sq(s: str) -> str:
     return "'" + str(s).replace("'", "''") + "'"
+
+
+# --------------------------------------------------------------------------- #
+# Shared-singleton snapshot/restore. Update-phase mutators legitimately dirty
+# the HOT shared rows (users.updateStatus wrote statusContent='art matrix
+# synthetic' onto the identity's users row; workspace.update renames the bulk
+# workspace) — cleanup can't DELETE those, and the dirt then leaks into every
+# later run (permission-dependent hydration, baseline shifts, and one manual
+# row-restore already). Capture the rows as jsonb pre-run, UPDATE them back
+# post-run via jsonb_populate_record with a column list derived live from
+# information_schema (schema-proof). Python-side storage — no snapshot table
+# in the DB, so nothing extra enters the replication stream.
+SNAPSHOT_SPECS = [
+    # (table, pk column, WHERE template — {uid} substituted)
+    ("users",         "id",       "id = {uid}"),
+    ("user_profiles", "id",       '"userId" = {uid}'),
+    ("user_presence", "id",       '"userId" = {uid}'),
+    ("workspaces",    "id",       'id IN (SELECT "workspaceId" FROM public.users WHERE id = {uid})'),
+    ("organizations", '"orgId"',  "true"),
+    ("org_members",   '"memberId"', "email IN (SELECT email FROM public.users WHERE id = {uid})"),
+]
+
+
+def snapshot_shared(a, user_id: str) -> list[tuple[str, str, str, str]]:
+    """[(table, pk_col, pk_value, row_jsonb)] for the identity's hot rows."""
+    snaps = []
+    for table, pk, where in SNAPSHOT_SPECS:
+        sql = (f"SELECT {pk} || '\u0001' || to_jsonb(t)::text FROM "
+               f"public.{qi(table)} t WHERE {where.format(uid=sq(user_id))}")
+        rc, out, err = psql(a, "\\t on\n\\a\n" + sql + ";")
+        if rc != 0:
+            continue
+        for line in out.splitlines():
+            if "\u0001" in line:
+                pkv, data = line.split("\u0001", 1)
+                snaps.append((table, pk, pkv, data))
+    return snaps
+
+
+def restore_shared(a, snaps: list[tuple[str, str, str, str]]) -> tuple[int, int]:
+    """UPDATE each snapshotted row back to its captured image."""
+    if not snaps:
+        return 0, 0
+    stmts = []
+    for table, pk, pkv, data in snaps:
+        pk_plain = pk.strip('"')
+        dq = data.replace("$art$", "")          # defuse dollar-quote collision
+        stmts.append(f"""
+DO $do$
+DECLARE setexpr text;
+BEGIN
+  SELECT string_agg(format('%I = j.%I', c.column_name, c.column_name), ', ')
+    INTO setexpr
+    FROM information_schema.columns c
+   WHERE c.table_schema = 'public' AND c.table_name = '{table}'
+     AND c.column_name <> '{pk_plain}';
+  EXECUTE format(
+    'UPDATE public.%I t SET %s FROM jsonb_populate_record(NULL::public.%I, %L::jsonb) j WHERE t.%I = %L',
+    '{table}', setexpr, '{table}', $art${dq}$art$, '{pk_plain}', {sq(pkv)});
+END $do$;""")
+    rc, out, err = psql(a, "\n".join(stmts))
+    return len(snaps), err.count("ERROR:")
 
 
 def qi(ident: str) -> str:
@@ -163,20 +386,45 @@ async def primary_reader(side: Side, stop: asyncio.Event,
 
 
 async def converge(sides: list[Side], timeout_s: float,
-                   poll_s: float = 1.5) -> tuple[bool, float]:
+                   poll_s: float = 1.5,
+                   ignore: set | None = None) -> tuple[bool, float]:
     """Equal-canon twice in a row => converged (matrix_oracle's predicate —
-    equality, not quiet: background traffic makes quiet impossible)."""
+    equality, not quiet: background traffic makes quiet impossible).
+
+    ignore: (table, key) pairs from ALREADY-diverged waves. Without the mask,
+    one permanently-diverged row (e.g. the users-row ×1000 timestamp bug)
+    fails equality for EVERY later wave — one root cause reported N times,
+    burying any genuinely-new divergence behind residue."""
+    def _canon(s: Side) -> str:
+        if not ignore:
+            return canon(s.mat.state)
+        return canon({t: {k: v for k, v in rows.items() if (t, k) not in ignore}
+                      for t, rows in s.mat.state.items()})
     t0 = time.perf_counter()
     streak = 0
     while time.perf_counter() - t0 < timeout_s:
         await asyncio.sleep(poll_s)
-        if canon(sides[0].mat.state) == canon(sides[1].mat.state):
+        if _canon(sides[0]) == _canon(sides[1]):
             streak += 1
             if streak >= 2:
                 return True, time.perf_counter() - t0
         else:
             streak = 0
     return False, time.perf_counter() - t0
+
+
+def mismatch_keys(a: Side, b: Side, ignore: set) -> set[tuple[str, str]]:
+    """Full (table, key) set currently differing between the two sides
+    (diff_states truncates examples — masking needs every key)."""
+    bad: set[tuple[str, str]] = set()
+    for t in set(a.mat.state) | set(b.mat.state):
+        ra, rb = a.mat.state.get(t, {}), b.mat.state.get(t, {})
+        for k in set(ra) | set(rb):
+            if (t, k) in ignore:
+                continue
+            if k not in ra or k not in rb or canon(ra[k]) != canon(rb[k]):
+                bad.add((t, k))
+    return bad
 
 
 def classify(result: dict | None) -> tuple[str, str]:
@@ -191,6 +439,8 @@ def classify(result: dict | None) -> tuple[str, str]:
         return "zero-rejected", f"{err}: {msg}"
     if NOT_FOUND_RE.search(msg):
         return "not-found", msg
+    if PERM_RE.search(msg):
+        return "app-rejected", f"permission: {msg}"
     if ZOD_MSG_RE.search(msg):
         return "synth-invalid", msg
     return "app-rejected", msg
@@ -258,7 +508,13 @@ async def amain(a: argparse.Namespace) -> int:
     cschema = json.load(open(a.client_schema))
     tables_spec = cschema.get("tables", {})
     pks = {t: s.get("primaryKey", []) for t, s in tables_spec.items()}
-    rng = random.Random(a.seed)
+    # Per-run entropy by default: a FIXED seed re-mints the same artmx ids
+    # every run — leftovers from any cleanup gap then guarantee duplicate-key
+    # rejections on the next run (observed on emailSignature.create).
+    # --seed pins it for reproduction.
+    seed = a.seed if a.seed is not None else (int(time.time() * 1000) & 0xFFFFFF)
+    print(f"rng seed: {seed}" + ("" if a.seed is None else " (pinned)"))
+    rng = random.Random(seed)
     extra = [tuple(p.split("=", 1)) for p in (a.extra_param or [])]
     user_id = dict(extra).get("userID", "")
     identity = {"userId": user_id,
@@ -303,6 +559,18 @@ async def amain(a: argparse.Namespace) -> int:
     stop = asyncio.Event()
     push_results: dict[int, dict] = {}
     error_frames: list[dict] = []
+    # Pre-run artmx sweep across EVERY synced table with a text pk: the
+    # post-run cleanup only covers tables the impact matrix maps for the
+    # mutators that ran — any gap (e.g. resource_access) leaves artmx rows
+    # whose unique constraints then reject this run's inserts. Runs BEFORE
+    # hydration so the map phase never materializes stale artmx rows.
+    pre_stmts = [f"DELETE FROM {qi(t)} WHERE {qi((pks.get(t) or ['id'])[0])} "
+                 f"LIKE 'artmx%';" for t in sorted(tables_spec)]
+    if pre_stmts:
+        rc, _, err = await asyncio.to_thread(psql, a, "\n".join(pre_stmts))
+        n_err = err.count("ERROR:")
+        print(f"  pre-run artmx sweep: {len(pre_stmts)} tables"
+              + (f" ({n_err} skipped: non-text pk)" if n_err else ""))
     try:
         for s in sides:
             url = connect_url(s.target, s.cgid, s.cid, extra, a.protocol_version)
@@ -348,10 +616,14 @@ async def amain(a: argparse.Namespace) -> int:
         return 2
 
     # ---- fire: sequential, ack-barriered (see pod-log channel note) ----
+    shared_snaps = snapshot_shared(a, user_id)
+    print(f"  shared-row snapshot: {len(shared_snaps)} rows "
+          f"(users/workspace/org singletons — restored post-run)")
     run_start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     mid = 0
     results: list[dict] = []               # per fired mutation
     diverged_waves: list[dict] = []
+    known_bad: set[tuple[str, str]] = set()  # (table,key) of confirmed diverges
     cleanup: list[tuple[str, str]] = []    # (mutator, fresh_id) of APPLIED creates
     fired = timeouts = 0
     wave: list[dict] = []                  # converge batch (attribution is per-mutation)
@@ -360,37 +632,88 @@ async def amain(a: argparse.Namespace) -> int:
         nonlocal wave
         if not wave:
             return
-        okc, _ = await converge(sides, a.converge_timeout_s)
+        okc, _ = await converge(sides, a.converge_timeout_s, ignore=known_bad)
         if not okc:
             # persistent-mismatch re-check: replication/advance lag self-heals;
             # only a SECOND failed converge counts (oracle-hardening lesson)
-            okc, _ = await converge(sides, a.converge_timeout_s)
+            okc, _ = await converge(sides, a.converge_timeout_s,
+                                    ignore=known_bad)
             if not okc:
+                new_bad = mismatch_keys(sides[0], sides[1], known_bad)
+                known_bad.update(new_bad)
                 diverged_waves.append({
                     "members": [w["name"] for w in wave],
+                    "new_diverged_keys": sorted(f"{t}:{k}" for t, k in new_bad),
                     "diff": diff_states(sides[0].mat, sides[1].mat),
                 })
-                print(f"  WAVE DIVERGED after re-check: {[w['name'] for w in wave]}")
+                print(f"  WAVE DIVERGED after re-check: "
+                      f"{[w['name'] for w in wave]} "
+                      f"({len(new_bad)} new key(s); "
+                      f"{len(known_bad)} total masked)")
         wave = []
+
+    def reconcile_overlay() -> None:
+        """Phase-boundary eviction: scrape the pusher log for errors so far,
+        match them to fired mutations (same two-pass window matcher as the
+        final classification), and evict REJECTED mutations' optimistic
+        overlay ids. Without this, one rejected create poisons its family for
+        the rest of the run — canvas.create rejected => canvas.update/delete
+        chase the dead artmx id ("Canvas not found") instead of falling back
+        to live artseed pool rows. Log scraping is the ONLY per-mutation
+        error channel in this build (no pushResponse frames), so eviction
+        can't happen inline; phase boundaries are the earliest sound point."""
+        err_lines = scrape_mutation_errors(a.primary_container, run_start_iso,
+                                           sides[0].cgid)
+        used = [False] * len(err_lines)
+        evicted = 0
+        # STRICT windows only — no padded second pass. The final classifier
+        # pads ±2s for clock-skew stragglers, but a MIS-eviction here is worse
+        # than a missed one: round-6 audit — a padded match stole a
+        # neighboring create's error line, evicted automations.createProposal's
+        # LIVE overlay id, and the whole family fell back to pool rows that
+        # its state gates then rejected.
+        for rec in results:
+            if not rec.get("fresh_ids") or rec.get("_evicted") \
+                    or rec.get("outcome") == "timeout":
+                continue
+            lo = rec["sent_ts"]
+            hi = rec["acked_ts"] or rec["sent_ts"]
+            for i, (ts, _obj) in enumerate(err_lines):
+                if not used[i] and lo <= ts <= hi:
+                    used[i] = True
+                    rec["_evicted"] = True
+                    evicted += synth.evict_fresh(
+                        rec["fresh_ids"], ns=rec["name"].split(".")[0])
+                    break
+        if evicted:
+            print(f"  overlay reconcile: evicted {evicted} id(s) from "
+                  f"rejected mutations")
 
     now_phase = None
     for phase, name in plan:
         if phase != now_phase:
             await converge_wave()
+            if now_phase is not None:
+                await asyncio.to_thread(reconcile_overlay)
             now_phase = phase
             print(f"-- phase: {phase} --")
         args, meta = synth.synth(
             name, int(time.time() * 1000),
             allow_fresh=(phase == "create"),
-            overlay_only=(phase == "destructive"))
-        if args is not None and phase == "create" and meta["fresh_ids"]:
+            overlay_only=(phase == "destructive"),
+            force_fresh=FORCE_FRESH.get(name))
+        if args is not None:
+            args = apply_overrides(name, args, meta, identity, rng,
+                                   pool.get("ids") or {})
+        if args is not None and meta["fresh_ids"]:
             # optimistic in-run overlay commit: the authoritative applied/
             # rejected classification only exists post-hoc (log scrape), but
             # the destructive phase needs overlay targets DURING the run.
             # A rejected create's id in the overlay just turns the dependent
             # destructive mutator into an app-rejected "not found" — recorded
-            # coverage, no false FAIL.
-            synth.commit_fresh(meta["fresh_ids"])
+            # coverage, no false FAIL. (All phases now: FORCE_FRESH mints in
+            # update-phase mutators like messages.react too.)
+            synth.commit_fresh(meta["fresh_ids"], ns=name.split(".")[0])
         if args is None:
             reason = meta["skip_reason"]
             skipped[name] = ("skipped-destructive-shared"
@@ -484,7 +807,15 @@ async def amain(a: argparse.Namespace) -> int:
         if stmts:
             rc, out, err = await asyncio.to_thread(psql, a, "\n".join(stmts))
             leftovers = err.count("ERROR:")
-        await converge(sides, 20)      # let the deletes replicate + settle
+    # shared-singleton restore runs even with --keep-rows: keep-rows preserves
+    # CREATED artifacts for inspection; it must not preserve DIRT on the
+    # identity's users/workspace/org rows (that leaks into every later run)
+    restored, restore_errors = await asyncio.to_thread(
+        restore_shared, a, shared_snaps)
+    if restored:
+        print(f"  shared-row restore: {restored} rows, {restore_errors} errors")
+    if (cleanup and not a.keep_rows) or restored:
+        await converge(sides, 20)      # let deletes+restores replicate + settle
 
     stop.set()
     for r in readers:
@@ -530,6 +861,7 @@ async def amain(a: argparse.Namespace) -> int:
         "error_frames": [str(e)[:200] for e in error_frames[:8]],
         "cleanup_rows_created": len(cleanup),
         "cleanup_sql_errors": leftovers,
+        "shared_restore": {"rows": restored, "errors": restore_errors},
         "shared_updates_applied": shared_updates,
         "results": results,
         "skipped": skipped,
@@ -584,7 +916,10 @@ def main() -> int:
     ap.add_argument("--converge-timeout-s", type=float, default=45.0)
     ap.add_argument("--hydrate-max-s", type=float, default=90.0)
     ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
-    ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="pin the rng (default: per-run time nonce — fixed "
+                         "seeds re-mint identical artmx ids across runs and "
+                         "trip unique constraints on any cleanup gap)")
     ap.add_argument("--keep-rows", action="store_true",
                     help="skip the artmx%% cleanup sweep")
     ap.add_argument("--out", default=None)

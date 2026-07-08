@@ -128,7 +128,7 @@ run_leg() {  # run_leg <label> <args...>
 # the negative suite's wrong-user scenario runs; oracle A/B-diffs vs the TS pod.
 # NB: `[ cond ] && cmd` at top level trips `set -e` when cond is false — use if.
 AFLAGS=(--connections 10 --users 2 --oracle --negative --duration "$FDUR")
-if [ "$WRITES" = "1" ]; then AFLAGS+=(--mutations); fi
+if [ "$WRITES" = "1" ]; then AFLAGS+=(--mutations --mutation-matrix); fi
 if [ "$CLEAN" = "1" ]; then AFLAGS+=(--clean); fi
 run_leg functional "${AFLAGS[@]}"
 

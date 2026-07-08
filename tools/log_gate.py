@@ -48,6 +48,26 @@ HARD_BLOCKING: list[tuple[str, str]] = [
     ("breaker-tripped",     r"reset circuit breaker tripped"),
     ("rpc-init-timeout",    r"RPC init timed out"),
     ("go-init-failed",      r"Go backend init failed"),
+    # go-ivm's wedge watchdog (landed 2026-07-08): a per-CG handler running
+    # past ~90s logs [GO-IVM][WEDGE] cg=… method=… every tick and dumps all
+    # goroutine stacks ONCE per incident between WEDGE-STACKS BEGIN/END
+    # sentinels — the blocking frame is named right in the pod log.
+    # NOTE: WEDGE is handled by the pairing logic in scan_container (a wedge
+    # with a matching WEDGE-CLEAR self-healed => WATCH; unresolved => FAIL),
+    # NOT by this any-hit list.
+    # pool degraded to serial mode — go-ivm marks this 0-tolerance alongside
+    # WEDGE: coread pin denied / reader pool unable to serve parallel builds.
+    # Historically the precursor of the starvation family (PoolAcquireTimeout
+    # deadlock, keepwarm regression); a healthy run must never log it.
+    ("go-pool-serial",      r"\[GO-IVM\]\[POOL-SERIAL\]"),
+    # ABI v4 delivery boundary (2026-07-08): every row/group/frame crosses
+    # Go->JS through ONE bounded TSFN queue (8192). A delivery parked on a
+    # full queue past GO_IVM_DELIVER_TIMEOUT_SEC (150s) with no drain and no
+    # cancellation fails the stream and logs this marker — the JS event loop
+    # was starved beyond any plausible recovery. This is the successor
+    # signature of the pre-v4 permanent wedge (blocked goivm_call_deliver
+    # holding rp.mu — diagnosed 2026-07-08 via WEDGE-STACKS dumps).
+    ("go-deliver-timeout",  r"\[GO-IVM\]\[DELIVER-TIMEOUT\]"),
 ]
 # Routine self-heal under load — the reference TS pod produces these too
 # (84/10min at 1x prod trace). Signal is the RATE, not the existence.
@@ -57,7 +77,17 @@ SELF_HEAL: list[tuple[str, str]] = [
     ("advancement-timeout", r"Advancement exceeded timeout"),
 ]
 SLOW_RE = re.compile(r"Slow SQLite query[^0-9]*([0-9.]+)")
+SLOW_MAT_RE = re.compile(r"Slow query materialization ([0-9.]+)")
 ERROR_RE = re.compile(r'"level":"ERROR"|level.:.error|\blevel=error\b', re.I)
+# wedge watchdog pairing: [WEDGE] repeats per tick while stuck; [WEDGE-CLEAR]
+# closes the incident. Match by cg.
+WEDGE_RE = re.compile(r"\[GO-IVM\]\[WEDGE\] cg=(\S+)")
+WEDGE_CLEAR_RE = re.compile(r"\[GO-IVM\]\[WEDGE-CLEAR\] cg=(\S+)")
+# ABI v4 boundary health: prints only when nonzero. stalls = enqueue found
+# all 8192 TSFN slots full and parked (100µs->5ms retry loop, cancellable);
+# timeouts = parked past 150s (also emits DELIVER-TIMEOUT above).
+PERF_NAPI_RE = re.compile(
+    r"\[GO-IVM\]\[PERF-NAPI\].*?stalls=(\d+) timeouts=(\d+)")
 
 
 def scan_container(name: str, since: str, slow_ms_watch: float,
@@ -84,6 +114,30 @@ def scan_container(name: str, since: str, slow_ms_watch: float,
     hits = match(HARD_BLOCKING)
     heal = match(SELF_HEAL)
 
+    # -- wedge watchdog: pair WEDGE incidents with WEDGE-CLEARs per cg -------
+    wedged = {m.group(1) for ln in lines if (m := WEDGE_RE.search(ln))}
+    cleared = {m.group(1) for ln in lines if (m := WEDGE_CLEAR_RE.search(ln))}
+    unresolved = sorted(wedged - cleared)
+    if unresolved:
+        # never cleared within the scan window = the pre-v4 permanent-wedge
+        # class; the stack dump between WEDGE-STACKS BEGIN/END names the frame
+        hits["go-wedge-unresolved"] = {
+            "count": len(unresolved),
+            "samples": [f"cg={c} wedged, no WEDGE-CLEAR in window"
+                        for c in unresolved[:3]]}
+
+    # -- ABI v4 Go->JS delivery boundary -------------------------------------
+    stalls = timeouts = napi_windows = 0
+    for ln in lines:
+        m = PERF_NAPI_RE.search(ln)
+        if m:
+            napi_windows += 1
+            stalls += int(m.group(1))
+            timeouts += int(m.group(2))
+    slow_mat = [float(m.group(1)) for ln in lines
+                if (m := SLOW_MAT_RE.search(ln))]
+    slow_mat_10s = sum(1 for v in slow_mat if v > 10_000)
+
     slow_ms = [float(m.group(1)) for ln in lines if (m := SLOW_RE.search(ln))]
     n_err = sum(1 for ln in lines if ERROR_RE.search(ln))
 
@@ -94,11 +148,32 @@ def scan_container(name: str, since: str, slow_ms_watch: float,
         watch.append(f"slow-sqlite count {len(slow_ms)} > {slow_count_watch}")
     if n_err > error_count_watch:
         watch.append(f"ERROR-level lines {n_err} > {error_count_watch}")
+    if cleared:
+        # >90s stall happened but the deliver drained and the handler
+        # completed — the pass signature explicitly allows self-clearing
+        watch.append(f"go-wedge self-cleared: {len(cleared)} cg(s) "
+                     f"({', '.join(sorted(cleared)[:3])})")
+    if stalls:
+        # Expected under load WHEN the JS loop is provably busy (synchronous
+        # TS materializations): Go parks briefly holding no lock, continues.
+        # Stalls WITHOUT TS-side slowness = the queue filled for a reason we
+        # can't see — a new finding per the v4 contract; flag it louder.
+        corr = (f"correlated: {slow_mat_10s} materializations >10s in window"
+                if slow_mat_10s else
+                "NO slow TS materializations in window — uncorrelated "
+                "stall source, new finding worth flagging")
+        watch.append(f"napi-deliver stalls={stalls} across {napi_windows} "
+                     f"10s-windows (timeouts={timeouts}) — {corr}")
 
     return {
         "lines_scanned": len(lines),
         "blocking_hits": hits,
         "self_heal_hits": heal,
+        "wedges": {"wedged_cgs": sorted(wedged), "cleared_cgs": sorted(cleared),
+                   "unresolved_cgs": unresolved},
+        "napi_deliver": {"stall_windows": napi_windows, "stalls": stalls,
+                         "timeouts": timeouts,
+                         "slow_materializations_gt10s": slow_mat_10s},
         "slow_sqlite": {"count": len(slow_ms),
                         "max_ms": round(max(slow_ms), 1) if slow_ms else 0,
                         "p50_ms": round(sorted(slow_ms)[len(slow_ms) // 2], 1) if slow_ms else 0},

@@ -122,14 +122,53 @@ def edges_for(data_type: str, udt: str, nullable: bool,
     elif dt == "boolean":
         out = ["true", "false"]
     elif dt.startswith("timestamp") or dt == "date":
-        out = [sq("1970-01-01 00:00:00"), sq("2099-12-31 23:59:59")]
+        # The pre-2001 window is a PROVEN Go-vs-TS wire divergence (found by
+        # G15, confirmed by fresh-hydration probe): NULLABLE temporal columns
+        # reach go-ivm as time.Time via mattn's decltype auto-conversion,
+        # whose seconds-vs-ms heuristic treats any |epoch| <= 1e12 as SECONDS;
+        # go-ivm's UnixMilli() reversal then ships value*1000 while TS ships
+        # the raw integer (query_builder.go:561). Every value strictly inside
+        # (-1e12, 1e12) ms — i.e. before 2001-09-09T01:46:40Z — diverges.
+        # epoch-0 is the one value in the window that DOESN'T (0*1000 == 0),
+        # and it was exactly the edge this list used to test. Keep it as the
+        # fixpoint control and add real in-window values on both sides of it.
+        out = [sq("1970-01-01 00:00:00"),          # 0ms — ×1000 fixpoint
+               sq("1970-01-01 00:00:00.001"),      # 1ms -> Go 1000 vs TS 1
+               sq("1969-12-31 23:59:59"),          # -1000ms (negative epoch)
+               sq("2001-09-09 01:46:39"),          # just below the 1e12 edge
+               sq("2099-12-31 23:59:59")]          # post-window control
     elif dt in ("json", "jsonb"):
         out = [sq("{}") + "::jsonb", sq("[]") + "::jsonb",
                sq(DEEP_JSON) + "::jsonb"]
     elif dt == "uuid":
         out = [sq("00000000-0000-4000-8000-0000000000aa")]
+    elif dt == "array":
+        # PG arrays were SKIPPED here until staging-regression's parity
+        # tolerances exposed the cost: their runner caught Go emitting the
+        # STRING "[]" where TS emitted the ARRAY [] on tickets.referenceTicket
+        # / user_group_mappings.onCallSetNumbers — a real cross-engine wire
+        # divergence in exactly the class this skip hid (G12 read "0
+        # divergence" while it was live). Empty array is the proven trap;
+        # also push element edges through (JS-float bigint boundary, unicode,
+        # quotes). udt is the element type prefixed with "_" (_int4 -> int4).
+        elem = udt.lstrip("_")
+        if elem in ("int2", "int4", "int8"):
+            big = "9007199254740993" if elem == "int8" else "2147483647"
+            out = [f"'{{}}'::{elem}[]", f"ARRAY[1,2]::{elem}[]",
+                   f"ARRAY[0,-1,{big}]::{elem}[]"]
+        elif elem in ("text", "varchar", "bpchar", "citext"):
+            out = [f"'{{}}'::{elem}[]",
+                   f"ARRAY[{sq('a')},{sq('')}]::{elem}[]",
+                   f"ARRAY[{sq(UNICODE_STR)},{sq(QUOTE_STR)}]::{elem}[]"]
+        elif elem in ("float4", "float8", "numeric"):
+            out = [f"'{{}}'::{elem}[]",
+                   f"ARRAY[0,-1.5,0.30000000000000004]::{elem}[]"]
+        elif elem == "bool":
+            out = ["'{}'::bool[]", "ARRAY[true,false]"]
+        else:
+            return []                                # exotic element types: skip
     else:
-        return []                                    # arrays/intervals: skip
+        return []                                    # intervals etc.: skip
     if nullable:
         out.append("NULL")
     return out

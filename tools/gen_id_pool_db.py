@@ -56,6 +56,87 @@ MAPPING: dict[str, tuple] = {
     "impactId":         ("impacts", "id"),
     "rcaId":            ("rcas", "id"),
     "id":               ("channels", "id"),
+    # --- G15 audit additions: every key below was a required-arg-unresolvable
+    # skip or an "X not found" app-rejection in mutmatrix-full.json. Tables
+    # are populated by tools/seed_all_tables.py when bulk-seed leaves them
+    # empty; missing tables still skip gracefully (sandboxes vary).
+    "callId":              ("calls", "id"),
+    "activityId":          ("activities", "id"),
+    "nudgeId":             ("proactive_nudges", "id"),
+    "appId":               ("apps", "id"),
+    "applicationId":       ("applications", "id"),
+    "installedAppId":      ("installed_apps", "id"),
+    "channelParticipantId": ("channel_user_status", "id"),
+    "channelUserStatusId":  ("channel_user_status", "id"),
+    "participantId":        ("conversation_participants", "id"),
+    "conversationParticipantId": ("conversation_participants", "id"),
+    "sectionId":           ("channel_sections", "id"),
+    "emailId":             ("emails", "id"),
+    "lastReadEmailId":     ("emails", "id"),
+    "formEntityValueId":   ("form_entity_values", "id"),
+    "formFieldId":         ("form_fields", "id"),
+    "linkId":              ("surface_links", "id"),
+    "configId":            ("saved_user_configurations", "id"),
+    "stageId":             ("stages", "id"),
+    "presenceId":          ("user_presence", "id"),
+    "profileId":           ("user_profiles", "id"),
+    "roleId":              ("roles", "id"),
+    "automationId":        ("workflows", "id"),   # automations.* mutators write the workflows table
+    "delayedMessageId":    ("delayed_messages", "id"),
+    "canvasVersionId":     ("canvas_versions", "id"),
+    "versionId":           ("canvas_versions", "id"),
+    "recapId":             ("recaps", "id"),
+    "invitationId":        ("invitations", "id"),
+    "workflowId":          ("workflows", "id"),
+    "queryId":             ("queries", "id"),
+    "resourceId":          ("resources", "id"),
+    "agentId":             ("agents", "id"),
+    "toolId":              ("tools", "id"),
+    "modelId":             ("models", "id"),
+    "merchantId":          ("merchants", "id"),
+    "reactionId":          ("reactions", '"reactionId"'),
+    "draftId":             ("draft_messages", "id"),
+    "knowledgeDocumentId": ("knowledge_documents", "id"),
+    "coeId":               ("coes", "id"),
+    "subTicketId":         ("sub_tickets", "id"),
+    "pullRequestId":       ("pull_requests", "id"),
+    "attachmentId":        ("message_attachments", "id"),
+    "memberId":            ("org_members", '"memberId"'),
+    "mappingId":           ("ticket_tag_mappings", "id"),
+    # G15 VALUE_OVERRIDES targets (__pool:KEY__ sentinels): a bulk user that
+    # seed_all_tables LINK'd into the artseed channels (valid target for
+    # channel.removeParticipant/updateParticipantRole), and the entityIds the
+    # identity actually bookmarked (bookmark.remove/updateMetadata reject on
+    # anything else)
+    "secondMemberId":      ("channel_user_status", '"userId"',
+                           "\"channelId\" LIKE 'artseed-%' AND \"userId\" IN "
+                           "(SELECT id FROM public.users WHERE email LIKE 'bulk-user-%')"),
+    "bookmarkedEntityId":  ("bookmarks", '"entityId"', "id LIKE 'artseed-%'"),
+    # family-scoped bare-`id` pool keys (workload.NS_ID_KEY): bare `id` args
+    # now resolve ONLY through their ns-mapped key — these tables previously
+    # fell through to the generic pool (= a channels.id, guaranteed
+    # "X not found")
+    "artRowId":            ("application_release_tickets", "id"),
+    "slaPolicyId":         ("board_sla_policies", "id"),
+    "classificationMappingId": ("classification_mappings", "id"),
+    "stageEtaId":          ("ticket_stage_eta", "id"),
+    "ticketReferenceId":   ("ticket_reference_mappings", "id"),
+    "releaseAttributionId": ("release_attributions", "id"),
+    "emailReadId":         ("email_reads", "id"),
+    "draftMessageId":      ("draft_messages", "id"),
+    "emojiId":             ("custom_emojis", "id"),
+    "signatureId":         ("email_signatures", "id"),
+    "seriesId":            ("recurring_call_series", "id"),
+    "tagId":               ("ticket_tags", "id"),
+    "repoId":              ("repos", "id"),
+    "externalId":          ("calls", '"externalId"'),
+    # modifier-prefixed refs to core entities (synthesizer also strips these
+    # prefixes as a fallback — the pool entry makes resolution direct)
+    "targetUserId":        ("users", "id"),
+    "targetChannelId":     ("channels", "id"),
+    "childConversationId": ("conversations", '"conversationId"'),
+    "parentConversationId": ("conversations", '"conversationId"'),
+    "mainBoardId":         ("boards", "id"),
 }
 
 # Behavioural scalars the DB can't supply — same defaults the prod harvester
@@ -76,6 +157,23 @@ SCALARS: dict[str, list] = {
     "entityType": ["TICKET"], "searchQuery": ["test", "status", "release"],
     "scope": ["channel"], "scopeType": ["channel"], "dir": ["forward", "backward"],
     "type": ["TICKET_TYPE"], "boardType": ["DEFAULT", "RELEASE"],
+    # visibility: the source-derive step SKIPS this key (3 conflicting enum
+    # sets across queries), so without a hand value channel.promoteToChannel
+    # was required-arg-unresolvable. PUBLIC is a label in every variant.
+    "visibility": ["PUBLIC", "PRIVATE"],
+}
+
+# Plain-string mutator args the backend casts into PG enums (invisible to zod
+# derivation — the schema just says "string"). Resolved from pg_enum at pool
+# build; caught by G15 synth-invalids: automations.createProposal eventType ->
+# WorkflowEventType, query.upsert visualType -> QueryVisualizationType.
+KEY_PGENUM: dict[str, str] = {
+    "eventType": "WorkflowEventType",
+    "visualType": "QueryVisualizationType",
+    # nonLinear.syncTransitions transitions[].visitSlaMode — zod sees "string",
+    # backend casts into the pg enum (G15 synth-invalid class)
+    "visitSlaMode": "VisitSlaMode",
+    "onReenter": "ReenterMode",
 }
 
 
@@ -87,18 +185,32 @@ def psql_cmd(a) -> list[str]:
 
 def fetch(a, table: str, column: str, where: str | None, per_key: int) -> list[str]:
     w = f"WHERE {column} IS NOT NULL" + (f" AND {where}" if where else "")
+    # artseed-% rows FIRST, always included: organic cuid ids ('cm...') sort
+    # above 'artseed...' in DESC, so on organic-heavy tables (messages: 441k)
+    # the plain top-N would never contain the seeded rows — and the G15
+    # destructive phase can ONLY consume artseed pool entries.
+    art = run_sql(a, f"SELECT DISTINCT {column} FROM public.{table} {w} "
+                     f"AND {column}::text LIKE 'artseed%' LIMIT 40")
     sql = (f"SELECT DISTINCT {column} FROM public.{table} {w} "
            f"ORDER BY {column} DESC LIMIT {per_key}")
-    return run_sql(a, sql)
+    organic = run_sql(a, sql)
+    seen = set(art)
+    return art + [v for v in organic if v not in seen]
 
 
 def fetch_ranked_channels(a, where: str | None, per_key: int) -> list[str]:
     """channelIds ordered by participant count DESC — index 0 = hottest channel.
-    Enables rank-based Zipf sampling in the driver (replay.py --zipf-s)."""
+    Enables rank-based Zipf sampling in the driver (replay.py --zipf-s).
+    artseed channels are appended at the TAIL (coldest — they have 1-2 members
+    so the rank is honest) rather than lost below the LIMIT cutoff."""
     w = 'WHERE "channelId" IS NOT NULL' + (f" AND {where}" if where else "")
     sql = (f'SELECT "channelId" FROM public.channel_user_status {w} '
            f'GROUP BY "channelId" ORDER BY count(*) DESC LIMIT {per_key}')
-    return run_sql(a, sql)
+    ranked = run_sql(a, sql)
+    art = run_sql(a, 'SELECT DISTINCT "channelId" FROM public.channel_user_status '
+                     "WHERE \"channelId\" LIKE 'artseed-%' LIMIT 40")
+    seen = set(ranked)
+    return ranked + [v for v in art if v not in seen]
 
 
 # Signal-ranked pools for keys where a uniform draw mostly hits rows with no
@@ -258,6 +370,19 @@ def main() -> int:
     # scalars: hand defaults, overlaid by source-derived enum values (see
     # derive_scalars_from_source — the anti-stale-scalar mechanism)
     scalars = {k: list(v) for k, v in SCALARS.items()}
+    # every PG enum, exact-by-type-name: SchemaSynthesizer's nativeEnum
+    # fallback looks up "__pgenum:<Type>" when the source extractor could not
+    # resolve the enum at runtime (2 of 35 were missing in main-93410d5c)
+    for typ_lab in run_sql(a, "SELECT t.typname || '|' || "
+                              "string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) "
+                              "FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid "
+                              "GROUP BY t.typname"):
+        typ, labs = typ_lab.split("|", 1)
+        scalars[f"__pgenum:{typ}"] = labs.split(",")
+    for key, typ in KEY_PGENUM.items():
+        labs = scalars.get(f"__pgenum:{typ}")
+        if labs and key not in scalars:
+            scalars[key] = list(labs)
     if a.arg_schemas and os.path.exists(a.arg_schemas):
         derived, conflicts = derive_scalars_from_source(a, a.arg_schemas)
         drift_fixed = [k for k in derived

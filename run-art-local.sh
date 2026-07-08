@@ -273,6 +273,17 @@ fi
 # hotness ranking for its rank-to-rank id mapping. Also auto-seeds the tables
 # bulk-seed leaves empty (user_groups/canvases; idempotent artseed-% rows) so
 # the top trace keys keep mapping after a BULK_WIPE reseed.
+# Mutation-matrix (G15) additionally seeds EVERY empty table + the curated
+# destructive-target tables (artseed-% rows, identity-linked) and FORCES a
+# pool re-harvest: the previous matrix run's destructive phase CONSUMED
+# artseed rows, so both the rows and the pool entries must be regenerated
+# per run or destructive coverage silently decays back to skips.
+if [ "$MUTMATRIX" = "1" ]; then
+  "$PY" tools/seed_aux_tables.py --pg-container "$PG" --db "$DB" \
+    --groups 250 --canvases 100 | tail -1 | sed 's/^/  aux-seed: /'
+  "$PY" tools/seed_all_tables.py --pg-container "$PG" --db "$DB" \
+    --identity-user "$ALL_UIDS" | tail -2 | sed 's/^/  all-seed: /'
+fi
 if [ -n "$TRACE" ]; then
   "$PY" tools/seed_aux_tables.py --pg-container "$PG" --db "$DB" \
     --groups 250 --canvases 100 | sed 's/^/  seed: /'
@@ -280,7 +291,7 @@ if [ -n "$TRACE" ]; then
     echo "== harvesting UNSCOPED trace id-pool from $DB =="
     "$PY" tools/gen_id_pool_db.py --container "$PG" --db "$DB" --out "$POOL"
   fi
-elif [ "$REFRESH" = "1" ] || [ ! -f "$POOL" ] || [ "$N_IDENT" -gt 1 ]; then
+elif [ "$REFRESH" = "1" ] || [ ! -f "$POOL" ] || [ "$N_IDENT" -gt 1 ] || [ "$MUTMATRIX" = "1" ]; then
   echo "== harvesting id-pool from $DB (users: $N_IDENT) =="
   "$PY" tools/gen_id_pool_db.py --container "$PG" --db "$DB" --user-id "$ALL_UIDS" --out "$POOL"
 fi

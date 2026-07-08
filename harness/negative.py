@@ -311,7 +311,8 @@ async def sc_stale_cookie_ahead(ctx: Ctx) -> dict:
     storage, or a restored-from-backup server behind the client). Must be
     InvalidConnectionRequestBaseCookie — never silent wrong-baseline sync."""
     name = "stale-cookie-ahead"
-    expect = "error kind=InvalidConnectionRequestBaseCookie"
+    expect = ("terminal rejection (InvalidConnectionRequest[BaseCookie]) — "
+              "Rehome bounces allowed while the CG's view-syncer tears down")
     cgid, cid = rand_id(), rand_id()
     # 1) establish real state and learn the current cookie (hydration on the
     # sandbox is heavy-tailed: wait adaptively, cap at 45s)
@@ -337,22 +338,62 @@ async def sc_stale_cookie_ahead(ctx: Ctx) -> dict:
     # 36^12: numerically ahead of any watermark the replica can reach during
     # this test, still valid Lexi.
     forged = lexi_bump(s1.last_cookie.split(":")[0], by=36**12)
-    s2 = await ctx.open(cgid, cid, base_cookie=forged)
-    try:
-        # Wait for an actual verdict: either the rejection error (expected) or
-        # a poke (the server accepted the forged cookie and started syncing —
-        # the real regression). On a pod still digesting a preceding replay
-        # the verdict can take >20s; only pongs within the window means NO
-        # verdict yet — that's inconclusive (INFRA), not a regression.
-        await s2.pump_until(
-            lambda x: x.errors or x.tags.get("pokeStart", 0) > 0, 45)
-    finally:
-        await close(s2)
-    err = s2.first_error("InvalidConnectionRequestBaseCookie")
+    # Model the REAL zero-client: on Rehome it keeps the cookie and reconnects
+    # after backoff (error.ts getBackoffParams / NO_STATUS_TRANSITION). The
+    # Rehome here is NOT the cookie check answering — it's view-syncer.ts:460
+    # (stock zero-cache): leg-1's close started the CG's view-syncer teardown
+    # (#stateChanges cancelled) but the service isn't deleted from the
+    # ServiceRunner yet; a reconnect landing in that zombie window gets a
+    # generic Rehome before the cookie is ever examined. The Go pod's teardown
+    # is slow enough (sidecar table-source cleanup) that an immediate
+    # reconnect hits the window ~deterministically — verified 2026-07-07:
+    # attempt 1 Rehome, attempt 2 (0.1s later) InvalidConnectionRequestBase-
+    # Cookie, identical to TS. False-positive class #10: judging only the
+    # first answer turned a one-bounce race into a phantom "reconnect loop".
+    rehome_bounces = 0
+    s2 = None
+    for attempt_i, backoff in enumerate((0, 0.5, 1.5, 3.0), 1):
+        if backoff:
+            await asyncio.sleep(backoff)
+        s2 = await ctx.open(cgid, cid, base_cookie=forged)
+        try:
+            # Wait for an actual verdict: rejection error (expected) or a poke
+            # (server accepted the forged cookie — the real regression). On a
+            # pod still digesting a preceding replay this can take >20s; only
+            # pongs in the window = no verdict = INFRA, not a regression.
+            await s2.pump_until(
+                lambda x: x.errors or x.tags.get("pokeStart", 0) > 0, 45)
+        finally:
+            await close(s2)
+        if s2.first_error("Rehome") and not (
+                s2.first_error("InvalidConnectionRequestBaseCookie")
+                or s2.first_error("InvalidConnectionRequest")):
+            rehome_bounces += 1
+            continue                      # client-faithful retry, cookie kept
+        break
+    err = s2.first_error("InvalidConnectionRequestBaseCookie") \
+        or s2.first_error("InvalidConnectionRequest")
     if err:
+        # Both kinds are TERMINAL for the client (ConnectionStatus.Error /
+        # state reset) — the corrupt cookie cannot loop. TS 1.7.0 answers
+        # the same terminally (probed 2026-07-07). Rehome bounces before the
+        # terminal answer are the teardown-window race above — they cost one
+        # client reconnect each, so they're reported (and a Go-vs-TS teardown-
+        # speed observation), but they are not a correctness failure.
+        note = (f" after {rehome_bounces} Rehome bounce(s) "
+                f"(teardown-window race — see comment)" if rehome_bounces else "")
         return result(name, "PASS", expect,
-                      f"got it (cookie {s1.last_cookie} -> forged {forged}): "
-                      f"{err.get('message', '')[:50]}")
+                      f"rejected (cookie {s1.last_cookie} -> forged {forged}): "
+                      f"{err.get('kind')}: {err.get('message', '')[:50]}{note}")
+    if s2.first_error("Rehome"):
+        # Rehome on EVERY attempt incl. after 5s of backoff — no longer
+        # explainable by the teardown window; the client (which keeps the
+        # cookie on Rehome, NO_STATUS_TRANSITION) would loop indefinitely.
+        return result(name, "FAIL", expect,
+                      f"Rehome persisted across {rehome_bounces} attempts "
+                      f"(~5s backoff) for forged-ahead cookie {forged} — "
+                      "client keeps cookie + retries => reconnect loop; "
+                      "post-resync clients cannot recover")
     if s2.tags.get("pokeStart", 0) > 0 and not s2.errors:
         return result(name, "FAIL", expect,
                       f"server SYNCED from a forged future cookie {forged} "
@@ -689,6 +730,18 @@ async def run(a: argparse.Namespace) -> int:
                                   + " [first attempt failed; passed on retry "
                                     "— timing flake, not a regression]")
                 r2["flaky"] = True
+                # EXCEPTION to "flaky = pass": if the first attempt observed a
+                # PERMISSION LEAK (wrong-user data actually hydrated), a
+                # passing retry does NOT unsee it — an intermittent authz race
+                # is still an authz hole. Keep the leak on the record as its
+                # own entry so the report can't launder it.
+                if "LEAK" in str(r.get("observed", "")).upper():
+                    r2["first_attempt_leak"] = r.get("observed")
+                    results.append(dict(
+                        r, name=f"{nm}(first-attempt)", status="FAIL",
+                        observed=str(r.get("observed", ""))
+                        + " [intermittent: retry passed — authz RACE, "
+                          "not steady-state]"))
                 r = r2
             # else: keep the FIRST attempt's expect/observed (the real detail)
         results.append(r)

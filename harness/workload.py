@@ -22,6 +22,7 @@ from __future__ import annotations
 import bisect
 import hashlib
 import json
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -513,21 +514,57 @@ NS_ID_KEY = {
     "channel": "channelId", "channels": "channelId",
     "conversation": "conversationId", "conversations": "conversationId",
     "message": "messageId", "messages": "messageId",
-    "ticket": "ticketId", "tickets": "ticketId", "subTicket": "ticketId",
+    "ticket": "ticketId", "tickets": "ticketId", "subTicket": "subTicketId",
     "project": "projectId", "projects": "projectId",
     "board": "boardId", "boards": "boardId",
     "canvas": "canvasId", "call": "callId", "calls": "callId",
     "userGroup": "userGroupId", "draftMessages": "draftMessageId",
     "draft": "draftMessageId", "activities": "activityId",
     "bookmark": "messageId", "bookmarks": "messageId",
+    # --- G15 audit: every ns below resolved a bare `id` arg to the GENERIC
+    # pool key (= channels.id) — delayedMessages.cancel was looking up a
+    # CHANNEL id as a delayed message, which is why whole families read
+    # "X not found" even after their tables were seeded.
+    "delayedMessages": "delayedMessageId", "emailSignature": "signatureId",
+    "links": "linkId", "canvasVersion": "canvasVersionId",
+    "channelSection": "sectionId", "nudges": "nudgeId",
+    "collection": "collectionId", "form": "formId", "query": "queryId",
+    "automations": "workflowId", "workflow": "workflowId",
+    "repo": "repoId", "recap": "recapId", "coe": "coeId",
+    "merchant": "merchantId", "dashboard": "dashboardId",
+    "invitation": "invitationId", "knowledgeDocument": "knowledgeDocumentId",
+    "customEmoji": "emojiId", "resource": "resourceId",
+    "agent": "agentId", "tool": "toolId", "model": "modelId",
+    "app": "appId", "apps": "appId",
+    "application": "applicationId", "stage": "stageId",
+    "role": "roleId", "userPresence": "presenceId",
+    "userProfile": "profileId", "savedUserConfiguration": "configId",
+    "ticketTag": "tagId", "ticketTagV2": "tagId",
+    # gaps found by the G15 overlay audit: an UNMAPPED ns used to commit its
+    # fresh `id` under the raw "id" key — shared by half the catalog — so
+    # automations.update once drew rca.create's artmx id ("Automation
+    # artmx… not found").
+    "rca": "rcaId", "impact": "impactId", "emailRead": "emailReadId",
+    "releaseAttribution": "releaseAttributionId",
+    "ticketReference": "ticketReferenceId", "ticketStageEta": "stageEtaId",
+    "formEntityValue": "formEntityValueId", "canvasFolder": "folderId",
+    "applicationReleaseTicket": "artRowId", "orgMember": "memberId",
+    "boardSlaPolicy": "slaPolicyId", "classificationMapping": "classificationMappingId",
+    "emailDraft": "conversationId", "emailSignature2": "signatureId",
 }
 
 _SYN_STR_BY_KEY = [
-    # (predicate on lowercase key, value factory) — first match wins
-    (lambda k: k in ("name", "title", "label", "tagname"), lambda m: f"art-mx {m}"[:60]),
+    # (predicate on lowercase key, value factory) — first match wins.
+    # name/title/url carry a per-call nonce: constant synthetic strings
+    # tripped every uniqueness constraint on re-runs (repos_url_createdBy_key,
+    # "Collection already exists", "A section with this name already exists")
+    # — cleanup only reverts artmx-id ROWS, not unique VALUES they burned.
+    (lambda k: k in ("name", "title", "label", "tagname"),
+     lambda m: f"art-mx {m} {os.urandom(3).hex()}"[:60]),
     (lambda k: k in ("emoji",), lambda m: "🔥"),
     (lambda k: "email" in k, lambda m: "art-mx@example.invalid"),
-    (lambda k: "url" in k or "link" in k, lambda m: "https://example.invalid/art-mx"),
+    (lambda k: "url" in k or "link" in k,
+     lambda m: f"https://example.invalid/art-mx/{os.urandom(4).hex()}"),
     (lambda k: "color" in k, lambda m: "#8080ff"),
     (lambda k: k in ("position", "rank", "sortkey", "sortorder"), lambda m: "a0"),
     (lambda k: "timezone" in k, lambda m: "UTC"),
@@ -562,22 +599,69 @@ class SchemaSynthesizer:
         self.overlay: dict[str, list[str]] = {}   # argKey -> created ids (LIFO)
 
     # -- id resolution ------------------------------------------------------
+    # Modifier prefixes on entity refs (targetUserId, childConversationId,
+    # mainBoardId, lastReadEmailId ...) — stripped to find the base pool key
+    # when the exact key has no pool entry. G15 audit: 6 mutator types were
+    # skipped purely for want of this aliasing.
+    _MODIFIER_PREFIXES = ("target", "child", "main", "parent", "mapped",
+                          "sub", "lastRead", "initial", "root", "source",
+                          "dest", "new", "old", "from", "to", "linked",
+                          "original", "creator")
+
+    def _alias_keys(self, key: str) -> list[str]:
+        out = [key]
+        for p in self._MODIFIER_PREFIXES:
+            if key.startswith(p) and len(key) > len(p) and key[len(p)].isupper():
+                base = key[len(p)].lower() + key[len(p) + 1:]
+                if base != "id":
+                    out.append(base)
+        return out
+
     def _entity_id(self, key: str, ns: str, allow_fresh: bool,
                    overlay_only: bool) -> tuple[Optional[str], str]:
         """Resolve an id-like arg. Returns (value|None, provenance)."""
         pool_key = key
         if key == "id":
-            pool_key = NS_ID_KEY.get(ns, key)
+            # bare `id` is family-scoped: resolve through the ns-mapped key
+            # ONLY (raw overlay["id"] was cross-family poison — see NS_ID_KEY)
+            pool_key = NS_ID_KEY.get(ns) or f"{ns}#id"
+            tries = [pool_key]
+            # CREATE phase: bare `id` is the NEW row's client-minted PK — a
+            # pool draw is an existing PK and a guaranteed duplicate-key
+            # rejection (G15 round-5: workflows/impacts/collections/
+            # channel_sections_pkey). Mint fresh, always.
+            if allow_fresh:
+                return None, "want-fresh"
+        else:
+            tries = []
+            for k in self._alias_keys(key) + [pool_key]:
+                if k not in tries:
+                    tries.append(k)
         # own-run entities first: chains (create -> update -> delete) must
         # target what we made, and destructive phases may ONLY use these
-        for k in (key, pool_key):
+        for k in tries:
             if self.overlay.get(k):
                 return self.overlay[k][-1], "overlay"
         if overlay_only:
+            # artseed-% rows are OURS too (tools/seed_all_tables.py, wiped +
+            # re-seeded on demand) — letting destructive mutators consume them
+            # unlocked the 44 skipped-destructive-shared types without ever
+            # touching bulk-seeded or organic data.
+            for k in tries:
+                seeded = [v for v in self.ids.get(k, [])
+                          if isinstance(v, str) and v.startswith("artseed")]
+                if seeded:
+                    return seeded[self.rng.randrange(len(seeded))], "artseed"
             return None, "unresolved"
+        # identity affinity: userId/workspaceId AND owner-ish refs resolve to
+        # the caller — a random pool user is almost never a valid "owner" for
+        # backend ownership checks ("Owner not found": coe.create, rca.create)
         if key in ("userId", "workspaceId") and self.identity.get(key):
             return self.identity[key], "identity"
-        for k in (key, pool_key):
+        if key in ("ownerId", "creatorId", "authorId") \
+                and self.identity.get("userId"):
+            return self.identity["userId"], "identity"
+        for k in tries:
             vals = self.ids.get(k)
             if vals:
                 return vals[self.rng.randrange(len(vals))], "pool"
@@ -591,15 +675,38 @@ class SchemaSynthesizer:
         """Returns (value, ok). ok=False => caller omits (optional) or skips."""
         t = s.get("type")
         lk = key.lower()
+        # client-generated row PKs (conversations.send conversationId,
+        # messages.react reactionId/countId, ...): a POOL value here is an
+        # EXISTING pk -> guaranteed duplicate-key rejection. The matrix
+        # declares them per-mutator (FORCE_FRESH); mint + record uncondition-
+        # ally so cleanup and later phases see them.
+        if t == "string" and key in (meta.get("force_fresh") or ()):
+            fid = fresh_entity_id(self.rng)
+            meta["fresh_ids"].append((key, fid))
+            meta["provenance"][key] = "forced-fresh"
+            return fid, True
         if t == "literal":
             return s.get("value"), True
         if t == "boolean":
             return False, True
         if t == "enum":
             vals = s.get("values") or []
-            return (vals[0], True) if vals else (None, False)
+            if vals:
+                return vals[0], True
+            # extractor lost the labels (computed z.enum values — seen on
+            # channel.promoteToChannel visibility): fall back to pool scalars
+            sc = self.scalars.get(key)
+            if sc:
+                return sc[0], True
+            return None, False
         if t == "nativeEnum":
             vals = self.enums.get(s.get("enum") or "")
+            if vals:
+                return vals[0], True
+            # extractor could not resolve the TS enum at runtime: pg_enum dump
+            # (gen_id_pool_db writes every DB enum as __pgenum:<Type>) is
+            # authoritative for the target DB
+            vals = self.scalars.get(f"__pgenum:{s.get('enum') or ''}")
             if vals:
                 return vals[0], True
             sc = self.scalars.get(key)
@@ -624,6 +731,12 @@ class SchemaSynthesizer:
                     return None, False
                 meta["provenance"][key] = prov
                 return val, True
+            if key.endswith("Json") or lk.endswith("json"):
+                # string-that-must-parse-as-JSON (configJson/metadataJson/
+                # formValuesJson — zod sees only "string"; the backend
+                # JSON.parses it). {} is the cheapest valid document.
+                meta["provenance"][key] = "synthetic"
+                return "{}", True
             sc = self.scalars.get(key)
             if sc and isinstance(sc[0], str):
                 meta["provenance"][key] = "scalar"
@@ -670,9 +783,10 @@ class SchemaSynthesizer:
         return None, False                # date/bigint/tuple/opaque
 
     def synth(self, name: str, now_ms: int, allow_fresh: bool = False,
-              overlay_only: bool = False) -> tuple[Optional[dict], dict]:
+              overlay_only: bool = False,
+              force_fresh: set | None = None) -> tuple[Optional[dict], dict]:
         meta = {"mutator": name, "provenance": {}, "fresh_ids": [],
-                "skip_reason": None}
+                "skip_reason": None, "force_fresh": force_fresh or set()}
         entry = self.mutators.get(name)
         if entry is None:
             meta["skip_reason"] = "not-in-arg-schemas"
@@ -693,12 +807,55 @@ class SchemaSynthesizer:
             else:
                 meta["skip_reason"] = f"required-arg-unresolvable:{key}"
                 return None, meta
+        # z.record() companions to an id array (channel.addParticipants:
+        # userIds + participantIds/userStatusIds) — the backend expects one
+        # entry PER id in the sibling array; a bare {} synth-invalids with
+        # "participantId is required for user X". Mint a fresh row id per
+        # member (they become the created rows' PKs).
+        for key, s in args_schema.items():
+            if s.get("type") != "record" or not key.endswith("Ids") \
+                    or out.get(key) != {}:
+                continue
+            sibling = next((v for k2, v in out.items()
+                            if k2.endswith("Ids") and isinstance(v, list)
+                            and v and all(isinstance(x, str) for x in v)), None)
+            if sibling:
+                out[key] = {m: fresh_entity_id(self.rng) for m in sibling}
+                meta["provenance"][key] = "synthetic-record"
         return out, meta
 
-    def commit_fresh(self, fresh_ids: list[tuple[str, str]]) -> None:
-        """Record APPLIED creations so later phases can target them."""
+    def commit_fresh(self, fresh_ids: list[tuple[str, str]],
+                     ns: str | None = None) -> None:
+        """Record APPLIED creations so later phases can target them.
+
+        Keyed by the NS-MAPPED pool key, not the raw arg key: half the catalog
+        names its PK arg literally `id`, so overlay["id"] used to accumulate
+        fresh ids from EVERY create — emailSignature.create then drew a
+        delayed_messages artmx id and hit email_signatures_pkey (G15 write-
+        path audit). Under signatureId/delayedMessageId/... each family only
+        ever sees its own creations — and its update/delete chain-targets the
+        row it just made."""
         for key, fid in fresh_ids:
-            self.overlay.setdefault(key, []).append(fid)
+            k = (NS_ID_KEY.get(ns or "") or f"{ns}#id") if key == "id" else key
+            self.overlay.setdefault(k, []).append(fid)
+
+    def evict_fresh(self, fresh_ids: list[tuple[str, str]],
+                    ns: str | None = None) -> int:
+        """Remove a REJECTED mutation's optimistically-committed ids from the
+        overlay. Without eviction, one rejected create poisons its whole
+        family: canvas.create rejected -> canvas.update/delete draw the dead
+        artmx id and report 'Canvas not found' instead of falling back to a
+        live artseed pool row (G15 write-path audit round 3)."""
+        n = 0
+        for key, fid in fresh_ids:
+            k = (NS_ID_KEY.get(ns or "") or f"{ns}#id") if key == "id" else key
+            vals = self.overlay.get(k) or []
+            if fid in vals:
+                vals.remove(fid)
+                n += 1
+                if not vals:
+                    self.overlay.pop(k, None)
+        return n
 
 
 # --------------------------------------------------------------------------- #

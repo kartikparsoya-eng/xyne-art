@@ -1,0 +1,152 @@
+[GO-IVM][WEDGE-STACKS] BEGIN cg=art-i26192j8ja method=addQueriesStream elapsed=1m32.826s goroutines=31
+goroutine 37 [running]:
+main.dumpAllStacks(0x4002087680, 0x159cde6ae8)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/wedgewatch.go:168 +0x70
+main.(*Server).scanWedgedGroups(0x4000232000, {0x4000285738?, 0x0?, 0xfff297fab7e0?})
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/wedgewatch.go:148 +0x404
+main.(*Server).runWedgeWatchdog(0x4000232000, {0xfff29791c170, 0x40001a46e0})
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/wedgewatch.go:114 +0xb0
+created by main.startABIHostWithServer in goroutine 17
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/abi.go:237 +0x260
+
+goroutine 35 [select]:
+main.(*Server).runReaper(0x4000232000, {0xfff29791c170, 0x40001a46e0})
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1313 +0xc4
+created by main.startABIHostWithServer in goroutine 17
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/abi.go:230 +0x1c0
+
+goroutine 17 [runnable, locked to thread]:
+runtime.goexit({})
+	runtime/asm_arm64.s:1268 +0x4
+
+goroutine 36 [select]:
+main.(*Server).runPullIdleSweeper(0x4000232000, {0xfff29791c170, 0x40001a46e0})
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1272 +0xf0
+created by main.startABIHostWithServer in goroutine 17
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/abi.go:233 +0x210
+
+goroutine 38 [select]:
+main.(*Server).runPerfReporter(0x4000232000, {0xfff29791c170, 0x40001a46e0})
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:397 +0xb8
+created by main.startABIHostWithServer in goroutine 17
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/abi.go:243 +0x2b0
+
+goroutine 39 [IO wait, 5 minutes]:
+internal/poll.runtime_pollWait(0xfff29625cc00, 0x72)
+	runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x4000174900?, 0xfff2975ae408?, 0x0)
+	internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x4000174900)
+	internal/poll/fd_unix.go:613 +0x21c
+net.(*netFD).accept(0x4000174900)
+	net/fd_unix.go:161 +0x28
+net.(*TCPListener).accept(0x400012eb00)
+	net/tcpsock_posix.go:159 +0x24
+net.(*TCPListener).Accept(0x400012eb00)
+	net/tcpsock.go:380 +0x2c
+net/http.(*Server).Serve(0x4000288000, {0xfff29791ad80, 0x400012eb00})
+	net/http/server.go:3463 +0x24c
+net/http.(*Server).ListenAndServe(0x4000288000)
+	net/http/server.go:3389 +0x80
+main.startPprofServer.func1()
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:381 +0x6c
+created by main.startPprofServer in goroutine 17
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:379 +0x1fc
+
+goroutine 40 [select]:
+net.(*pipe).read(0x40001b2800, {0x400024a000, 0x10000, 0xfff297460524?})
+	net/pipe.go:159 +0xe0
+	github.com/mattn/go-sqlite3@v1.14.44/sqlite3.go:2531 +0x17c
+
+goroutine 1380343 [sync.WaitGroup.Wait]:
+sync.runtime_SemacquireWaitGroup(0xfff296ce6210?, 0xe0?)
+	runtime/sema.go:114 +0x38
+sync.(*WaitGroup).Wait(0x4006494010)
+	sync/waitgroup.go:206 +0xa8
+github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).addQueriesStreamChunked(0x4004bdb810, {0x40057e8000, 0x152, 0x152}, 0x1, 0x1, 0x4001c70fc0)
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:1154 +0x38c
+github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).AddQueriesStreamPull(...)
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:940
+main.(*Server).handleAddQueriesStream(0x4000232000, {{0x4006b2d180, 0x3}, {0x4006b2d190, 0x10}, {0x40081fc000, 0x7862f, 0x88000}, {0xfff2977b9180, 0x4006b2d1a8}, ...}, ...)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2160 +0x934
+main.(*Server).handleStreamWithRecover(0xfff29791c138?, {{0x4006b2d180, 0x3}, {0x4006b2d190, 0x10}, {0x40081fc000, 0x7862f, 0x88000}, {0xfff2977b9180, 0x4006b2d1a8}, ...}, ...)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1843 +0xd8
+main.(*ClientGroup).worker(0x40019040b0, 0x4000232000)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1534 +0x624
+created by main.(*Server).getGroup in goroutine 40
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1185 +0x2c8
+
+goroutine 1380288 [select]:
+database/sql.(*DB).connectionOpener(0x400430eea0, {0xfff29791c170, 0x4004bdb720})
+	database/sql/sql.go:1261 +0x80
+created by database/sql.OpenDB in goroutine 1380343
+	database/sql/sql.go:841 +0x114
+
+goroutine 1071124 [chan receive, 1 minutes]:
+main.handleConnection.func3.2(0xc?)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2400 +0x70
+created by main.handleConnection.func3 in goroutine 22
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2398 +0x240
+
+goroutine 1070684 [sync.WaitGroup.Wait, 1 minutes]:
+sync.runtime_SemacquireWaitGroup(0xfff296ce6210?, 0x80?)
+	runtime/sema.go:114 +0x38
+sync.(*WaitGroup).Wait(0x40004920b0)
+	sync/waitgroup.go:206 +0xa8
+github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).addQueriesStreamChunked(0x40001a5680, {0x4001c52000, 0x11c, 0x11c}, 0x1, 0x1, 0x4002cdeeb8)
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:1154 +0x38c
+github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).AddQueriesStreamPull(...)
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:940
+main.(*Server).handleAddQueriesStream(0x4000232000, {{0x400091f480, 0x3}, {0x400091f4f0, 0x10}, {0x4006794000, 0x5e542, 0x6c000}, {0xfff2977b9180, 0x400091f648}, ...}, ...)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2160 +0x934
+main.(*Server).handleStreamWithRecover(0xfff29791c138?, {{0x400091f480, 0x3}, {0x400091f4f0, 0x10}, {0x4006794000, 0x5e542, 0x6c000}, {0xfff2977b9180, 0x400091f648}, ...}, ...)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1843 +0xd8
+main.(*ClientGroup).worker(0x40005920b0, 0x4000232000)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1534 +0x624
+created by main.(*Server).getGroup in goroutine 40
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1185 +0x2c8
+
+goroutine 1395719 [select]:
+github.com/mattn/go-sqlite3.(*SQLiteRows).Next(0x40079e99e0, {0x4007b09cc0, 0xa, 0xa})
+	github.com/mattn/go-sqlite3@v1.14.44/sqlite3.go:2535 +0x1bc
+github.com/kartikparsoya-eng/go-ivm/internal/tablesource.(*sourceInput).Fetch.(*Source).fetchViaBoundReaderStream.func1(0x4007b04c40)
+	github.com/kartikparsoya-eng/go-ivm/internal/tablesource/source.go:1919 +0x1b0
+github.com/kartikparsoya-eng/go-ivm/ivm.(*Cap).Fetch.func1.(*Cap).initialFetch.1(0x4004ecb0c0)
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:1040 +0x110
+github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).addQueriesStreamChunked.func2-range1({0x40064bdd10, 0x4002999740, {0x40029999b0, 0x3, 0x3}})
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:1066 +0x204
+github.com/kartikparsoya-eng/go-ivm/ivm.(*Join).Fetch.func1-range1({0x40064bdd10, 0x4002999530, {0x4004376c80, 0x2, 0x2}})
+	github.com/kartikparsoya-eng/go-ivm/ivm/join.go:136 +0xa4
+github.com/kartikparsoya-eng/go-ivm/ivm.(*Take).initialFetch.func1-range1({0x40064bdd10, 0x4002999530, {0x4004376c80, 0x2, 0x2}})
+	github.com/kartikparsoya-eng/go-ivm/ivm/take.go:215 +0x6c
+github.com/kartikparsoya-eng/go-ivm/ivm.(*FlippedJoin).yieldParentWithOverlay(0x4000eda750, {0x40064bdd10, 0x40064bdd40, {0x4002a5d270, 0x1, 0x1}}, {0x4002999470, 0x1, 0x1}, 0x40040edb40)
+	github.com/kartikparsoya-eng/go-ivm/ivm/flipped_join.go:380 +0x490
+github.com/kartikparsoya-eng/go-ivm/ivm.(*FlippedJoin).fetchBatched.func1-range1({0x40064bdd10, 0x40064bdd40, {0x4002a5d270, 0x1, 0x1}})
+	github.com/kartikparsoya-eng/go-ivm/ivm/flipped_join.go:266 +0x214
+github.com/kartikparsoya-eng/go-ivm/ivm.(*FlippedJoin).fetchBatched.(*FlippedJoin).fetchChunkedSequential.func3(0x4003184c00)
+	github.com/kartikparsoya-eng/go-ivm/ivm/flipped_join.go:316 +0x328
+github.com/kartikparsoya-eng/go-ivm/ivm.(*FlippedJoin).fetchBatched.func1(0x40040edb40)
+	github.com/kartikparsoya-eng/go-ivm/ivm/flipped_join.go:247 +0x110
+github.com/kartikparsoya-eng/go-ivm/ivm.(*Take).initialFetch.func1(0x40019c9260)
+	github.com/kartikparsoya-eng/go-ivm/ivm/take.go:214 +0x24c
+github.com/kartikparsoya-eng/go-ivm/ivm.(*Join).Fetch.func1(0x40040ed9c0)
+	github.com/kartikparsoya-eng/go-ivm/ivm/join.go:135 +0xcc
+github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).addQueriesStreamChunked.func2(0xfff2971fc610?, 0x40061ec600)
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:1061 +0x268
+github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).addQueriesStreamChunked.func3(0x6?, 0x4004e46770?)
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:1121 +0x70
+created by github.com/kartikparsoya-eng/go-ivm/engine.(*Engine).addQueriesStreamChunked in goroutine 1070684
+	github.com/kartikparsoya-eng/go-ivm/engine/engine.go:1116 +0x500
+
+goroutine 1071548 [syscall, 1 minutes]:
+main._Cfunc_goivm_call_deliver(0xffff900e14e0, 0x0, 0x3, 0x40007faf00, 0x13b)
+	_cgo_gotypes.go:84 +0x2c
+main.goivm_start.func1.1(...)
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/napi_lib.go:162
+main.goivm_start.func1(0x3, {0x40007faf00?, 0x13b, 0xfff2978415e0?})
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/napi_lib.go:162 +0xa0
+main.(*rowPlane).emitChanges(0x4003a070b0, {0x400219a0e0, 0x3, 0x4})
+	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/rowplane.go:141 +0x2f4
+main.(*rowPlane).emitHydratePartial(0x4003a070b0, {{0x400125a9b0, 0x10}, {0x400219a0e0, 0x3, 0x4}, 0x68e, 0x0, 0x0})

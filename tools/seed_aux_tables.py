@@ -50,10 +50,19 @@ SELECT 'artseed-ug-' || lpad(i::text, 3, '0'), '{WS}',
 FROM generate_series(0, {{n_groups}} - 1) i
 ON CONFLICT (id) DO NOTHING;
 
--- map every bulk user into ~3 groups (deterministic spread by row_number)
-INSERT INTO public.user_group_mappings (id, "userId", "userGroupId", "createdAt", "updatedAt")
+-- map every bulk user into ~3 groups (deterministic spread by row_number).
+-- onCallSetNumbers cycles NULL / empty / [1,2]: the empty-vs-non-empty PG
+-- array shapes are the exact staging-regression parity-tolerance class
+-- (Go once emitted the STRING "[]" where TS emitted the ARRAY []) — keep
+-- them permanently probe-able on the wire via getUserGroupMembers.
+-- (ARRAY[] constructor syntax: this template renders through BOTH an
+-- f-string and .format(), so PG's brace literals would need 4x escaping)
+INSERT INTO public.user_group_mappings (id, "userId", "userGroupId",
+                                        "onCallSetNumbers", "createdAt", "updatedAt")
 SELECT 'artseed-ugm-' || u.rn || '-' || g,
        u.id, 'artseed-ug-' || lpad(((u.rn + g) % {{n_groups}})::text, 3, '0'),
+       CASE (u.rn + g) % 3 WHEN 0 THEN NULL
+            WHEN 1 THEN ARRAY[]::int4[] ELSE ARRAY[1,2]::int4[] END,
        now(), now()
 FROM (SELECT id, row_number() OVER (ORDER BY email) AS rn
       FROM public.users WHERE email LIKE 'bulk-user-%') u,
