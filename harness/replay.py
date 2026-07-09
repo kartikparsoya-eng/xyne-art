@@ -371,8 +371,21 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                     if msampler is None or cfg.mutations_per_min <= 0:
                         return
                     interval = 60.0 / cfg.mutations_per_min
+
+                    async def sleep_or_stop(seconds: float) -> bool:
+                        remaining = session_deadline - time.perf_counter()
+                        if remaining <= 0 or stop.is_set():
+                            return False
+                        try:
+                            await asyncio.wait_for(
+                                stop.wait(), timeout=min(seconds, remaining))
+                            return False
+                        except asyncio.TimeoutError:
+                            return time.perf_counter() < session_deadline and not stop.is_set()
+
                     # de-sync clients so pushes don't arrive in lockstep
-                    await asyncio.sleep(rng.uniform(0, interval))
+                    if not await sleep_or_stop(rng.uniform(0, interval)):
+                        return
                     while time.perf_counter() < session_deadline and not stop.is_set():
                         now_ms = int(time.time() * 1000)
                         if msampler.impact is not None:
@@ -400,7 +413,8 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                                 return
                             stats.mutations_sent += 1
                             stats.per_mutation[name] = stats.per_mutation.get(name, 0) + 1
-                        await asyncio.sleep(interval)
+                        if not await sleep_or_stop(interval):
+                            return
 
                 async def reader() -> None:
                     nonlocal acked, base_cookie, poke_open
