@@ -86,8 +86,14 @@ WEDGE_CLEAR_RE = re.compile(r"\[GO-IVM\]\[WEDGE-CLEAR\] cg=(\S+)")
 # ABI v4 boundary health: prints only when nonzero. stalls = enqueue found
 # all 8192 TSFN slots full and parked (100µs->5ms retry loop, cancellable);
 # timeouts = parked past 150s (also emits DELIVER-TIMEOUT above).
+# staged/batchFlushes (added 2026-07-08, staging build): staged = BENIGN
+# coalescing — entries buffered while the JS loop is busy then flushed in
+# batches; it tracks loop busyness, not distress. Healthy signature:
+# staged >> stalls, stalls ~0, timeouts 0. Optional in the regex so pre-batch
+# builds still parse.
 PERF_NAPI_RE = re.compile(
-    r"\[GO-IVM\]\[PERF-NAPI\].*?stalls=(\d+) timeouts=(\d+)")
+    r"\[GO-IVM\]\[PERF-NAPI\].*?stalls=(\d+) timeouts=(\d+)"
+    r"(?: staged=(\d+) batchFlushes=(\d+))?")
 
 
 def scan_container(name: str, since: str, slow_ms_watch: float,
@@ -127,13 +133,15 @@ def scan_container(name: str, since: str, slow_ms_watch: float,
                         for c in unresolved[:3]]}
 
     # -- ABI v4 Go->JS delivery boundary -------------------------------------
-    stalls = timeouts = napi_windows = 0
+    stalls = timeouts = staged = batch_flushes = napi_windows = 0
     for ln in lines:
         m = PERF_NAPI_RE.search(ln)
         if m:
             napi_windows += 1
             stalls += int(m.group(1))
             timeouts += int(m.group(2))
+            staged += int(m.group(3) or 0)
+            batch_flushes += int(m.group(4) or 0)
     slow_mat = [float(m.group(1)) for ln in lines
                 if (m := SLOW_MAT_RE.search(ln))]
     slow_mat_10s = sum(1 for v in slow_mat if v > 10_000)
@@ -158,12 +166,16 @@ def scan_container(name: str, since: str, slow_ms_watch: float,
         # TS materializations): Go parks briefly holding no lock, continues.
         # Stalls WITHOUT TS-side slowness = the queue filled for a reason we
         # can't see — a new finding per the v4 contract; flag it louder.
+        # (staged is deliberately NOT a watch trigger: batch-coalescing is
+        # the designed absorption path — staged >> stalls is the healthy
+        # signature, so it only rides along as context here.)
         corr = (f"correlated: {slow_mat_10s} materializations >10s in window"
                 if slow_mat_10s else
                 "NO slow TS materializations in window — uncorrelated "
                 "stall source, new finding worth flagging")
         watch.append(f"napi-deliver stalls={stalls} across {napi_windows} "
-                     f"10s-windows (timeouts={timeouts}) — {corr}")
+                     f"10s-windows (timeouts={timeouts}, staged={staged}, "
+                     f"batchFlushes={batch_flushes}) — {corr}")
 
     return {
         "lines_scanned": len(lines),
@@ -172,7 +184,8 @@ def scan_container(name: str, since: str, slow_ms_watch: float,
         "wedges": {"wedged_cgs": sorted(wedged), "cleared_cgs": sorted(cleared),
                    "unresolved_cgs": unresolved},
         "napi_deliver": {"stall_windows": napi_windows, "stalls": stalls,
-                         "timeouts": timeouts,
+                         "timeouts": timeouts, "staged": staged,
+                         "batch_flushes": batch_flushes,
                          "slow_materializations_gt10s": slow_mat_10s},
         "slow_sqlite": {"count": len(slow_ms),
                         "max_ms": round(max(slow_ms), 1) if slow_ms else 0,
