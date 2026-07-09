@@ -348,9 +348,21 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                 for p, n in zip(initial_puts, names):
                     register(p, n, initial=True)
 
+                async def sleep_or_stop(seconds: float) -> bool:
+                    remaining = session_deadline - time.perf_counter()
+                    if remaining <= 0 or stop.is_set():
+                        return False
+                    try:
+                        await asyncio.wait_for(
+                            stop.wait(), timeout=min(seconds, remaining))
+                        return False
+                    except asyncio.TimeoutError:
+                        return time.perf_counter() < session_deadline and not stop.is_set()
+
                 async def churn() -> None:
                     while time.perf_counter() < session_deadline and not stop.is_set():
-                        await asyncio.sleep(cfg.churn_ms / 1000.0)
+                        if not await sleep_or_stop(cfg.churn_ms / 1000.0):
+                            return
                         patch = []
                         if active and len(active) >= cfg.working_set:
                             old = active.pop(0)
@@ -371,17 +383,6 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                     if msampler is None or cfg.mutations_per_min <= 0:
                         return
                     interval = 60.0 / cfg.mutations_per_min
-
-                    async def sleep_or_stop(seconds: float) -> bool:
-                        remaining = session_deadline - time.perf_counter()
-                        if remaining <= 0 or stop.is_set():
-                            return False
-                        try:
-                            await asyncio.wait_for(
-                                stop.wait(), timeout=min(seconds, remaining))
-                            return False
-                        except asyncio.TimeoutError:
-                            return time.perf_counter() < session_deadline and not stop.is_set()
 
                     # de-sync clients so pushes don't arrive in lockstep
                     if not await sleep_or_stop(rng.uniform(0, interval)):
