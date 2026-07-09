@@ -135,6 +135,11 @@ FORCE_FRESH: dict[str, set] = {
     "coe.create": {"id"},
     "rca.create": {"id"},
     "canvas.create": {"id"},
+    # notesCanvasViewAccessId is a client-minted resource_access row PK (same
+    # pattern as canvas.create's viewAccessId) — it was our ONLY unresolvable
+    # skip. Their suite (d4ebb1885) fires it via auto-synth minting; ours now
+    # mints too => 220/220 planned mutators fire.
+    "calls.linkNotesCanvas": {"notesCanvasViewAccessId"},
     # upsert-style mutators whose bare `id` is the client-minted pk of the
     # row being upserted: ns-strict resolution has no pool key for these
     # per-user rows (user_preferences etc.) — fresh mint IS the correct
@@ -222,6 +227,7 @@ VALUE_OVERRIDES: dict[str, dict] = {
                      "userIds": ["__other_user__"]},
     "calls.reject": {"callId": "artseed-calls-2-ext"},
     "calls.cancelJoinRequest": {"callId": "artseed-calls-2-ext"},
+    "calls.linkNotesCanvas": {"callId": "artseed-calls-1-ext"},
     "draftMessages.create": {"channelId": "artseed-channels-0"},
 }
 
