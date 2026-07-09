@@ -208,6 +208,20 @@ VALUE_OVERRIDES: dict[str, dict] = {
     # start calls"), and every downstream overlay draw then chases a dead id
     "conversations.send": {"channelId": "artseed-channels-0"},
     "calls.initiate": {"channelId": "artseed-channels-0"},
+    # calls.* lookups resolve by EXTERNAL id, not calls.id (adopted from
+    # staging-regression d4ebb1885 curatedMutationArgs — their calls.leave
+    # passes activeCallExternalId; empirically our overlay's internal artmx
+    # callId got "Call not found" even after calls.initiate APPLIED).
+    # Seeder pins statuses: calls-0 SCHEDULED (cancel), -1/-2 ACTIVE (join/
+    # leave/requestToJoin demand an active call).
+    "calls.cancel": {"callId": "artseed-calls-0-ext"},
+    "calls.join": {"callId": "artseed-calls-1-ext"},
+    "calls.leave": {"callId": "artseed-calls-1-ext"},
+    "calls.requestToJoin": {"callId": "artseed-calls-2-ext"},
+    "calls.invite": {"callId": "artseed-calls-1-ext",
+                     "userIds": ["__other_user__"]},
+    "calls.reject": {"callId": "artseed-calls-2-ext"},
+    "calls.cancelJoinRequest": {"callId": "artseed-calls-2-ext"},
     "draftMessages.create": {"channelId": "artseed-channels-0"},
 }
 

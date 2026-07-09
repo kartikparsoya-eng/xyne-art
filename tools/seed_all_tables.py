@@ -407,6 +407,18 @@ def seed(a) -> int:
                WHERE id = 'artseed-channels-1';""",
             """UPDATE public.channels SET "isArchived"=true
                WHERE id = 'artseed-channels-3';""",
+            # calls fixtures (adopted from staging-regression d4ebb1885's
+            # curatedMutationArgs: their calls.leave passes the EXTERNAL id,
+            # and calls.cancel demands status SCHEDULED). Give the family a
+            # status spread + id-shaped externalIds (value_for had produced
+            # 'artseed calls externalId 0' junk strings).
+            f"""UPDATE public.calls SET "externalId" = id || '-ext',
+                   "createdByUserId" = {sq(uid)}, "organizerId" = {sq(uid)}
+               WHERE id LIKE 'artseed%';""",
+            """UPDATE public.calls SET status='SCHEDULED', "startsAt"=now() + interval '1 day'
+               WHERE id = 'artseed-calls-0';""",
+            """UPDATE public.calls SET status='ACTIVE'
+               WHERE id IN ('artseed-calls-1','artseed-calls-2');""",
             # tuple-unique leftovers from earlier rounds' applied grants/
             # upserts (their pks were pool-drawn or cleanup-gapped — the
             # artmx pre-sweep can't see them; the TUPLE is what collides)
@@ -495,7 +507,7 @@ def seed(a) -> int:
             rc, _ = psql(a, s, quiet=False)
             if rc == 0:
                 links += 1
-    n_links = 17
+    n_links = 20
 
     psql(a, "ANALYZE", quiet=True)
     print(f"\nseeded {len(seeded)} tables "
