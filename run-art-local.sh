@@ -51,6 +51,8 @@ cd "$DIR"
 
 SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
 MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
+PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0
+IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=0; DRAIN_BUDGET=30
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 while [ $# -gt 0 ]; do
@@ -78,6 +80,20 @@ while [ $# -gt 0 ]; do
     --negative) NEGATIVE=1; shift;;
     --mutation-matrix) MUTMATRIX=1; shift;;
     --refresh) REFRESH=1; shift;;
+    --protocol) PROTOCOL=1; shift;;
+    --telemetry) TELEMETRY=1; shift;;
+    --cold-start) COLDSTART=1; shift;;
+    --readiness) READINESS=1; shift;;
+    --drain) DRAIN=1; shift;;
+    --determinism) DETERMINISM=1; shift;;
+    --capacity) CAPACITY=1; shift;;
+    --capacity-ladder) CAPACITY_LADDER="$2"; shift 2;;
+    --capacity-blessed) CAPACITY_BLESSED="$2"; shift 2;;
+    --image) IMAGE="$2"; shift 2;;
+    --image-audit) IMAGEAUDIT=1; shift;;
+    --http-port) HTTP_PORT="$2"; shift 2;;
+    --drain-budget) DRAIN_BUDGET="$2"; shift 2;;
+    --upgrade) UPGRADE=1; shift;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -566,6 +582,72 @@ set +e
   --since "$RUN_START_ISO" --out "$LOG_REPORT"
 set -e
 
+# --- 6e) image/lifecycle probes (G16-G24) ---------------------------------------
+# Read-only probes run first; cold-start RESTARTS zero-cache; drain SIGTERMs
+# it (pod dies) so it runs LAST. capacity drives a multi-rung replay sweep.
+PROTOCOL_REPORT=""; TELEMETRY_REPORT=""; READINESS_REPORT=""; DETERMINISM_REPORT=""
+CAPACITY_REPORT=""; IMAGEAUDIT_REPORT=""; UPGRADE_REPORT=""; COLDSTART_REPORT=""; DRAIN_REPORT=""
+AUTHFLAGS=(--auth-token "$JWT" --extra-param "userID=$FIRST_UID")
+
+if [ "$PROTOCOL" = "1" ]; then
+  PROTOCOL_REPORT="reports/protocol-$TAG.json"
+  echo "== protocol-version probe (G16) =="
+  set +e; "$PY" tools/probe_protocol.py --target "$TARGET" "${AUTHFLAGS[@]}" --out "$PROTOCOL_REPORT"; set -e
+fi
+if [ "$TELEMETRY" = "1" ]; then
+  TELEMETRY_REPORT="reports/telemetry-$TAG.json"
+  echo "== telemetry-contract test (G17) =="
+  set +e; "$PY" tools/telemetry_contract.py --container "$ZCACHE" --since "${DURATION}s" --baseline art-baseline.json --out "$TELEMETRY_REPORT"; set -e
+fi
+if [ "$READINESS" = "1" ]; then
+  READINESS_REPORT="reports/readiness-$TAG.json"
+  : "${HTTP_PORT:=8080}"
+  echo "== readiness/liveness contract (G19) =="
+  set +e; "$PY" tools/probe_readiness.py --http "http://${SANDBOX}.localhost:${HTTP_PORT}" --ws-target "$TARGET" "${AUTHFLAGS[@]}" --out "$READINESS_REPORT"; set -e
+fi
+if [ "$DETERMINISM" = "1" ]; then
+  DETERMINISM_REPORT="reports/determinism-$TAG.json"
+  echo "== determinism oracle (G21) =="
+  set +e; "$PY" tools/determinism_oracle.py --target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --out "$DETERMINISM_REPORT"; set -e
+fi
+if [ "$UPGRADE" = "1" ]; then
+  UPGRADE_REPORT="reports/upgrade-$TAG.json"
+  echo "== upgrade-path test (G24) =="
+  if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+    set +e; "$PY" tools/upgrade_path.py --baseline-target "$MIRROR_URL" --candidate-target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --out "$UPGRADE_REPORT"; set -e
+  else
+    echo "NOTE: $MIRROR_POD not running — G24 needs a second image target (start zero-cache-ts)" >&2
+  fi
+fi
+if [ "$IMAGEAUDIT" = "1" ]; then
+  IMAGEAUDIT_REPORT="reports/image-$TAG.json"
+  if [ -z "$IMAGE" ]; then
+    IMAGE="$(docker inspect -f '{{.Config.Image}}' "$ZCACHE" 2>/dev/null || true)"
+  fi
+  if [ -n "$IMAGE" ]; then
+    echo "== image supply-chain audit (G23): $IMAGE =="
+    set +e; "$PY" tools/image_audit.py --image "$IMAGE" --out "$IMAGEAUDIT_REPORT"; set -e
+  else
+    echo "NOTE: could not determine image ref for $ZCACHE — pass --image" >&2
+  fi
+fi
+if [ "$CAPACITY" = "1" ]; then
+  CAPACITY_REPORT="reports/capacity-$TAG.json"
+  echo "== capacity-cliff sweep (G22): ladder $CAPACITY_LADDER =="
+  set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --ladder "$CAPACITY_LADDER" --blessed-conns "$CAPACITY_BLESSED" --out "$CAPACITY_REPORT"; set -e
+fi
+if [ "$COLDSTART" = "1" ]; then
+  COLDSTART_REPORT="reports/coldstart-$TAG.json"
+  echo "== cold-start timing (G18) — RESTARTS $ZCACHE =="
+  set +e; "$PY" tools/cold_start.py --target "$TARGET" --container "$ZCACHE" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --out "$COLDSTART_REPORT"; set -e
+  sleep 5  # let zero-cache come back up for the drain probe / verdict
+fi
+if [ "$DRAIN" = "1" ]; then
+  DRAIN_REPORT="reports/drain-$TAG.json"
+  echo "== SIGTERM drain test (G20) — KILLS $ZCACHE =="
+  set +e; "$PY" tools/drain_test.py --target "$TARGET" --container "$ZCACHE" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --drain-budget-s "$DRAIN_BUDGET" --out "$DRAIN_REPORT"; set -e
+fi
+
 # --- 7) the verdict --------------------------------------------------------------
 echo ""
 set +e
@@ -576,6 +658,15 @@ set +e
   ${CHAOS_REPORT:+--chaos "$CHAOS_REPORT"} \
   ${NEGATIVE_REPORT:+--negative "$NEGATIVE_REPORT"} \
   ${MUTMATRIX_REPORT:+--mut-matrix "$MUTMATRIX_REPORT"}
+  ${PROTOCOL_REPORT:+--protocol "$PROTOCOL_REPORT"} \
+  ${TELEMETRY_REPORT:+--telemetry "$TELEMETRY_REPORT"} \
+  ${COLDSTART_REPORT:+--coldstart "$COLDSTART_REPORT"} \
+  ${READINESS_REPORT:+--readiness "$READINESS_REPORT"} \
+  ${DRAIN_REPORT:+--drain "$DRAIN_REPORT"} \
+  ${DETERMINISM_REPORT:+--determinism "$DETERMINISM_REPORT"} \
+  ${CAPACITY_REPORT:+--capacity "$CAPACITY_REPORT"} \
+  ${IMAGEAUDIT_REPORT:+--image-audit "$IMAGEAUDIT_REPORT"} \
+  ${UPGRADE_REPORT:+--upgrade "$UPGRADE_REPORT"}
 GATE=$?
 set -e
 echo ""

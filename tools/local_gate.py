@@ -128,6 +128,25 @@ def main() -> int:
                     help="log_gate.py report json for gate G13 (default: skip)")
     ap.add_argument("--mut-matrix", default=None,
                     help="mutation_matrix.py report json for gate G15 (default: skip)")
+    # --- image/lifecycle gates G16-G24 (consumed from probe/gate reports) ---
+    ap.add_argument("--protocol", default=None,
+                    help="probe_protocol.py report json for gate G16 (default: skip)")
+    ap.add_argument("--telemetry", default=None,
+                    help="telemetry_contract.py report json for gate G17 (default: skip)")
+    ap.add_argument("--coldstart", default=None,
+                    help="cold_start.py report json for gate G18 (default: skip)")
+    ap.add_argument("--readiness", default=None,
+                    help="probe_readiness.py report json for gate G19 (default: skip)")
+    ap.add_argument("--drain", default=None,
+                    help="drain_test.py report json for gate G20 (default: skip)")
+    ap.add_argument("--determinism", default=None,
+                    help="determinism_oracle.py report json for gate G21 (default: skip)")
+    ap.add_argument("--capacity", default=None,
+                    help="capacity_gate.py report json for gate G22 (default: skip)")
+    ap.add_argument("--image-audit", default=None,
+                    help="image_audit.py report json for gate G23 (default: skip)")
+    ap.add_argument("--upgrade", default=None,
+                    help="upgrade_path.py report json for gate G24 (default: skip)")
     ap.add_argument("--baseline", default=BASELINE_DEFAULT)
     ap.add_argument("--update-baseline", action="store_true",
                     help="bless this run's latencies as the baseline for its shape and exit")
@@ -534,6 +553,32 @@ def main() -> int:
         results.append(("G15 mut-matrix", "SKIP",
                         "no mutation-matrix report (run with --mutation-matrix)"))
 
+    # --- G16-G24: image lifecycle + supply-chain gates. Each consumes a JSON
+    #     report from the matching probe/gate tool (uniform schema: verdict +
+    #     summary + checks). A report that never ran reads SKIP (not FAIL);
+    #     ERROR (infra) is distinguished from FAIL so a dead pod or a missing
+    #     scanner never reads as a regression. ---
+    def _consume_report(flag_val, gate_id, label, skip_hint):
+        if not flag_val or not os.path.exists(flag_val):
+            results.append((f"{gate_id} {label}", "SKIP", skip_hint))
+            return
+        with open(flag_val) as f:
+            doc = json.load(f)
+        v = doc.get("verdict", "ERROR")
+        if v == "INFRA":
+            v = "ERROR"
+        results.append((f"{gate_id} {label}", v, doc.get("summary", "")))
+
+    _consume_report(a.protocol, "G16", "protocol", "no protocol probe (run probe_protocol.py)")
+    _consume_report(a.telemetry, "G17", "telemetry", "no telemetry report (run telemetry_contract.py)")
+    _consume_report(a.coldstart, "G18", "coldstart", "no cold-start report (run cold_start.py)")
+    _consume_report(a.readiness, "G19", "readiness", "no readiness report (run probe_readiness.py)")
+    _consume_report(a.drain, "G20", "drain", "no drain report (run drain_test.py)")
+    _consume_report(a.determinism, "G21", "determinism", "no determinism report (run determinism_oracle.py)")
+    _consume_report(a.capacity, "G22", "capacity", "no capacity report (run capacity_gate.py)")
+    _consume_report(getattr(a, "image_audit"), "G23", "image-audit", "no image audit (run image_audit.py)")
+    _consume_report(a.upgrade, "G24", "upgrade", "no upgrade report (run upgrade_path.py)")
+
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))
     width = max(len(g) for g, _, _ in results)
@@ -561,7 +606,16 @@ def main() -> int:
                             if a.logs and os.path.exists(a.logs) else None),
                    "mut_matrix": (os.path.basename(a.mut_matrix)
                                   if a.mut_matrix and os.path.exists(a.mut_matrix)
-                                  else None)},
+                                  else None),
+                   "protocol": os.path.basename(a.protocol) if a.protocol and os.path.exists(a.protocol) else None,
+                   "telemetry": os.path.basename(a.telemetry) if a.telemetry and os.path.exists(a.telemetry) else None,
+                   "coldstart": os.path.basename(a.coldstart) if a.coldstart and os.path.exists(a.coldstart) else None,
+                   "readiness": os.path.basename(a.readiness) if a.readiness and os.path.exists(a.readiness) else None,
+                   "drain": os.path.basename(a.drain) if a.drain and os.path.exists(a.drain) else None,
+                   "determinism": os.path.basename(a.determinism) if a.determinism and os.path.exists(a.determinism) else None,
+                   "capacity": os.path.basename(a.capacity) if a.capacity and os.path.exists(a.capacity) else None,
+                   "image_audit": os.path.basename(getattr(a, "image_audit")) if getattr(a, "image_audit") and os.path.exists(getattr(a, "image_audit")) else None,
+                   "upgrade": os.path.basename(a.upgrade) if a.upgrade and os.path.exists(a.upgrade) else None},
                "results": [{"gate": g, "verdict": v, "detail": d}
                            for g, v, d in results],
                "overall": overall}
