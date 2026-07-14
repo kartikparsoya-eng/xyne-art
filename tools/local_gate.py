@@ -147,6 +147,8 @@ def main() -> int:
                     help="image_audit.py report json for gate G23 (default: skip)")
     ap.add_argument("--upgrade", default=None,
                     help="upgrade_path.py report json for gate G24 (default: skip)")
+    ap.add_argument("--parity", default=None,
+                    help="parity_gate.py report json for gate G25 (default: skip)")
     ap.add_argument("--baseline", default=BASELINE_DEFAULT)
     ap.add_argument("--update-baseline", action="store_true",
                     help="bless this run's latencies as the baseline for its shape and exit")
@@ -578,6 +580,7 @@ def main() -> int:
     _consume_report(a.capacity, "G22", "capacity", "no capacity report (run capacity_gate.py)")
     _consume_report(getattr(a, "image_audit"), "G23", "image-audit", "no image audit (run image_audit.py)")
     _consume_report(a.upgrade, "G24", "upgrade", "no upgrade report (run upgrade_path.py)")
+    _consume_report(a.parity, "G25", "latency-parity", "no parity report (run parity_gate.py)")
 
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))
@@ -615,7 +618,8 @@ def main() -> int:
                    "determinism": os.path.basename(a.determinism) if a.determinism and os.path.exists(a.determinism) else None,
                    "capacity": os.path.basename(a.capacity) if a.capacity and os.path.exists(a.capacity) else None,
                    "image_audit": os.path.basename(getattr(a, "image_audit")) if getattr(a, "image_audit") and os.path.exists(getattr(a, "image_audit")) else None,
-                   "upgrade": os.path.basename(a.upgrade) if a.upgrade and os.path.exists(a.upgrade) else None},
+                   "upgrade": os.path.basename(a.upgrade) if a.upgrade and os.path.exists(a.upgrade) else None,
+                   "parity": os.path.basename(a.parity) if a.parity and os.path.exists(a.parity) else None},
                "results": [{"gate": g, "verdict": v, "detail": d}
                            for g, v, d in results],
                "overall": overall}

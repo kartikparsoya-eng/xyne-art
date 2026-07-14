@@ -51,7 +51,7 @@ cd "$DIR"
 
 SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
 MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
-PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0
+PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0
 IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=0; DRAIN_BUDGET=30
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
@@ -94,6 +94,10 @@ while [ $# -gt 0 ]; do
     --http-port) HTTP_PORT="$2"; shift 2;;
     --drain-budget) DRAIN_BUDGET="$2"; shift 2;;
     --upgrade) UPGRADE=1; shift;;
+    --parity) PARITY=1; shift;;
+    --parity-factor) PARITY_FACTOR="$2"; shift 2;;
+    --cascade) CASCADE=1; PARITY=1; shift;;
+    --oversample) OVERSAMPLE=1; PARITY=1; shift;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -586,7 +590,7 @@ set -e
 # Read-only probes run first; cold-start RESTARTS zero-cache; drain SIGTERMs
 # it (pod dies) so it runs LAST. capacity drives a multi-rung replay sweep.
 PROTOCOL_REPORT=""; TELEMETRY_REPORT=""; READINESS_REPORT=""; DETERMINISM_REPORT=""
-CAPACITY_REPORT=""; IMAGEAUDIT_REPORT=""; UPGRADE_REPORT=""; COLDSTART_REPORT=""; DRAIN_REPORT=""
+CAPACITY_REPORT=""; IMAGEAUDIT_REPORT=""; UPGRADE_REPORT=""; PARITY_REPORT=""; COLDSTART_REPORT=""; DRAIN_REPORT=""
 AUTHFLAGS=(--auth-token "$JWT" --extra-param "userID=$FIRST_UID")
 
 if [ "$PROTOCOL" = "1" ]; then
@@ -636,6 +640,20 @@ if [ "$CAPACITY" = "1" ]; then
   echo "== capacity-cliff sweep (G22): ladder $CAPACITY_LADDER =="
   set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --ladder "$CAPACITY_LADDER" --blessed-conns "$CAPACITY_BLESSED" --out "$CAPACITY_REPORT"; set -e
 fi
+if [ "$PARITY" = "1" ]; then
+  PARITY_REPORT="reports/parity-$TAG.json"
+  echo "== latency-parity gate (G25): Go vs TS =="
+  if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+    PARITY_FLAGS=(--drive --primary-target "$TARGET" --mirror-target "$MIRROR_URL")
+    [ "$CASCADE" = "1" ] && PARITY_FLAGS+=(--cascade)
+    [ "$OVERSAMPLE" = "1" ] && PARITY_FLAGS+=(--oversample)
+    set +e; "$PY" tools/parity_gate.py "${PARITY_FLAGS[@]}" \
+      "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" \
+      --factor "$PARITY_FACTOR" --out "$PARITY_REPORT"; set -e
+  else
+    echo "NOTE: $MIRROR_POD not running — G25 needs the TS reference (start zero-cache-ts)" >&2
+  fi
+fi
 if [ "$COLDSTART" = "1" ]; then
   COLDSTART_REPORT="reports/coldstart-$TAG.json"
   echo "== cold-start timing (G18) — RESTARTS $ZCACHE =="
@@ -667,6 +685,7 @@ set +e
   ${CAPACITY_REPORT:+--capacity "$CAPACITY_REPORT"} \
   ${IMAGEAUDIT_REPORT:+--image-audit "$IMAGEAUDIT_REPORT"} \
   ${UPGRADE_REPORT:+--upgrade "$UPGRADE_REPORT"}
+  ${PARITY_REPORT:+--parity "$PARITY_REPORT"}
 GATE=$?
 set -e
 echo ""
