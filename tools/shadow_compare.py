@@ -42,7 +42,7 @@ QUANTILES = (("p50", 0.50), ("p95", 0.95), ("p99", 0.99))
 
 def sample_count(key: str, bucket: str, window: str, selector: str) -> int | None:
     """Total observations in the window for one side (le="+Inf" bucket)."""
-    sel = f'le="+Inf"' + (f",{selector}" if selector else "")
+    sel = 'le="+Inf"' + (f",{selector}" if selector else "")
     expr = f'sum(increase({bucket}{{{sel}}}[{window}]))'
     try:
         d = _get(PROM, {"query": expr}, key)

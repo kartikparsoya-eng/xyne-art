@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from replay import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
+from protocol import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
 from workload import (  # noqa: E402
     ArgResolver, WeightedSampler, load_baseline,
     query_put, init_connection_message, change_desired_queries_message,
@@ -503,7 +503,7 @@ async def sc_reconnect_storm(ctx: Ctx, n: int = 8) -> dict:
         # pump all sockets concurrently; older ones should get closed. The
         # survivor gets an adaptive wait (hydration under 8x churn is slow).
         last = sessions[-1]
-        won = (lambda x: x.errors or (x.connected and (
+        won = (lambda x: x.errors or (x.connected and (  # noqa: E731
             x.tags.get("pokeStart", 0) > 0 or x.tags.get("pokeEnd", 0) > 0
             or x.got_hashes)))
         await asyncio.gather(*(s.pump(12) for s in sessions[:-1]),

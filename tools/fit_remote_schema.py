@@ -28,7 +28,7 @@ import urllib.parse
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harness"))
-from replay import encode_sec_protocols  # noqa: E402
+from protocol import encode_sec_protocols  # noqa: E402
 from workload import init_connection_message  # noqa: E402
 
 COL_ERR = re.compile(
@@ -103,7 +103,7 @@ async def fit(a) -> int:
         if status == "schema_err":
             m = COL_ERR.search(detail)
             if m:
-                tbl, col, tail = m.group(1), m.group(2), m.group(3)
+                tbl, _col, tail = m.group(1), m.group(2), m.group(3)
                 valid = set(re.findall(r'"([^"]+)"', tail))
                 if tbl not in tables:
                     print(f"iter {i}: server names table {tbl!r} we don't declare — bail")

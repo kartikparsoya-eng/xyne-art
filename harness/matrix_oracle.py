@@ -54,7 +54,7 @@ from workload import (  # noqa: E402
     ArgResolver, change_desired_queries_message, init_connection_message,
     load_baseline, query_put,
 )
-from replay import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
+from protocol import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
 
 ZERO_INTERNAL_PREFIX = "_"
 

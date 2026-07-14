@@ -46,7 +46,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from workload import (  # noqa: E402
@@ -54,7 +54,7 @@ from workload import (  # noqa: E402
     query_put, query_del, change_desired_queries_message, init_connection_message,
     custom_mutation, push_message,
 )
-from replay import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
+from protocol import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
 
 
 def canon(v: Any) -> str:

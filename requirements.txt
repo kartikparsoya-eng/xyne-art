@@ -1,0 +1,5 @@
+# Xyne ART — runtime dependencies.
+# The harness is stdlib-only except for the live WebSocket driver.
+# Install:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+websockets==16.0

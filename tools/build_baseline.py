@@ -5,7 +5,8 @@ Client latency  : 72h (the 7d quantile aggregation over ~3.5M events overloads t
                   log backend; 72h over ~1.5M events is the widest that returns).
 Server hist     : 7d increase (ivm_advance: 1h rate fallback — 7d increase returns null).
 """
-import json, os
+import json
+import os
 
 RAW = os.path.join(os.path.dirname(__file__), "..", "raw")
 OUT = os.path.join(os.path.dirname(__file__), "..", "art-baseline.json")
@@ -124,7 +125,8 @@ def qrow(name):
         "args": arg_schema.get(name, []),
     }
     if st:
-        p95 = f(st["p95"]); p99 = f(st["p99"])
+        p95 = f(st["p95"])
+        p99 = f(st["p99"])
         row["p50_ms"] = round(f(st["p50"]), 1)
         row["p95_ms"] = round(p95, 1)
         row["p99_ms"] = round(p99, 1)
@@ -140,7 +142,8 @@ def qrow(name):
 queries = [qrow(n) for n in sorted(q_counts, key=lambda n: -q_counts[n])]
 
 # coverage: how many queries to reach 80% / 95%
-cum = 0; c80 = c95 = None
+cum = 0
+c80 = c95 = None
 for i, r in enumerate(queries, 1):
     cum += r["weight_pct"]
     if c80 is None and cum >= 80:
@@ -165,8 +168,10 @@ for name in sorted(oneshot, key=lambda n: -int(oneshot[n]["calls"])):
 # ---- mutation workload (ALL 151) ----
 mut_rows = []
 for m in sorted(muts, key=lambda m: -int(m["calls"])):
-    name = m["mutation"]; calls = int(m["calls"])
-    p95 = f(m["p95"]); p99 = f(m["p99"])
+    name = m["mutation"]
+    calls = int(m["calls"])
+    p95 = f(m["p95"])
+    p99 = f(m["p99"])
     r = {"name": name, "calls_7d": calls, "weight_pct": round(calls / total_m * 100, 4),
          "p50_ms": round(f(m["p50"]), 1), "p95_ms": round(p95, 1),
          "p99_ms": round(p99, 1), "max_ms": round(f(m["max"]), 1)}

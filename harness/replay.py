@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import random
@@ -55,18 +54,10 @@ from workload import (  # noqa: E402
     custom_mutation, push_message, MUTATION_ARG_BUILDERS,
 )
 
-# Current mono protocol version (packages/zero-protocol/src/protocol-version.ts).
-DEFAULT_PROTOCOL_VERSION = 49
-
-
-def encode_sec_protocols(init_connection_message: Optional[list],
-                         auth_token: Optional[str]) -> str:
-    """Port of packages/zero-protocol/src/connect.ts::encodeSecProtocols.
-    base64(utf8(JSON)) then percent-encode. Kept byte-for-byte compatible so
-    zero-cache's decodeSecProtocols round-trips. If that file changes, update here."""
-    protocols = {"initConnectionMessage": init_connection_message, "authToken": auth_token}
-    raw = json.dumps(protocols, separators=(",", ":")).encode("utf-8")
-    return urllib.parse.quote(base64.b64encode(raw).decode("ascii"))
+# Vendored wire-protocol primitives (DEFAULT_PROTOCOL_VERSION + encode_sec_protocols).
+from protocol import (  # noqa: E402
+    DEFAULT_PROTOCOL_VERSION, encode_sec_protocols,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -615,7 +606,6 @@ async def run_live(cfg: Config, sampler, resolver,
 # --------------------------------------------------------------------------- #
 def dry_run(cfg: Config, sampler, resolver, n: int,
             msampler: Optional[MutationSampler] = None) -> None:
-    rng = random.Random(cfg.seed)
     print("=== DRY RUN (no network) ===")
     print(f"target        : {cfg.target}{cfg.path_prefix}/sync/v{cfg.protocol_version}/connect")
     print(f"auth          : {'cookie' if cfg.cookie else ('token' if cfg.auth_token else 'NONE')}"

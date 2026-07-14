@@ -74,7 +74,7 @@ from workload import (  # noqa: E402
     custom_mutation, fresh_entity_id, init_connection_message, load_baseline,
     push_message, query_put,
 )
-from replay import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
+from protocol import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
 
 CREATE_RE = re.compile(r"\.(create|add|new)[A-Za-z]*$|\.create$", re.I)
 DESTRUCTIVE_RE = re.compile(

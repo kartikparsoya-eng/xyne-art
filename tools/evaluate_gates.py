@@ -211,7 +211,7 @@ def render_md(meta: dict, checks: list[dict], verdict: str) -> str:
     counts = {}
     for c in checks:
         counts[c["verdict"]] = counts.get(c["verdict"], 0) + 1
-    lines.append(f"- results: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    lines.append("- results: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     lines.append("")
 
     lines.append("## Server engine SLOs (hard gate)")

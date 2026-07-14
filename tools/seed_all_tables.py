@@ -35,7 +35,6 @@ seeded FK/text columns where possible (best effort, reported).
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 from collections import defaultdict
@@ -379,7 +378,6 @@ def seed(a) -> int:
     links = 0
     if uid:
         role_of = lambda t, d: (enums.get(t) or [d])[0]  # noqa: E731
-        uid_rows = ", ".join(sq(u) for u in all_uids)
         # a SECOND known member for target-user mutators (channel.remove-
         # Participant / updateParticipantRole reject when the target isn't in
         # the channel — a random pool userId almost never is)

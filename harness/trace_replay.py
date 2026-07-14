@@ -51,14 +51,14 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from workload import (  # noqa: E402
     MUTATION_ARG_BUILDERS, ArgResolver, change_desired_queries_message,
     custom_mutation, init_connection_message, push_message, query_put,
 )
-from replay import (  # noqa: E402
+from protocol import (  # noqa: E402
     DEFAULT_PROTOCOL_VERSION, encode_sec_protocols,
 )
 

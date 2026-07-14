@@ -1,0 +1,12 @@
+[tool.ruff]
+# The harness targets Python 3.11+ (uses PEP 604 `X | None` and `list[...]` hints).
+# The dev venv is 3.14; keep the floor conservative so teammates aren't forced.
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+# ruff's default families (E4/E7/E9 + F) plus W (whitespace/warnings).
+# E501 (line-too-long) is intentionally NOT selected: several tools embed
+# long SQL/JSON literals where wrapping hurts readability. Enforce length
+# via `ruff format` if/when adopted.
+select = ["E4", "E7", "E9", "F", "W"]

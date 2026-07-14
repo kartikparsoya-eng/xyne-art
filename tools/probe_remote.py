@@ -21,7 +21,7 @@ import urllib.parse
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harness"))
-from replay import encode_sec_protocols  # noqa: E402
+from protocol import encode_sec_protocols  # noqa: E402
 from workload import init_connection_message  # noqa: E402
 
 

@@ -1,4 +1,5 @@
-import sys, json
+import sys
+import json
 from collections import defaultdict
 
 schema = defaultdict(lambda: {"keys": set(), "sample": None, "n": 0})

@@ -1,0 +1,5 @@
+# Xyne ART — dev/test dependencies.
+# Install:  .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+
+pytest==8.4.1
+ruff==0.12.8
