@@ -51,7 +51,7 @@ cd "$DIR"
 
 SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
 MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
-PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0
+PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0; WRITE_PARITY=0; PROD_BUDGET=0
 IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=0; DRAIN_BUDGET=30
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
@@ -98,6 +98,8 @@ while [ $# -gt 0 ]; do
     --parity-factor) PARITY_FACTOR="$2"; shift 2;;
     --cascade) CASCADE=1; PARITY=1; shift;;
     --oversample) OVERSAMPLE=1; PARITY=1; shift;;
+    --write-parity) WRITE_PARITY=1; PARITY=1; shift;;
+    --prod-budget) PROD_BUDGET="$2"; PARITY=1; shift 2;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -647,6 +649,8 @@ if [ "$PARITY" = "1" ]; then
     PARITY_FLAGS=(--drive --primary-target "$TARGET" --mirror-target "$MIRROR_URL")
     [ "$CASCADE" = "1" ] && PARITY_FLAGS+=(--cascade)
     [ "$OVERSAMPLE" = "1" ] && PARITY_FLAGS+=(--oversample)
+    [ "$WRITE_PARITY" = "1" ] && PARITY_FLAGS+=(--write-parity)
+    [ -n "$PROD_BUDGET" ] && [ "$PROD_BUDGET" != "0" ] && PARITY_FLAGS+=(--prod-budget "$PROD_BUDGET")
     set +e; "$PY" tools/parity_gate.py "${PARITY_FLAGS[@]}" \
       "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" \
       --factor "$PARITY_FACTOR" --out "$PARITY_REPORT"; set -e

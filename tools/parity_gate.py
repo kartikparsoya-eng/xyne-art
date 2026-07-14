@@ -63,7 +63,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from protocol import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
 from workload import (  # noqa: E402
     ArgResolver, load_baseline, query_put,
-    init_connection_message,
+    init_connection_message, custom_mutation, push_message,
+    MUTATION_ARG_BUILDERS,
 )
 
 
@@ -169,6 +170,103 @@ def compute_cascade_multiplier(hydrate_times: list[float],
               f"single {single:.0f}ms = {multiplier}x amplification")
     return {"overflows": len(overflows), "cascade_cost_ms": round(cascade),
             "single_cost_ms": round(single), "multiplier": multiplier,
+            "verdict": verdict, "detail": detail}
+
+
+def load_prod_query_latencies(baseline_path: str = "art-baseline.json") -> dict:
+    """Return {query_name: {"p50": .., "p95": .., "p99": ..}} from the prod baseline.
+    The ART's per-query prod percentiles (art-baseline.json::query_workload.queries)
+    are the absolute budget: a query whose sandbox p95 exceeds prod p95 × factor
+    is a finding EVEN IF Go vs TS ratio passes (both builds could be equally slow
+    on a bug both inherited — the ratio cancels shared bugs, the absolute budget
+    catches them)."""
+    d = json.load(open(baseline_path))
+    out: dict = {}
+    for q in d.get("query_workload", {}).get("queries", []):
+        name = q.get("name")
+        if not name:
+            continue
+        out[name] = {k: q[k] for k in ("p50_ms", "p95_ms", "p99_ms") if k in q}
+    return out
+
+
+def compute_prod_budget_violations(primary_pq: dict, prod_pq: dict,
+                                    factor: float = 3.0,
+                                    quantile: str = "p95",
+                                    min_samples: int = 10) -> dict:
+    """For each query in primary_pq with enough samples, check whether its sandbox
+    latency exceeds the PROD budget by more than factor. Returns {compared,
+    violations, verdict}. This is the THIRD signal that complements the ratio
+    gate (Go vs TS) — it catches shared bugs that the ratio cancels.
+
+    prod field naming: art-baseline.json uses {p50_ms, p95_ms, p99_ms}.
+    """
+    prod_key = {"p50": "p50_ms", "p95": "p95_ms", "p99": "p99_ms"}[quantile]
+    violations: list[dict] = []
+    compared = 0
+    details: list[dict] = []
+    for qname, p in primary_pq.items():
+        prod = prod_pq.get(qname)
+        if not prod:
+            continue
+        ps = p.get("samples", 0)
+        if ps < min_samples:
+            continue
+        pv = p.get(quantile)
+        mv = prod.get(prod_key)
+        if pv is None or mv is None:
+            continue
+        compared += 1
+        ratio = round(pv / mv, 2) if mv else float("inf")
+        detail = {"query": qname, "primary": pv, "prod": mv,
+                  "ratio": ratio, "samples": ps}
+        details.append(detail)
+        if ratio > factor:
+            detail["verdict"] = "FAIL"
+            violations.append(detail)
+        else:
+            detail["verdict"] = "PASS"
+    violations.sort(key=lambda v: v["ratio"], reverse=True)
+    verdict = "FAIL" if violations else "PASS"
+    return {"compared": compared, "violations": violations,
+            "details": details, "verdict": verdict}
+
+
+def compute_write_parity(primary_pokes: list[float], mirror_pokes: list[float],
+                         factor: float = 2.0, min_delta_ms: float = 100.0,
+                         min_samples: int = 10) -> dict:
+    """Pure comparator for write-path poke latencies (push -> pokeEnd round-trip
+    times for the same mutation fired against both builds). Returns the same
+    shape as compute_ratios but for write-path.
+
+    Without this, a mutation that's correct but 10x slower on Go than TS
+    (the advance/invalidation poke path) sails through G25 — read-path parity
+    doesn't extend to writes. This is the third signal that closes #2.
+    """
+    def _stats(xs):
+        if not xs:
+            return {"samples": 0, "p50": None, "p95": None}
+        s = sorted(xs)
+        def pct(p):
+            return round(s[min(len(s) - 1, int(p * len(s)))], 1) if s else None
+        return {"samples": len(s), "p50": pct(0.50), "p95": pct(0.95)}
+
+    ps, ms = _stats(primary_pokes), _stats(mirror_pokes)
+    compared = min(ps["samples"], ms["samples"])
+    if compared < min_samples or not ps["p95"] or not ms["p95"]:
+        return {"compared": compared, "stats": {"primary": ps, "mirror": ms},
+                "offenders": [], "verdict": "SKIP",
+                "detail": f"insufficient samples (need {min_samples}, have {compared})"}
+    slower, faster = (ps["p95"], ms["p95"]) if ps["p95"] >= ms["p95"] else (ms["p95"], ps["p95"])
+    ratio = round(slower / faster, 2) if faster else float("inf")
+    delta = round(abs(ps["p95"] - ms["p95"]), 1)
+    direction = "primary-slower" if ps["p95"] > ms["p95"] else "mirror-slower"
+    detail = {"primary_p95": ps["p95"], "mirror_p95": ms["p95"],
+              "ratio": ratio, "delta_ms": delta, "direction": direction,
+              "samples": {"primary": ps["samples"], "mirror": ms["samples"]}}
+    verdict = "FAIL" if ratio > factor and delta > min_delta_ms else "PASS"
+    return {"compared": compared, "stats": {"primary": ps, "mirror": ms},
+            "offenders": [detail] if verdict == "FAIL" else [],
             "verdict": verdict, "detail": detail}
 
 
@@ -305,6 +403,75 @@ async def cascade_probe(target: str, version: int, auth_token: str | None,
 
 
 # --------------------------------------------------------------------------- #
+# Write-path probe: measure mutation poke round-trip latency (Go vs TS)
+# --------------------------------------------------------------------------- #
+async def write_path_probe(target: str, version: int, auth_token: str | None,
+                          extra_params: list[tuple[str, str]], id_pool: str,
+                          client_schema: dict | None, n_samples: int) -> list[float]:
+    """Fire n_samples mutations and measure push→pokeEnd round-trip latency.
+
+    This is the write-path counterpart to the read-path ratio. G15 (mutation
+    matrix) proves Go and TS converge to the same STATE after a mutation; this
+    proves they don't take 10x longer to get there. Reuses the same
+    MUTATION_ARG_BUILDERS + push_message plumbing as mutation_matrix.py.
+    """
+    import websockets
+
+    pool = json.load(open(id_pool)) if os.path.exists(id_pool) else {}
+    builder_keys = sorted(MUTATION_ARG_BUILDERS.keys())
+    times: list[float] = []
+    for i in range(n_samples):
+        mut_name = builder_keys[i % len(builder_keys)]
+        try:
+            args = MUTATION_ARG_BUILDERS[mut_name](pool, random.Random(i))
+            mut = custom_mutation(mut_name, args)
+            msg = push_message([mut])
+        except Exception:
+            continue
+        rng = random.Random(i + 1000)
+        cgid = "art-wp-" + "".join(rng.choice("abc012") for _ in range(10))
+        cid = "art-wp-" + "".join(rng.choice("abc012") for _ in range(10))
+        params = {"clientGroupID": cgid, "clientID": cid, "baseCookie": "",
+                  "ts": str(time.time() * 1000), "lmid": "0"}
+        params.update(extra_params)
+        url = (target.rstrip("/") + f"/sync/v{version}/connect?"
+               + urllib.parse.urlencode(params))
+        sec = encode_sec_protocols(None, auth_token)
+        t0 = time.perf_counter()
+        try:
+            async with websockets.connect(url, subprotocols=[sec], open_timeout=15,
+                                           max_size=None, ping_interval=None) as ws:
+                init = init_connection_message([], client_schema=client_schema)
+                await ws.send(json.dumps(init))
+                # wait for pokeEnd (initial empty hydration)
+                deadline = time.perf_counter() + 10
+                while time.perf_counter() < deadline:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        break
+                    msg_in = json.loads(raw) if raw else None
+                    if isinstance(msg_in, list) and msg_in and msg_in[0] == "pokeEnd":
+                        break
+                # send the mutation
+                t0 = time.perf_counter()
+                await ws.send(json.dumps(msg))
+                deadline = time.perf_counter() + 10
+                while time.perf_counter() < deadline:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        break
+                    msg_in = json.loads(raw) if raw else None
+                    if isinstance(msg_in, list) and msg_in and msg_in[0] == "pokeEnd":
+                        times.append(round((time.perf_counter() - t0) * 1000, 1))
+                        break
+        except Exception:
+            continue
+    return times
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 async def amain(a: argparse.Namespace) -> dict:
@@ -379,6 +546,44 @@ async def amain(a: argparse.Namespace) -> dict:
             checks.append({"name": "oversample", "verdict": "PASS",
                            "detail": "all queries above sample floor"})
 
+    # --- prod absolute budget (catches shared bugs the ratio cancels) ---
+    if a.prod_budget:
+        try:
+            prod_pq = load_prod_query_latencies(a.prod_budget)
+            pb = compute_prod_budget_violations(primary_pq, prod_pq,
+                                                  a.prod_factor, a.quantile)
+            checks.append({"name": "prod-budget", "verdict": pb["verdict"],
+                           "detail": f"{pb['compared']} vs prod; "
+                                     f"{len(pb['violations'])} budget violation(s)"})
+            for v in pb["violations"][:4]:
+                checks.append({"name": f"  {v['query']}", "verdict": "FAIL",
+                               "detail": f"{v['ratio']}x prod "
+                                         f"({v['primary']:.0f} vs {v['prod']:.0f}ms)"})
+        except FileNotFoundError:
+            checks.append({"name": "prod-budget", "verdict": "SKIP",
+                           "detail": f"baseline file not found: {a.prod_budget}"})
+
+    # --- write-path parity (mutation poke latency Go vs TS) ---
+    if a.write_parity and a.primary_target and a.mirror_target:
+        extra_params = [tuple(p.split("=", 1)) for p in a.extra_param]
+        client_schema = json.load(open(a.client_schema)) if a.client_schema else None
+        p_pokes = await write_path_probe(
+            a.primary_target, a.protocol_version, a.auth_token,
+            extra_params, a.id_pool, client_schema, a.write_samples)
+        m_pokes = await write_path_probe(
+            a.mirror_target, a.protocol_version, a.auth_token,
+            extra_params, a.id_pool, client_schema, a.write_samples)
+        wp = compute_write_parity(p_pokes, m_pokes, a.factor, a.min_delta_ms,
+                                   a.min_samples)
+        checks.append({"name": "write-parity", "verdict": wp["verdict"],
+                       "detail": (f"write-path {wp['compared']} samples; "
+                                  f"{wp.get('detail', '')}") if wp["offenders"]
+                                  else f"write-path {wp['compared']} samples, "
+                                       f"no parity violation"})
+    elif a.write_parity:
+        checks.append({"name": "write-parity", "verdict": "SKIP",
+                       "detail": "needs --primary-target and --mirror-target (drive mode)"})
+
     # --- cascade mode ---
     if a.cascade:
         resolver = ArgResolver.from_pool_file(a.id_pool, random.Random(a.seed))
@@ -445,6 +650,16 @@ def main() -> int:
     ap.add_argument("--timeout-ms", type=float, default=500.0,
                     help="client timeout threshold for cascade (default 500ms)")
     ap.add_argument("--seed", type=int, default=42)
+    # prod absolute budget (third signal — catches shared bugs the ratio cancels)
+    ap.add_argument("--prod-budget", default=None,
+                    help="path to art-baseline.json for prod absolute budget check")
+    ap.add_argument("--prod-factor", type=float, default=3.0,
+                    help="FAIL when primary/prod ratio exceeds this (default 3.0)")
+    # write-path parity (mutation poke latency Go vs TS)
+    ap.add_argument("--write-parity", action="store_true",
+                    help="measure mutation poke round-trip latency Go vs TS")
+    ap.add_argument("--write-samples", type=int, default=50,
+                    help="number of mutation pokes per build (default 50)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 

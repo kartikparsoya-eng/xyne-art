@@ -14,6 +14,7 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 from parity_gate import compute_ratios, find_undersampled, compute_cascade_multiplier  # noqa: E402
+from parity_gate import compute_prod_budget_violations, compute_write_parity  # noqa: E402
 
 
 def _pq(name, samples, p50, p95=None, p99=None):
@@ -151,4 +152,92 @@ def test_cascade_multiplier_uses_min_as_single():
 
 def test_cascade_empty_samples():
     r = compute_cascade_multiplier([], timeout_ms=500)
+    assert r["verdict"] == "SKIP"
+
+
+# --------------------------------------------------------------------------- #
+# compute_prod_budget_violations
+# --------------------------------------------------------------------------- #
+def test_prod_budget_passes_when_within_factor():
+    primary = _pq("q1", 50, 200, 400)
+    prod = {"q1": {"p95_ms": 300}}
+    r = compute_prod_budget_violations(primary, prod, factor=3.0)
+    assert r["verdict"] == "PASS"
+    assert r["compared"] == 1
+    assert r["violations"] == []
+
+
+def test_prod_budget_fails_when_exceeds_factor():
+    # sandbox p95 = 1200ms, prod p95 = 200ms = 6x, above 3x factor
+    primary = _pq("userAllChannels", 50, 600, 1200)
+    prod = {"userAllChannels": {"p95_ms": 200}}
+    r = compute_prod_budget_violations(primary, prod, factor=3.0)
+    assert r["verdict"] == "FAIL"
+    assert len(r["violations"]) == 1
+    assert r["violations"][0]["ratio"] == 6.0
+
+
+def test_prod_budget_skips_missing_prod_entry():
+    primary = _pq("q1", 50, 200, 400)
+    prod = {"other": {"p95_ms": 300}}
+    r = compute_prod_budget_violations(primary, prod, factor=3.0)
+    assert r["verdict"] == "PASS"
+    assert r["compared"] == 0
+
+
+def test_prod_budget_skips_insufficient_samples():
+    primary = _pq("q1", 5, 200, 400)
+    prod = {"q1": {"p95_ms": 100}}
+    r = compute_prod_budget_violations(primary, prod, factor=3.0, min_samples=10)
+    assert r["verdict"] == "PASS"
+    assert r["compared"] == 0
+
+
+def test_prod_budget_catches_shared_bug_ratio_misses():
+    # Both Go and TS are 5x slower than prod (shared bug), but ratio is 1.0
+    go = _pq("q1", 50, 500, 1000)
+    ts = _pq("q1", 50, 500, 1000)
+    prod = {"q1": {"p95_ms": 200}}
+    ratio = compute_ratios(go, ts, factor=2.0, min_delta_ms=100)
+    budget = compute_prod_budget_violations(go, prod, factor=3.0)
+    assert ratio["verdict"] == "PASS"   # ratio cancels shared bug
+    assert budget["verdict"] == "FAIL"  # budget catches it
+
+
+# --------------------------------------------------------------------------- #
+# compute_write_parity
+# --------------------------------------------------------------------------- #
+def test_write_parity_passes_when_similar():
+    p = [100.0] * 20
+    m = [120.0] * 20
+    r = compute_write_parity(p, m, factor=2.0, min_delta_ms=100, min_samples=10)
+    assert r["verdict"] == "PASS"
+
+
+def test_write_parity_fails_when_primary_slower():
+    p = [500.0] * 20
+    m = [100.0] * 20
+    r = compute_write_parity(p, m, factor=2.0, min_delta_ms=100, min_samples=10)
+    assert r["verdict"] == "FAIL"
+    assert r["offenders"][0]["direction"] == "primary-slower"
+    assert r["offenders"][0]["ratio"] == 5.0
+
+
+def test_write_parity_fails_when_mirror_slower():
+    p = [100.0] * 20
+    m = [500.0] * 20
+    r = compute_write_parity(p, m, factor=2.0, min_delta_ms=100, min_samples=10)
+    assert r["verdict"] == "FAIL"
+    assert r["offenders"][0]["direction"] == "mirror-slower"
+
+
+def test_write_parity_skips_insufficient_samples():
+    p = [100.0] * 3
+    m = [100.0] * 3
+    r = compute_write_parity(p, m, factor=2.0, min_samples=10)
+    assert r["verdict"] == "SKIP"
+
+
+def test_write_parity_skips_empty():
+    r = compute_write_parity([], [], factor=2.0, min_samples=10)
     assert r["verdict"] == "SKIP"
