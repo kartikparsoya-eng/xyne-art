@@ -376,13 +376,27 @@ def main() -> int:
         verdict = "FAIL" if bad else ("WATCH" if watch else "PASS")
         results.append(("G6 leaks", verdict, detail))
 
-    # G7 CVR GC (WATCH)
+    # G7 CVR GC (WATCH) — enhanced with GC timing (#6)
     if resources and "cvr_art_instances" in resources:
         v = resources["cvr_art_instances"]
         growing = v["last"] >= v["max"] and v["last"] > v["first"]
-        results.append(("G7 cvr-gc", "WATCH" if growing else "PASS",
-                        f"art client groups {v['first']} -> {v['last']} (max {v['max']})"
-                        + (" — still growing at run end; check GC" if growing else "")))
+        detail = (f"art client groups {v['first']} -> {v['last']} "
+                  f"(max {v['max']})")
+        if growing:
+            detail += " — still growing at run end; check GC"
+        else:
+            # CVR count decreased from peak — measure GC timing (#6)
+            declined = v["max"] - v["last"]
+            if declined > 0 and v["max"] > v["first"]:
+                # estimate GC delay: if count dropped, how much?
+                # We don't have per-sample timestamps in the summary, so
+                # report the decline amount — the resource sampler ndjson
+                # has the full time series for drill-down
+                detail += (f" — GC reclaimed {declined} CG(s) "
+                           f"(peak {v['max']} -> end {v['last']})")
+            else:
+                detail += " — stable"
+        results.append(("G7 cvr-gc", "WATCH" if growing else "PASS", detail))
     else:
         results.append(("G7 cvr-gc", "SKIP", "no resource summary"))
 
@@ -418,7 +432,9 @@ def main() -> int:
 
     # G9 query coverage (WATCH — but split blind spots into KNOWN build drift
     # vs UNEXPLAINED, because "desired, never hydrated, no transformError" is
-    # exactly what a real delivery bug looks like)
+    # exactly what a real delivery bug looks like). Enhanced (#4): show the
+    # actual error message for blind spots that have one, and clearly
+    # separate "has error" from "no error at all" (the delivery bug shape).
     cov = run.get("coverage")
     if not cov:
         results.append(("G9 coverage", "SKIP", "run summary has no coverage section"))
@@ -427,8 +443,16 @@ def main() -> int:
         driven = cov.get("queries_driven", 0)
         drift_names = {m.group(1) for k in (run.get("per_error") or {})
                        if (m := DRIFT_NAME_RE.match(k))}
-        unexplained = [q for q in missing if q not in drift_names]
-        known = len(missing) - len(unexplained)
+        # use the new never_hydrated_errors / never_hydrated_no_error fields
+        # if available (replay.py >= this commit), else fall back to regex
+        nh_errors = cov.get("never_hydrated_errors", {})
+        nh_no_error = cov.get("never_hydrated_no_error", [])
+        if nh_errors or nh_no_error:
+            unexplained = nh_no_error
+            known = len(missing) - len(unexplained)
+        else:
+            unexplained = [q for q in missing if q not in drift_names]
+            known = len(missing) - len(unexplained)
         detail = f"{cov.get('queries_hydrated', 0)}/{driven} driven queries hydrated"
         if missing:
             if unexplained:
@@ -442,6 +466,10 @@ def main() -> int:
             else:
                 detail += (f" — all {known} blind spots are known build drift "
                            "(matching Query-not-found/Validation transformErrors)")
+            # blind spot root cause (#4): show actual error messages
+            for q, errs in list(nh_errors.items())[:4]:
+                for e in errs[:1]:
+                    detail += f"\n  {q}: {e}"
         results.append(("G9 coverage", "WATCH" if missing else "PASS", detail))
 
     # G10 chaos recovery

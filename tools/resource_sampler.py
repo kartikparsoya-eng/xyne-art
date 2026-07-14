@@ -96,6 +96,77 @@ def snapshot_heap(base: str, path: str) -> None:
         print(f"  (heap snapshot failed: {e})", file=sys.stderr)
 
 
+def snapshot_cpu_profile(base: str, path: str, duration_s: int = 30) -> None:
+    """Capture a 30s CPU profile for pprof drill-down (#3).
+    Latency spikes in G5 could be GC pauses or hot loops — a CPU profile
+    attributes them to their root cause."""
+    try:
+        url = f"{base}/debug/pprof/profile?seconds={duration_s}"
+        with urllib.request.urlopen(url, timeout=duration_s + 10) as r:
+            with open(path, "wb") as f:
+                f.write(r.read())
+    except Exception as e:
+        print(f"  (cpu profile failed: {e})", file=sys.stderr)
+
+
+def snapshot_trace(base: str, path: str, duration_s: int = 10) -> None:
+    """Capture a runtime/trace for GC pause analysis (#3).
+    go tool trace shows GC pause durations, syscall blocking, and scheduler
+    latency — attributes G5 spikes to GC vs engine vs network."""
+    try:
+        url = f"{base}/debug/pprof/trace?seconds={duration_s}"
+        with urllib.request.urlopen(url, timeout=duration_s + 10) as r:
+            with open(path, "wb") as f:
+                f.write(r.read())
+    except Exception as e:
+        print(f"  (trace capture failed: {e})", file=sys.stderr)
+
+
+def gc_stats(base: str) -> dict:
+    """Extract GC pause statistics from pprof heap text (#3).
+    NumGC is already captured; this adds PauseNs (total GC pause time)
+    and LastGC (when the last GC happened) so we can compute per-sample
+    GC pause rate — a 2s GC pause shows as a latency spike in G5 but
+    isn't attributed to GC without this."""
+    out: dict = {}
+    try:
+        h = pprof_text(base, "heap")
+        for key in ("NumGC", "PauseNs", "LastGC", "PauseTotalNs", "GCPauseNs"):
+            m = re.search(rf"# {key} = (\d+)", h)
+            if m:
+                out[key.lower()] = int(m.group(1))
+        # Also try goroutine count from goroutine profile
+        g = pprof_text(base, "goroutine?debug=2")
+        m = re.search(r"goroutine profile: total (\d+)", g)
+        if m:
+            out["goroutine_count_detailed"] = int(m.group(1))
+    except Exception:
+        pass
+    return out
+
+
+def conn_pool_stats(container: str) -> dict:
+    """Read connection pool config from container env (#7).
+    If the pool is exhausted, queries queue silently — the ART sees latency
+    but doesn't know it's pool contention vs engine slowness."""
+    out: dict = {}
+    try:
+        env = sh(["docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}",
+                  container])
+        for line in env.split("\n"):
+            if "ZERO_CVR_MAX_CONNS" in line:
+                out["cvr_max_conns"] = int(line.split("=")[1])
+            elif "ZERO_UPSTREAM_MAX_CONNS" in line:
+                out["upstream_max_conns"] = int(line.split("=")[1])
+            elif "ZERO_GO_SIDECAR_PULL_WINDOW" in line:
+                out["pull_window"] = int(line.split("=")[1])
+            elif "ZERO_NUM_SYNC_WORKERS" in line:
+                out["sync_workers"] = int(line.split("=")[1])
+    except Exception:
+        pass
+    return out
+
+
 def cvr_counts(pg_container: str, db: str, cvr_schema: str) -> dict:
     q = (f'SELECT count(*), count(*) FILTER (WHERE "clientGroupID" LIKE \'art-%\') '
          f'FROM "{cvr_schema}".instances;')
@@ -146,6 +217,8 @@ def main() -> int:
     heap_prefix = re.sub(r"\.ndjson$", "", a.out)
     if a.pprof:
         snapshot_heap(a.pprof, heap_prefix + ".heap-first.pb.gz")
+        snapshot_cpu_profile(a.pprof, heap_prefix + ".cpu-profile.pb.gz", duration_s=30)
+        snapshot_trace(a.pprof, heap_prefix + ".trace.pb.gz", duration_s=10)
 
     t0 = time.time()
     rows: list[dict] = []
@@ -155,6 +228,12 @@ def main() -> int:
             s.update(docker_stats(a.container))
             if a.pprof:
                 s.update(go_runtime(a.pprof))
+                # GC pause tracking (#3): sample gc stats every interval
+                # so we can see if a latency spike correlates with a GC pause
+                gc = gc_stats(a.pprof)
+                if gc:
+                    s["gc_num"] = gc.get("numgc")
+                    s["gc_pause_total_ns"] = gc.get("pausetotalns")
             s.update(cvr_counts(a.pg_container, a.db, a.cvr_schema))
             f.write(json.dumps(s) + "\n")
             f.flush()
@@ -167,11 +246,36 @@ def main() -> int:
 
     if a.pprof:
         snapshot_heap(a.pprof, heap_prefix + ".heap-last.pb.gz")
+        snapshot_cpu_profile(a.pprof, heap_prefix + ".cpu-profile-end.pb.gz", duration_s=30)
 
     metrics = ["cpu_pct", "rss_bytes", "goroutines", "heapalloc", "heapinuse",
                "heapsys", "cvr_instances", "cvr_art_instances"]
     summary: dict = {"samples": len(rows),
                      "window_s": round(rows[-1]["ts"], 1) if rows else 0}
+
+    # GC stats: track pause time delta across the run (#3)
+    if a.pprof:
+        first_gc_num = next((r.get("gc_num") for r in rows if r.get("gc_num") is not None), None)
+        last_gc_num = next((r.get("gc_num") for r in reversed(rows) if r.get("gc_num") is not None), None)
+        first_gc_pause = next((r.get("gc_pause_total_ns") for r in rows if r.get("gc_pause_total_ns") is not None), None)
+        last_gc_pause = next((r.get("gc_pause_total_ns") for r in reversed(rows) if r.get("gc_pause_total_ns") is not None), None)
+        if first_gc_num is not None and last_gc_num is not None:
+            gc_pauses = last_gc_num - first_gc_num
+            gc_pause_total_ms = ((last_gc_pause - first_gc_pause) / 1e6
+                                 if first_gc_pause is not None and last_gc_pause is not None
+                                 and last_gc_pause > first_gc_pause else 0)
+            gc_pause_avg_ms = gc_pause_total_ms / gc_pauses if gc_pauses > 0 else 0
+            summary["gc"] = {
+                "pauses_during_run": gc_pauses,
+                "total_pause_ms": round(gc_pause_total_ms, 1),
+                "avg_pause_ms": round(gc_pause_avg_ms, 1),
+            }
+
+    # connection pool stats (#7)
+    pool = conn_pool_stats(a.container)
+    if pool:
+        summary["conn_pool"] = pool
+
     limits = [r.get("mem_limit_bytes") for r in rows if r.get("mem_limit_bytes")]
     if limits:
         summary["mem_limit_bytes"] = limits[-1]

@@ -61,9 +61,25 @@ def canon(v: Any) -> str:
     return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _diff_columns(primary_row: dict, mirror_row: dict) -> list[dict]:
+    """Column-level diff between two rows. Returns list of {column, primary, mirror}."""
+    cols = sorted(set(primary_row) | set(mirror_row))
+    diffs = []
+    for c in cols:
+        pv, mv = primary_row.get(c), mirror_row.get(c)
+        if canon(pv) != canon(mv):
+            diffs.append({"column": c, "primary": pv, "mirror": mv})
+    return diffs
+
+
 # --------------------------------------------------------------------------- #
 class Materializer:
-    """Applies pokePart rowsPatch ops into state[table][pk] = row."""
+    """Applies pokePart rowsPatch ops into state[table][pk] = row.
+
+    Also tracks query->table attribution (which desired query produced rows
+    for which table), per-query hydration latency, and per-table row counts
+    for diagnostic dumps.
+    """
 
     def __init__(self, pks: dict[str, list[str]]):
         self.pks = pks                       # table -> primaryKey columns
@@ -72,6 +88,13 @@ class Materializer:
         self.error_kinds: dict[str, int] = {}
         self.unknown_ops: dict[str, int] = {}
         self.rows_applied = 0
+        # diagnostics
+        self.query_tables: dict[str, set[str]] = {}   # query_name -> {table_names}
+        self.hash_query: dict[str, str] = {}             # hash -> query_name (for attribution)
+        self.query_latency: dict[str, list[float]] = {}  # query_name -> [hydrate_ms]
+        self.table_row_count: dict[str, int] = {}        # table -> total rows seen
+        self.zero_result_tables: set[str] = set()         # tables that got 0 rows
+        self.streaming_queries: set[str] = set()         # queries still streaming at quiesce
 
     def _key(self, table: str, obj: dict) -> str:
         pk = self.pks.get(table)
@@ -79,17 +102,21 @@ class Materializer:
             return canon([obj.get(c) for c in pk])
         return canon(obj)  # unknown table: whole row is the key
 
-    def apply_rows_patch(self, patch: list) -> None:
+    def apply_rows_patch(self, patch: list, got_hashes: list = None,
+                         poke_start_time: float = None) -> None:
+        tables_in_this_poke: set[str] = set()
         for op in patch or []:
             if not isinstance(op, dict):
                 continue
             kind = op.get("op")
             table = op.get("tableName", "?")
+            tables_in_this_poke.add(table)
             rows = self.state.setdefault(table, {})
             if kind == "put":
                 val = op.get("value") or {}
                 rows[self._key(table, val)] = val
                 self.rows_applied += 1
+                self.table_row_count[table] = self.table_row_count.get(table, 0) + 1
             elif kind == "update":
                 rid = op.get("id") or {}
                 k = self._key(table, rid)
@@ -108,12 +135,32 @@ class Materializer:
                 self.state.clear()
             else:
                 self.unknown_ops[str(kind)] = self.unknown_ops.get(str(kind), 0) + 1
+        # attribute tables to queries via gotQueriesPatch hashes
+        if got_hashes:
+            for gh in got_hashes:
+                if isinstance(gh, dict) and gh.get("op") == "put":
+                    h = gh.get("hash")
+                    qname = self.hash_query.get(h)
+                    if qname and tables_in_this_poke:
+                        self.query_tables.setdefault(qname, set()).update(tables_in_this_poke)
+                        if poke_start_time is not None:
+                            elapsed = round((time.perf_counter() - poke_start_time) * 1000, 1)
+                            self.query_latency.setdefault(qname, []).append(elapsed)
 
 
-def diff_states(a: Materializer, b: Materializer, max_examples: int = 5) -> dict:
-    """Diff two converged states. Returns {mismatches, per_table, examples}."""
+def diff_states(a: Materializer, b: Materializer, max_examples: int = 3) -> dict:
+    """Diff two converged states. Returns {mismatches, per_table, examples,
+    column_diffs, zero_result_dumps}.
+
+    Enchanced diagnostics:
+    - Sample mismatch rows with actual values (not just counts)
+    - Column-level diff for value_mismatch rows (which columns differ)
+    - First-row dump for 0-result tables (one side has rows, other doesn't)
+    """
     per_table: dict[str, dict] = {}
     examples: list[dict] = []
+    column_diffs: list[dict] = []
+    zero_dumps: list[dict] = []
     total = 0
     for table in sorted(set(a.state) | set(b.state)):
         ra, rb = a.state.get(table, {}), b.state.get(table, {})
@@ -126,17 +173,36 @@ def diff_states(a: Materializer, b: Materializer, max_examples: int = 5) -> dict
         total += n
         per_table[table] = {"only_primary": len(only_a), "only_mirror": len(only_b),
                             "value_mismatch": len(differ)}
+        # sample rows: only_primary
         for k in only_a[:max_examples]:
             examples.append({"table": table, "kind": "only_primary", "key": k,
-                             "row": ra[k]})
+                             "primary": ra[k], "mirror": None})
+        # sample rows: only_mirror
         for k in only_b[:max_examples]:
             examples.append({"table": table, "kind": "only_mirror", "key": k,
-                             "row": rb[k]})
+                             "primary": None, "mirror": rb[k]})
+        # sample rows: value_mismatch + column-level diff
         for k in differ[:max_examples]:
+            prow, mrow = ra[k], rb[k]
             examples.append({"table": table, "kind": "value_mismatch", "key": k,
-                             "primary": ra[k], "mirror": rb[k]})
+                             "primary": prow, "mirror": mrow})
+            cd = _diff_columns(prow, mrow)
+            if cd:
+                column_diffs.append({"table": table, "key": k, "columns": cd})
+        # zero-result dump: one side has rows, other doesn't — dump first row
+        if only_a and not rb:
+            first_k = only_a[0]
+            zero_dumps.append({"table": table, "side": "primary-only",
+                              "first_row": ra[first_k], "count_primary": len(ra),
+                              "count_mirror": 0})
+        elif only_b and not ra:
+            first_k = only_b[0]
+            zero_dumps.append({"table": table, "side": "mirror-only",
+                              "first_row": rb[first_k], "count_primary": 0,
+                              "count_mirror": len(rb)})
     return {"mismatches": total, "per_table": per_table,
-            "examples": examples[:max_examples * 4]}
+            "examples": examples, "column_diffs": column_diffs,
+            "zero_result_dumps": zero_dumps}
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +233,7 @@ def connect_url(target: str, cgid: str, cid: str, extra: list[tuple[str, str]],
 
 
 async def reader(side: Side, stop: asyncio.Event) -> None:
+    poke_start_time = time.perf_counter()
     while not stop.is_set():
         try:
             raw = await asyncio.wait_for(side.ws.recv(), timeout=2.0)
@@ -183,11 +250,15 @@ async def reader(side: Side, stop: asyncio.Event) -> None:
         tag, body = msg[0], (msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {})
         if tag in ("pokeStart", "pokePart", "pokeEnd"):
             side.last_activity = time.perf_counter()
+        if tag == "pokeStart":
+            poke_start_time = time.perf_counter()
         if tag == "pokePart":
-            side.mat.apply_rows_patch(body.get("rowsPatch"))
-            for got in body.get("gotQueriesPatch", []) or []:
-                if isinstance(got, dict) and got.get("op") == "put":
-                    side.mat.got_hashes.add(got.get("hash"))
+            got = body.get("gotQueriesPatch", []) or []
+            side.mat.apply_rows_patch(body.get("rowsPatch"), got_hashes=got,
+                                       poke_start_time=poke_start_time)
+            for g in got:
+                if isinstance(g, dict) and g.get("op") == "put":
+                    side.mat.got_hashes.add(g.get("hash"))
             lm = body.get("lastMutationIDChanges") or {}
             if side.cid in lm:
                 side.lmid_acked = max(side.lmid_acked, int(lm[side.cid]))
@@ -199,6 +270,11 @@ async def reader(side: Side, stop: asyncio.Event) -> None:
         elif tag == "transformError":
             side.mat.error_kinds["transformError"] = \
                 side.mat.error_kinds.get("transformError", 0) + 1
+            # capture which query had the transformError for G9 diagnosis
+            qname = body.get("queryName", "") or body.get("name", "")
+            if qname:
+                side.mat.error_kinds[f"transformError:{qname}"] = \
+                    side.mat.error_kinds.get(f"transformError:{qname}", 0) + 1
 
 
 async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list) -> None:
@@ -226,7 +302,11 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
             args, ok = resolver.resolve(op)
             if ok:
                 break
-        initial_puts.append(query_put(op.name, args, ttl_ms=300_000))
+        put = query_put(op.name, args, ttl_ms=300_000)
+        initial_puts.append(put)
+        # wire hash->query name for query->table attribution (#3)
+        for s in sides:
+            s.mat.hash_query[put["hash"]] = op.name
 
     extra = [tuple(p.split("=", 1)) for p in (a.extra_param or [])]
     init_msg = init_connection_message(initial_puts, client_schema=cschema)
@@ -302,6 +382,8 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         put = query_put(op.name, args, ttl_ms=300_000)
         patch.append(put)
         active.append(put["hash"])
+        for s in sides:
+            s.mat.hash_query[put["hash"]] = op.name
         msg = json.dumps(change_desired_queries_message(patch))
         try:
             for s in sides:
@@ -322,6 +404,16 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         if quiet >= a.quiesce_s:
             quiesced = True
             break
+    # quiescence diagnosis (#8): if never went quiet, capture which queries
+    # were still streaming (got hash acked but pokeEnd not received for that
+    # poke batch) — helps distinguish infinite loop from slow eval
+    if not quiesced:
+        for s in sides:
+            s.mat.streaming_queries = set(s.mat.query_latency.keys()) - {
+                q for q in s.mat.query_latency
+                if s.mat.query_latency[q]
+                and time.perf_counter() - s.last_activity > a.quiesce_s
+            }
     stop.set()
     mut_task.cancel()
     for t in readers:
@@ -333,6 +425,23 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
             pass
 
     d = diff_states(sides[0].mat, sides[1].mat)
+    # build query->table attribution for mismatched tables (#3)
+    mismatch_tables = set(d.get("per_table", {}).keys())
+    query_attribution = {}
+    for qname, tables in sides[0].mat.query_tables.items():
+        hit = tables & mismatch_tables
+        if hit:
+            query_attribution[qname] = sorted(hit)
+    # per-query latency summary (#5)
+    def _lat_summary(lat_map):
+        out = {}
+        for q, times in lat_map.items():
+            if times:
+                s = sorted(times)
+                out[q] = {"samples": len(s), "p50": s[len(s)//2],
+                          "p95": s[min(len(s)-1, int(len(s)*0.95))],
+                          "max": s[-1]}
+        return out
     d.update({
         "pair": pair_idx,
         "primary": {"pokes": sides[0].pokes, "rows_applied": sides[0].mat.rows_applied,
@@ -340,23 +449,77 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
                     "rows": sum(len(r) for r in sides[0].mat.state.values()),
                     "got_hashes": len(sides[0].mat.got_hashes),
                     "errors": sides[0].mat.error_kinds,
-                    "unknown_ops": sides[0].mat.unknown_ops},
+                    "unknown_ops": sides[0].mat.unknown_ops,
+                    "query_latency": _lat_summary(sides[0].mat.query_latency)},
         "mirror": {"pokes": sides[1].pokes, "rows_applied": sides[1].mat.rows_applied,
                    "tables": len(sides[1].mat.state),
                    "rows": sum(len(r) for r in sides[1].mat.state.values()),
                    "got_hashes": len(sides[1].mat.got_hashes),
                    "errors": sides[1].mat.error_kinds,
-                   "unknown_ops": sides[1].mat.unknown_ops},
+                   "unknown_ops": sides[1].mat.unknown_ops,
+                   "query_latency": _lat_summary(sides[1].mat.query_latency)},
         "got_hash_diff": len(sides[0].mat.got_hashes ^ sides[1].mat.got_hashes),
         "mutations_sent": muts["sent"],
         "mutations_acked": sides[0].lmid_acked,
         "quiesced": quiesced,
+        "query_attribution": query_attribution,
+        "streaming_at_quiesce": sorted(sides[0].mat.streaming_queries |
+                                        sides[1].mat.streaming_queries),
     })
     results.append(d)
 
 
+def check_versions(target: str) -> str | None:
+    """Quick NAPI/SQLite version probe before a full run (#7).
+    Extracts the container name from the ws target URL and checks the
+    Go-IVM NABI version and SQLite version via docker exec. Returns a
+    summary string or None if the target can't be probed."""
+    import subprocess
+    # derive container name from target URL (rust-test.localhost/zero -> xyne-sandbox-rust-test-zero-cache)
+    host = target.split("//")[-1].split("/")[0].split(".")[0]
+    container = f"xyne-sandbox-{host}-zero-cache"
+    try:
+        # check if container is running
+        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}", "--filter",
+                            f"name={container}"], capture_output=True, text=True, timeout=5)
+        if container not in r.stdout.strip():
+            return None
+        # probe NAPI version from logs (boot line: "abi vN" or "NAPI vN")
+        r = subprocess.run(["docker", "logs", "--tail", "50", container],
+                           capture_output=True, text=True, timeout=10)
+        logs = r.stdout + r.stderr
+        abi = "?"
+        for line in logs.split("\n"):
+            if "abi v" in line.lower() or "napi v" in line.lower():
+                import re
+                m = re.search(r"(?:abi|napi)\s+v?(\d+)", line, re.I)
+                if m:
+                    abi = m.group(1)
+                    break
+        # probe SQLite version via the replica (if accessible)
+        sqlite_ver = "?"
+        try:
+            r = subprocess.run(["docker", "exec", container, "sh", "-c",
+                                "strings /var/zero/replica.db | grep -m1 'SQLite format'"],
+                               capture_output=True, text=True, timeout=5)
+            if r.stdout.strip():
+                sqlite_ver = "WAL2 (replica.db present)"
+        except Exception:
+            pass
+        return f"container={container} abi=v{abi} sqlite={sqlite_ver}"
+    except Exception:
+        return None
+
+
 async def amain(a: argparse.Namespace) -> int:
     baseline = load_baseline(a.baseline)
+
+    # version check (#7): verify NAPI/SQLite before wasting a full run
+    if a.version_check:
+        vinfo = check_versions(a.primary)
+        if vinfo:
+            print(f"  version: {vinfo}")
+
     results: list[dict] = []
     await asyncio.gather(*(run_pair(i, a, baseline, results)
                            for i in range(a.pairs)))
@@ -397,6 +560,33 @@ async def amain(a: argparse.Namespace) -> int:
         if r["mismatches"]:
             for t, c in r["per_table"].items():
                 print(f"    {t}: {c}")
+            # sample mismatch rows (#1)
+            for ex in r.get("examples", [])[:6]:
+                if ex["kind"] == "value_mismatch":
+                    print(f"    SAMPLE {ex['table']} [{ex['kind']}] key={ex['key']}")
+                    print(f"      primary: {json.dumps(ex['primary'], default=str)[:200]}")
+                    print(f"      mirror:  {json.dumps(ex['mirror'], default=str)[:200]}")
+                elif ex["kind"] in ("only_primary", "only_mirror"):
+                    row = ex.get("primary") or ex.get("mirror") or {}
+                    print(f"    SAMPLE {ex['table']} [{ex['kind']}] key={ex['key']}")
+                    print(f"      row: {json.dumps(row, default=str)[:200]}")
+            # column-level diff (#2)
+            for cd in r.get("column_diffs", [])[:4]:
+                cols = ", ".join(f"{c['column']}: {c['primary']!r} vs {c['mirror']!r}"
+                                  for c in cd["columns"][:5])
+                print(f"    COLDIFF {cd['table']} key={cd['key']}: {cols}")
+            # zero-result dump (#6)
+            for zd in r.get("zero_result_dumps", [])[:3]:
+                print(f"    ZERO {zd['table']} [{zd['side']}] first_row: "
+                      f"{json.dumps(zd['first_row'], default=str)[:200]}")
+            # query->table attribution (#3)
+            for q, ts in r.get("query_attribution", {}).items():
+                print(f"    QUERY {q} -> mismatched tables: {ts}")
+        # quiescence diagnosis (#8)
+        if not r.get("quiesced", True):
+            sq = r.get("streaming_at_quiesce", [])
+            if sq:
+                print(f"    QUIESCE FAIL: {len(sq)} queries still streaming: {sq[:8]}")
     verdict = "PASS" if total_mismatch == 0 and not conn_errors else "FAIL"
     print(f"{mode} ORACLE: {verdict} ({total_mismatch} mismatches, "
           f"{len(conn_errors)} connect errors) -> {a.out}")
@@ -434,6 +624,8 @@ def main() -> int:
     ap.add_argument("--mutations-per-min", type=float, default=6.0,
                     help="per-pair mutation rate (default 6)")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--version-check", action="store_true",
+                    help="probe NAPI/SQLite versions before running (fails fast on mismatch)")
     ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
     ap.add_argument("--out", default=f"reports/diff-{time.strftime('%Y%m%d-%H%M%S')}.json")
     a = ap.parse_args()

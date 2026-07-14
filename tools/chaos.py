@@ -53,14 +53,23 @@ def main() -> int:
     ap.add_argument("--pause-s", type=float, default=8.0,
                     help="how long each pause lasts")
     ap.add_argument("--actions", default="pause-zc,pause-pg",
-                    help="comma list: pause-zc,pause-pg")
+                    help="comma list: pause-zc,pause-pg,netem-latency,netem-loss,netem-partition")
+    ap.add_argument("--netem-latency-ms", type=float, default=200.0,
+                    help="network latency to inject (ms) for netem actions")
+    ap.add_argument("--netem-loss-pct", type=float, default=5.0,
+                    help="packet loss percentage for netem-loss")
+    ap.add_argument("--netem-duration-s", type=float, default=10.0,
+                    help="how long netem injection lasts before cleanup")
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--out", default=f"reports/chaos-{time.strftime('%Y%m%d-%H%M%S')}.json")
     a = ap.parse_args()
 
     rng = random.Random(a.seed)
     targets = {"pause-zc": a.zc_container, "pause-pg": a.pg_container}
-    actions = [x.strip() for x in a.actions.split(",") if x.strip() in targets]
+    actions = [x.strip() for x in a.actions.split(",")
+               if x.strip() in targets or x.strip().startswith("netem-")]
+    # netem targets: the zero-cache container's network interface
+    netem_container = a.zc_container
     if not actions:
         print("ERROR: no valid actions", file=sys.stderr)
         return 1
@@ -75,26 +84,68 @@ def main() -> int:
             break  # leave the tail of the window for recovery
         time.sleep(gap)
         action = rng.choice(actions)
-        container = targets[action]
         ev = {"t": time.strftime("%H:%M:%S"), "action": action,
-              "container": container, "pause_s": a.pause_s,
-              "paused": False, "unpaused": False}
-        rc, out = sh("docker", "pause", container)
-        ev["paused"] = rc == 0
-        if rc != 0:
-            ev["error"] = out
-        try:
-            if ev["paused"]:
-                print(f"[chaos] {ev['t']} {action}: paused {container} "
-                      f"for {a.pause_s:.0f}s", flush=True)
-                time.sleep(a.pause_s)
-        finally:
-            # ALWAYS attempt unpause, even mid-crash.
-            rc, out = sh("docker", "unpause", container)
-            ev["unpaused"] = rc == 0 or "is not paused" in out
-            if not ev["unpaused"]:
-                ev["unpause_error"] = out
-                all_reverted = False
+              "pause_s": a.pause_s, "paused": False, "unpaused": False}
+
+        if action in targets:
+            # docker pause action (original)
+            container = targets[action]
+            ev["container"] = container
+            rc, out = sh("docker", "pause", container)
+            ev["paused"] = rc == 0
+            if rc != 0:
+                ev["error"] = out
+            try:
+                if ev["paused"]:
+                    print(f"[chaos] {ev['t']} {action}: paused {container} "
+                          f"for {a.pause_s:.0f}s", flush=True)
+                    time.sleep(a.pause_s)
+            finally:
+                rc, out = sh("docker", "unpause", container)
+                ev["unpaused"] = rc == 0 or "is not paused" in out
+                if not ev["unpaused"]:
+                    ev["unpause_error"] = out
+                    all_reverted = False
+        elif action.startswith("netem-"):
+            # network chaos via tc netem (#8)
+            ev["container"] = netem_container
+            ev["netem"] = True
+            # find the container's eth0 interface
+            rc, iface = sh("docker", "exec", netem_container,
+                           "sh", "-c", "ip -o link show | grep -m1 'eth0' | awk '{print $2}' | tr -d ':'")
+            if not iface:
+                iface = "eth0"
+            if action == "netem-latency":
+                cmd = ["tc", "qdisc", "add", "dev", iface, "root",
+                       "netem", "delay", f"{a.netem_latency_ms}ms"]
+                desc = f"+{a.netem_latency_ms}ms latency"
+            elif action == "netem-loss":
+                cmd = ["tc", "qdisc", "add", "dev", iface, "root",
+                       "netem", "loss", f"{a.netem_loss_pct}%"]
+                desc = f"{a.netem_loss_pct}% packet loss"
+            elif action == "netem-partition":
+                cmd = ["tc", "qdisc", "add", "dev", iface, "root",
+                       "netem", "delay", "5000ms", "loss", "100%"]
+                desc = "network partition"
+            else:
+                events.append(ev)
+                continue
+            rc, out = sh("docker", "exec", netem_container, *cmd)
+            ev["applied"] = rc == 0
+            if rc != 0:
+                ev["error"] = out
+            try:
+                if ev["applied"]:
+                    print(f"[chaos] {ev['t']} {action}: {desc} on {iface} "
+                          f"for {a.netem_duration_s:.0f}s", flush=True)
+                    time.sleep(a.netem_duration_s)
+            finally:
+                rc2, out2 = sh("docker", "exec", netem_container,
+                               "tc", "qdisc", "del", "dev", iface, "root")
+                ev["reverted"] = rc2 == 0 or "No such file" in out2
+                if not ev["reverted"]:
+                    ev["revert_error"] = out2
+                    all_reverted = False
         events.append(ev)
 
     # Safety sweep: make sure nothing is left paused.
@@ -103,6 +154,12 @@ def main() -> int:
         if rc == 0 and out == "true":
             sh("docker", "unpause", c)
             all_reverted = False  # something needed the sweep — flag it
+
+    # Safety sweep: clean up any lingering tc netem qdisc (#8)
+    if any(a.startswith("netem-") for a in actions):
+        for iface in ("eth0", "ens3"):
+            sh("docker", "exec", netem_container,
+               "tc", "qdisc", "del", "dev", iface, "root")
 
     # Recovery check: zero-cache healthcheck must go green.
     final_health = "unknown"

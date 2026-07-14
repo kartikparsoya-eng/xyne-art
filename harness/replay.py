@@ -721,6 +721,18 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
             "queries_driven": len(stats.per_query),
             "queries_hydrated": len(stats.hydrated_queries),
             "never_hydrated": sorted(set(stats.per_query) - stats.hydrated_queries),
+            # blind spot root cause (#4): for each never_hydrated query, show
+            # the error kind if we have one (transformError:queryName:msg),
+            # else "no error" (truly unexplained — possible delivery bug)
+            "never_hydrated_errors": {
+                q: [k for k in stats.per_error if k.startswith(f"transformError: {q}:")]
+                for q in sorted(set(stats.per_query) - stats.hydrated_queries)
+                if any(k.startswith(f"transformError: {q}:") for k in stats.per_error)
+            },
+            "never_hydrated_no_error": sorted(
+                q for q in (set(stats.per_query) - stats.hydrated_queries)
+                if not any(k.startswith(f"transformError: {q}:") for k in stats.per_error)
+            ),
         },
         "mutations_driven": sorted(stats.per_mutation.items(), key=lambda kv: -kv[1]),
         "note": "client_latency is best-effort (rowsPatch queryHash attribution); "
