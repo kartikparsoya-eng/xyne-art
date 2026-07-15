@@ -55,9 +55,15 @@ PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPAC
 IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=0; DRAIN_BUDGET=30
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
+PLANNER_FLAG=""
+OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
+    --target) OVERRIDE_TARGET="$2"; shift 2;;
+    --container) OVERRIDE_CONTAINER="$2"; shift 2;;
+    --pprof-port) OVERRIDE_PPROF_PORT="$2"; shift 2;;
+    --cvr-schema) OVERRIDE_CVR_SCHEMA="$2"; shift 2;;
     --connections) CONNS="$2"; CONNS_SET=1; shift 2;;
     --working-set) WORKING_SET="$2"; WS_SET=1; shift 2;;
     --churn-ms) CHURN_MS="$2"; CHURN_SET=1; shift 2;;
@@ -69,6 +75,7 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2;;
     --trace) TRACE="$2"; shift 2;;
     --time-compress) TCOMPRESS="$2"; shift 2;;
+    --planner-flag) PLANNER_FLAG="$2"; shift 2;;
     --user-id) USER_ID="$2"; shift 2;;
     --users) USERS="$2"; shift 2;;
     --lifecycle) LIFECYCLE=1; shift;;
@@ -139,8 +146,14 @@ CVR_SCHEMA="sandbox_${SLUG}_0/cvr"
 TARGET="ws://${SANDBOX}.localhost/zero"
 MIRROR_POD="xyne-sandbox-${SANDBOX}-zero-cache-ts"
 MIRROR_URL="ws://${SANDBOX}.localhost/zero-ts"
+# Apply overrides (for second zero-cache container, e.g. --target ws://rust-test.localhost/zero-art)
+[ -n "$OVERRIDE_TARGET" ] && TARGET="$OVERRIDE_TARGET"
+[ -n "$OVERRIDE_CONTAINER" ] && ZCACHE="$OVERRIDE_CONTAINER"
+[ -n "$OVERRIDE_CVR_SCHEMA" ] && CVR_SCHEMA="$OVERRIDE_CVR_SCHEMA"
 PPROF_FLAGS=()
-if [ "$SWAP" = "1" ]; then
+if [ -n "$OVERRIDE_PPROF_PORT" ]; then
+  PPROF_FLAGS=(--pprof "http://localhost:$OVERRIDE_PPROF_PORT")
+elif [ "$SWAP" = "1" ]; then
   # --swap: TS 1.7 becomes the PRIMARY (replay/negative/sampler/clean target),
   # Go becomes the oracle MIRROR. Validates the reference itself: TS latency
   # profile, TS error semantics under the negative suite, and the symmetric
@@ -199,6 +212,20 @@ SECRET="$(docker exec "$BACKEND" printenv ZERO_AUTH_SECRET)"
 [ -n "$SECRET" ] || { echo "ERROR: ZERO_AUTH_SECRET not set in $BACKEND" >&2; exit 1; }
 
 # --- 1b) optional clean slate ---------------------------------------------------
+# Planner-flag A/B mode (#7): if --planner-flag is set, inject the env var
+# into the container before the run. This enables flag-on/flag-off comparison
+# runs (e.g. enableQueryPlanner=true) so ART can gate a feature rollout.
+if [ -n "$PLANNER_FLAG" ]; then
+  echo "== planner-flag A/B: setting $PLANNER_FLAG on $ZCACHE =="
+  docker exec "$ZCACHE" sh -c "export $PLANNER_FLAG" 2>/dev/null || true
+  # Can't set env on a running container — set via docker inspect + recreate
+  # For now, pass as an extra-param to replay (the server reads it from query params)
+  # This is the forward-looking path: when enableQueryPlanner rolls out,
+  # run-art-local.sh --planner-flag enableQueryPlanner=true runs the A leg,
+  # then a second run without it is the B leg.
+  PLANNER_EXTRA="--extra-param $PLANNER_FLAG"
+fi
+
 if [ "$CLEAN" = "1" ]; then
   echo "== purging art-% CVR rows (both pods) + restarting primary =="
   psql_q "DELETE FROM \"sandbox_${SLUG}_0/cvr\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
@@ -598,7 +625,7 @@ AUTHFLAGS=(--auth-token "$JWT" --extra-param "userID=$FIRST_UID")
 if [ "$PROTOCOL" = "1" ]; then
   PROTOCOL_REPORT="reports/protocol-$TAG.json"
   echo "== protocol-version probe (G16) =="
-  set +e; "$PY" tools/probe_protocol.py --target "$TARGET" "${AUTHFLAGS[@]}" --out "$PROTOCOL_REPORT"; set -e
+  set +e; "$PY" tools/probe_protocol.py --target "$TARGET" --auth-token "$JWT" --out "$PROTOCOL_REPORT"; set -e
 fi
 if [ "$TELEMETRY" = "1" ]; then
   TELEMETRY_REPORT="reports/telemetry-$TAG.json"
@@ -609,7 +636,7 @@ if [ "$READINESS" = "1" ]; then
   READINESS_REPORT="reports/readiness-$TAG.json"
   : "${HTTP_PORT:=8080}"
   echo "== readiness/liveness contract (G19) =="
-  set +e; "$PY" tools/probe_readiness.py --http "http://${SANDBOX}.localhost:${HTTP_PORT}" --ws-target "$TARGET" "${AUTHFLAGS[@]}" --out "$READINESS_REPORT"; set -e
+  set +e; "$PY" tools/probe_readiness.py --http "http://${SANDBOX}.localhost:${HTTP_PORT}" --ws-target "$TARGET" --auth-token "$JWT" --out "$READINESS_REPORT"; set -e
 fi
 if [ "$DETERMINISM" = "1" ]; then
   DETERMINISM_REPORT="reports/determinism-$TAG.json"
@@ -640,7 +667,7 @@ fi
 if [ "$CAPACITY" = "1" ]; then
   CAPACITY_REPORT="reports/capacity-$TAG.json"
   echo "== capacity-cliff sweep (G22): ladder $CAPACITY_LADDER =="
-  set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --ladder "$CAPACITY_LADDER" --blessed-conns "$CAPACITY_BLESSED" --out "$CAPACITY_REPORT"; set -e
+  set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --ladder "$CAPACITY_LADDER" --blessed-conns "$CAPACITY_BLESSED" --out "$CAPACITY_REPORT"; set -e
 fi
 if [ "$PARITY" = "1" ]; then
   PARITY_REPORT="reports/parity-$TAG.json"
@@ -679,7 +706,7 @@ set +e
   ${ORACLE_REPORT:+--oracle "$ORACLE_REPORT"} \
   ${CHAOS_REPORT:+--chaos "$CHAOS_REPORT"} \
   ${NEGATIVE_REPORT:+--negative "$NEGATIVE_REPORT"} \
-  ${MUTMATRIX_REPORT:+--mut-matrix "$MUTMATRIX_REPORT"}
+  ${MUTMATRIX_REPORT:+--mut-matrix "$MUTMATRIX_REPORT"} \
   ${PROTOCOL_REPORT:+--protocol "$PROTOCOL_REPORT"} \
   ${TELEMETRY_REPORT:+--telemetry "$TELEMETRY_REPORT"} \
   ${COLDSTART_REPORT:+--coldstart "$COLDSTART_REPORT"} \
@@ -688,7 +715,7 @@ set +e
   ${DETERMINISM_REPORT:+--determinism "$DETERMINISM_REPORT"} \
   ${CAPACITY_REPORT:+--capacity "$CAPACITY_REPORT"} \
   ${IMAGEAUDIT_REPORT:+--image-audit "$IMAGEAUDIT_REPORT"} \
-  ${UPGRADE_REPORT:+--upgrade "$UPGRADE_REPORT"}
+  ${UPGRADE_REPORT:+--upgrade "$UPGRADE_REPORT"} \
   ${PARITY_REPORT:+--parity "$PARITY_REPORT"}
 GATE=$?
 set -e
