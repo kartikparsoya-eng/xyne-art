@@ -290,6 +290,24 @@ def main() -> int:
                                if slope_per_hour(vals) is not None else None),
         }
     spath = heap_prefix + ".summary.json"
+    
+    # G6b goroutine leak detection: if the run was >=15min, assert
+    # goroutine count delta is bounded. A growing goroutine count with
+    # flat connection count = leaked goroutines (pool readers, hydrate
+    # lanes, progress handler flags not freed).
+    if summary.get("window_s", 0) >= 900 and "goroutines" in summary:
+        g = summary["goroutines"]
+        delta = g["last"] - g["first"]
+        summary["goroutine_leak_check"] = {
+            "delta": delta,
+            "first": g["first"],
+            "last": g["last"],
+            "verdict": "PASS" if delta < 50 else "FAIL",
+            "note": (f"goroutine count grew by {delta} over {g['last']:.0f}s window "
+                     f"({g['first']} -> {g['last']}) — "
+                     f"{'bounded' if delta < 50 else 'possible leak'}"),
+        }
+    
     with open(spath, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"resource summary: {spath}")

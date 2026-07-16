@@ -68,6 +68,17 @@ HARD_BLOCKING: list[tuple[str, str]] = [
     # signature of the pre-v4 permanent wedge (blocked goivm_call_deliver
     # holding rp.mu — diagnosed 2026-07-08 via WEDGE-STACKS dumps).
     ("go-deliver-timeout",  r"\[GO-IVM\]\[DELIVER-TIMEOUT\]"),
+    # W6: pump delivery timeout is now stream-fatal — the handler sets
+    # deathCause and the stream terminates. If this fires, a client saw
+    # a missing row. FAIL: the stream should error, not silently drop.
+    ("go-pump-deliver-fatal", r"pump deliver timed out.*stream fatally errored"),
+    # Watchdog escalation ladder (2026-07-16): 2x threshold force-cancels
+    # the stream gate. 6x threshold kills the process (fatalExit). The
+    # ESCALATE marker means the progress handler cancel was needed — if it
+    # fires, WATCH (the system self-healed but a wedge was real). The FATAL
+    # marker means the process died — that's a blocking FAIL if the pod
+    # somehow survived (it shouldn't).
+    ("go-wedge-fatal",      r"\[GO-IVM\]\[WEDGE-FATAL\]"),
 ]
 # Routine self-heal under load — the reference TS pod produces these too
 # (84/10min at 1x prod trace). Signal is the RATE, not the existence.
@@ -83,6 +94,13 @@ ERROR_RE = re.compile(r'"level":"ERROR"|level.:.error|\blevel=error\b', re.I)
 # closes the incident. Match by cg.
 WEDGE_RE = re.compile(r"\[GO-IVM\]\[WEDGE\] cg=(\S+)")
 WEDGE_CLEAR_RE = re.compile(r"\[GO-IVM\]\[WEDGE-CLEAR\] cg=(\S+)")
+WEDGE_ESCALATE_RE = re.compile(r"\[GO-IVM\]\[WEDGE-ESCALATE\] cg=(\S+)")
+# New markers from the progress handler / watchdog ladder:
+IDLE_DAMPER_RE = re.compile(r"\[GO-IVM\]\[IDLE-DAMPER\] (\d+) pull idle-timeouts")
+SCAN_WARN_RE = re.compile(r"\[GO-IVM\]\[SCAN-WARN\] table=(\S+) rows=(\d+)")
+WEDGE_FATAL_RE = re.compile(r"\[GO-IVM\]\[WEDGE-FATAL\]")
+PUMP_FATAL_RE = re.compile(r"pump deliver timed out.*stream fatally errored")
+PERF_PULL_RE = re.compile(r"\[GO-IVM\]\[PERF-PULL\].*?pull idle-timeouts=(\d+)")
 # ABI v4 boundary health: prints only when nonzero. stalls = enqueue found
 # all 8192 TSFN slots full and parked (100µs->5ms retry loop, cancellable);
 # timeouts = parked past 150s (also emits DELIVER-TIMEOUT above).
@@ -177,6 +195,25 @@ def scan_container(name: str, since: str, slow_ms_watch: float,
                      f"10s-windows (timeouts={timeouts}, staged={staged}, "
                      f"batchFlushes={batch_flushes}) — {corr}")
 
+    # -- progress handler / watchdog ladder markers (2026-07-16) ----------
+    escalated = [m.group(1) for ln in lines if (m := WEDGE_ESCALATE_RE.search(ln))]
+    if escalated:
+        watch.append(f"wedge-escalate: {len(escalated)} cg(s) force-cancelled "
+                     f"({', '.join(sorted(set(escalated))[:3])}) — "
+                     f"progress handler cancel was needed")
+    idle_damper = [int(m.group(1)) for ln in lines if (m := IDLE_DAMPER_RE.search(ln))]
+    if idle_damper:
+        watch.append(f"idle-damper: {len(idle_damper)} warning(s), "
+                     f"max {max(idle_damper)} idle-timeouts in a 5min window")
+    scan_warns = [(m.group(1), int(m.group(2))) for ln in lines if (m := SCAN_WARN_RE.search(ln))]
+    if scan_warns:
+        tables = ', '.join(f"{t}({r})" for t, r in scan_warns[:3])
+        watch.append(f"scan-warn: {len(scan_warns)} full table scan(s) detected "
+                     f"at plan time — tables: {tables}")
+    pull_idle_total = sum(int(m.group(1)) for ln in lines if (m := PERF_PULL_RE.search(ln)))
+    if pull_idle_total:
+        watch.append(f"pull idle-timeouts: {pull_idle_total} in window")
+
     return {
         "lines_scanned": len(lines),
         "blocking_hits": hits,
@@ -187,6 +224,13 @@ def scan_container(name: str, since: str, slow_ms_watch: float,
                          "timeouts": timeouts, "staged": staged,
                          "batch_flushes": batch_flushes,
                          "slow_materializations_gt10s": slow_mat_10s},
+        "progress_handler": {
+            "wedge_escalated": sorted(set(escalated)) if escalated else [],
+            "idle_damper_count": len(idle_damper),
+            "idle_damper_max": max(idle_damper) if idle_damper else 0,
+            "scan_warnings": scan_warns if scan_warns else [],
+            "pull_idle_total": pull_idle_total,
+        },
         "slow_sqlite": {"count": len(slow_ms),
                         "max_ms": round(max(slow_ms), 1) if slow_ms else 0,
                         "p50_ms": round(sorted(slow_ms)[len(slow_ms) // 2], 1) if slow_ms else 0},

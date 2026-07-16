@@ -151,6 +151,8 @@ def main() -> int:
                     help="parity_gate.py report json for gate G25 (default: skip)")
     ap.add_argument("--parks", default=None,
                    help="park_site_check.py report json for gate D4 (default: skip)")
+    ap.add_argument("--wedge", default=None,
+                   help="wedge_injector.py report json for gate G26 (default: skip)")
     ap.add_argument("--baseline", default=BASELINE_DEFAULT)
     ap.add_argument("--update-baseline", action="store_true",
                     help="bless this run's latencies as the baseline for its shape and exit")
@@ -612,6 +614,7 @@ def main() -> int:
     _consume_report(a.upgrade, "G24", "upgrade", "no upgrade report (run upgrade_path.py)")
     _consume_report(a.parity, "G25", "latency-parity", "no parity report (run parity_gate.py)")
     _consume_report(a.parks, "D4", "park-site-invariant", "no park-site report (run park_site_check.py)")
+    _consume_report(a.wedge, "G26", "progress-handler", "no wedge report (run wedge_injector.py)")
 
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))

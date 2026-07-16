@@ -709,6 +709,25 @@ if [ -n "$PPROF_PORT" ] && curl -s "http://localhost:$PPROF_PORT/debug/pprof/gor
   set +e; "$PY" tools/park_site_check.py --dump "reports/goroutines-$TAG.txt" --out "$PARK_REPORT"; set -e
 fi
 
+# --- 6g) progress handler gate (G26) --------------------------------------------
+# Scan the container logs for wedge markers from the just-completed replay:
+# WEDGE-ESCALATE (progress handler was needed), WEDGE-FATAL (cancel failed,
+# process killed), pump-deliver-fatal (stream frame dropped), SCAN-WARN
+# (full table scan at plan time), IDLE-DAMPER (repeated consumer stalls).
+# Also captures a goroutine dump for D4 if pprof is available.
+WEDGE_REPORT="reports/wedge-$TAG.json"
+echo "== progress handler gate (G26) =="
+PPROF_ARG=""
+if [ -n "$PPROF_PORT" ]; then
+  PPROF_ARG="--pprof http://localhost:$PPROF_PORT"
+fi
+set +e; "$PY" tools/wedge_injector.py \
+  --container "$ZCACHE" \
+  $PPROF_ARG \
+  --since "$RUN_START_ISO" \
+  --check-logs-only \
+  --out "$WEDGE_REPORT"; set -e
+
 # --- 7) the verdict --------------------------------------------------------------
 echo ""
 set +e
@@ -729,7 +748,8 @@ set +e
   ${IMAGEAUDIT_REPORT:+--image-audit "$IMAGEAUDIT_REPORT"} \
   ${UPGRADE_REPORT:+--upgrade "$UPGRADE_REPORT"} \
   ${PARITY_REPORT:+--parity "$PARITY_REPORT"} \
-  ${PARK_REPORT:+--parks "$PARK_REPORT"}
+  ${PARK_REPORT:+--parks "$PARK_REPORT"} \
+  ${WEDGE_REPORT:+--wedge "$WEDGE_REPORT"}
 GATE=$?
 set -e
 echo ""
