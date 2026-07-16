@@ -276,17 +276,21 @@ def compute_write_parity(primary_pokes: list[float], mirror_pokes: list[float],
 def drive_replay(target: str, auth_token: str | None, id_pool: str,
                  conns: int, working_set: int, churn_ms: int, duration: int,
                  extra: list[str], protocol: int, tag: str, label: str) -> str:
-    out = f"reports/parity-{tag}-{label}.json"
+    out_dir = f"reports/parity-{tag}-{label}.json"
     cmd = [sys.executable, "harness/replay.py",
            "--target", target, "--id-pool", id_pool,
            "--connections", str(conns), "--working-set", str(working_set),
            "--churn-ms", str(churn_ms), "--duration", str(duration),
-           "--protocol-version", str(protocol), "--out", out]
+           "--protocol-version", str(protocol), "--out-dir", out_dir,
+           "--client-schema", "harness/client-schema.json"]
     if auth_token:
         cmd += ["--auth-token", auth_token]
     cmd += extra
     subprocess.run(cmd, check=False, timeout=duration + 120)
-    return out
+    # replay.py writes run-TIMESTAMP.json inside out_dir — find it
+    import glob
+    runs = sorted(glob.glob(os.path.join(out_dir, "run-*.json")))
+    return runs[-1] if runs else out_dir
 
 
 def load_run_latencies(path: str) -> tuple[dict, dict]:
