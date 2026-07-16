@@ -57,7 +57,7 @@ PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 PLANNER_FLAG=""
 OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""
-CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""
+CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
@@ -90,6 +90,7 @@ while [ $# -gt 0 ]; do
     --starvation) LANE="starvation"; shift;;
     --parallel) LANE="parallel"; shift;;
     --ceiling) LANE="ceiling"; shift;;
+    --ts-baseline) TS_BASELINE=1; CLEAN=1; shift;;
     --oracle) ORACLE=1; shift;;
     --chaos) CHAOS=1; LIFECYCLE=1; shift;;
     --negative) NEGATIVE=1; shift;;
@@ -573,6 +574,59 @@ fi
 # G13 window start: everything the pods log from here until the verdict is
 # attributable to this run (30s pre-margin applied by log_gate.py --since).
 RUN_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# --- TS baseline arm (--ts-baseline): run TS first, bless, then Go -------
+# Back-to-back, same machine, same seeded DB, same day. The TS run validates
+# the harness (if TS trips the liveness ceiling or leaks goroutines, the
+# gate/sandbox is broken — the control arm catches harness bugs before they
+# masquerade as Go bugs). After blessing, Go runs against the stored TS pair.
+TS_BASELINE_REPORT=""
+if [ "$TS_BASELINE" = "1" ]; then
+  echo ""
+  echo "======== TS BASELINE ARM (control) ========"
+  if ! docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+    echo "ERROR: $MIRROR_POD not running — --ts-baseline needs the TS mirror" >&2
+    exit 1
+  fi
+  wait_mirror_ready "$MIRROR_POD" 180 || true
+  TS_TAG="$(date +%Y%m%d-%H%M%S)-ts"
+  TS_SAMPLES="reports/resources-$TS_TAG.ndjson"
+  "$PY" tools/resource_sampler.py --container "$MIRROR_POD" --pg-container "$PG" \
+    --db "$DB" --cvr-schema "sandbox_${SLUG}_ts_0/cvr" --pprof '' \
+    --out "$TS_SAMPLES" --interval 10 --duration $((DURATION + 60)) &
+  TS_SAMPLER_PID=$!
+  set +e
+  "$PY" harness/replay.py \
+    --target "$MIRROR_URL" --id-pool "$POOL" --client-schema "$CSCHEMA" \
+    --connections "$CONNS" \
+    --duration "$DURATION" "${AUTHFLAGS[@]}" \
+    ${SHAPEFLAGS[@]+"${SHAPEFLAGS[@]}"} ${PROFILEFLAGS[@]+"${PROFILEFLAGS[@]}"} \
+    ${LIFEFLAGS[@]+"${LIFEFLAGS[@]}"} ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${MUTFLAGS[@]+"${MUTFLAGS[@]}"} \
+    ${IMPACTFLAGS[@]+"${IMPACTFLAGS[@]}"} \
+    2>&1 | tee "reports/ts-baseline-$TAG.log"
+  TS_RC=${PIPESTATUS[0]}
+  set -e
+  sleep 15
+  kill "$TS_SAMPLER_PID" 2>/dev/null || true
+  wait "$TS_SAMPLER_PID" 2>/dev/null || true
+  # Find the run report the replay just wrote
+  TS_RUN_REPORT="$(ls -t reports/run-*.json | head -1)"
+  TS_RES_SUMMARY="reports/resources-$TS_TAG.summary.json"
+  if [ -f "$TS_RUN_REPORT" ]; then
+    # Bless the TS baseline (stamps config_hash so it self-invalidates on change)
+    set +e
+    "$PY" tools/local_gate.py --run "$TS_RUN_REPORT" \
+      --resources "$TS_RES_SUMMARY" \
+      --update-baseline --baseline "reports/ts-baseline.json"
+    set -e
+    TS_BASELINE_REPORT="$TS_RUN_REPORT"
+    echo "======== TS BASELINE BLESSED → running Go candidate ========"
+  else
+    echo "WARNING: TS run report not found — baseline not blessed" >&2
+  fi
+  echo ""
+fi
+
 set +e
 if [ -n "$TRACE" ]; then
   # trace mutation timing comes from the trace itself — no rate flag
@@ -889,6 +943,48 @@ set +e
 GATE=$?
 set -e
 echo ""
+
+# --- 7b) TS baseline head-to-head (--ts-baseline) ---------------------------
+# If we ran the TS control arm, print a per-query Go/TS comparison.
+# Go wins engine compute (2.5-7x measured) but pays serialization/RPC tax per
+# hydrate — ratios will be bimodal. This table surfaces WHICH queries are
+# slower and by how much, not just a global pass/fail.
+if [ -n "$TS_BASELINE_REPORT" ] && [ -f "$TS_BASELINE_REPORT" ]; then
+  echo "== Go vs TS baseline head-to-head =="
+  "$PY" - "$TS_BASELINE_REPORT" "reports/run-$TAG.json" 2>/dev/null <<'PYEOF' || true
+import json, sys
+ts_path, go_path = sys.argv[1], sys.argv[2]
+ts = json.load(open(ts_path))
+go = json.load(open(go_path))
+tq = ts.get("latency_by_query", {})
+gq = go.get("latency_by_query", {})
+common = [q for q in gq if q in tq and gq[q].get("samples",0) >= 5 and tq[q].get("samples",0) >= 5]
+if not common:
+    print("  (no queries with >=5 samples on both sides)")
+else:
+    ratios = [(q, gq[q].get("p50",0)/max(tq[q].get("p50",0.1),0.1),
+               gq[q].get("p50",0), tq[q].get("p50",0)) for q in common]
+    ratios.sort(key=lambda r: -r[1])
+    print(f"{'query':40} {'Go p50':>8} {'TS p50':>8} {'Go/TS':>6}")
+    for q, r, gp, tp in ratios[:10]:
+        print(f"  {q:38} {gp:8.0f} {tp:8.0f} {r:6.2f}x")
+    if len(ratios) > 10:
+        print(f"  ... ({len(ratios)-10} more)")
+    slower = [r for r in ratios if r[1] > 1.0]
+    faster = [r for r in ratios if r[1] < 1.0]
+    print(f"  Go slower on {len(slower)}/{len(ratios)} queries, faster on {len(faster)}")
+# RSS/goroutine comparison
+ts_res = go_res = None
+import glob
+for p in sorted(glob.glob("reports/resources-*-ts.summary.json"))[-1:]:
+    try: ts_res = json.load(open(p))
+    except: pass
+for p in sorted(glob.glob(f"reports/resources-{sys.argv[2].split('/')[-1].replace('run-','').replace('.json','')}*.summary.json"))[-1:]:
+    try: go_res = json.load(open(p))
+    except: pass
+PYEOF
+fi
+
 # best-effort heap growth report (needs `go` on PATH; never affects the verdict)
 if [ -f "reports/resources-$TAG.heap-first.pb.gz" ] && [ -f "reports/resources-$TAG.heap-last.pb.gz" ]; then
   "$PY" tools/heap_diff.py --tag "$TAG" 2>&1 | sed 's/^/  /' || true

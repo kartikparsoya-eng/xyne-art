@@ -8,6 +8,11 @@
 # Windows (see ART.md §1): counts/weights = 7d, client latency = 72h (7d quantile overloads the
 # log backend), server histograms = 7d increase. Everything lands in raw/, then build_baseline.py
 # assembles art-baseline.json.
+#
+# Weekly archive: because log retention is only ~8 days, each run archives raw/ into
+# raw/archive-YYYYMMDD/ before overwriting. After a month you have 4 weekly snapshots;
+# their union is your "1-month mine" — for free — and drift tracking (whale growth,
+# new shapes after app releases) comes along for the ride.
 set -euo pipefail
 
 : "${GR_KEY:?export GR_KEY first (Grafana service-account token, on VPN)}"
@@ -22,6 +27,17 @@ echo "# access check"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GR_KEY" "$BASE/api/user")
 [ "$code" = "200" ] || { echo "Grafana returned $code (VPN? rotated key?)"; exit 1; }
 echo "ok ($code)"
+
+# --- 0) archive previous raw/ (retention is 8d — archive is the only long-term memory) ---
+ARCH_TAG="$(date +%Y%m%d)"
+ARCH_DIR="$RAW/archive-$ARCH_TAG"
+if [ -d "$RAW" ] && [ "$(ls -A "$RAW" 2>/dev/null)" ]; then
+  mkdir -p "$ARCH_DIR"
+  cp -p "$RAW"/*.ndjson "$RAW"/*.json "$RAW"/*.txt "$ARCH_DIR/" 2>/dev/null || true
+  echo "  archived previous raw/ -> $ARCH_DIR"
+else
+  echo "  (no previous raw/ to archive)"
+fi
 
 logs () { # $1=LogsQL  $2=start  $3=limit  $4=outfile
   curl -s -G -H "Authorization: Bearer $GR_KEY" "$LOGS" \
@@ -100,7 +116,63 @@ done < "$RAW/missing_queries.txt"
 cat "$RAW/qsample.ndjson" "$RAW/targeted.ndjson" > "$RAW/qcombined.ndjson"
 python3 "$DIR/tools/extract_arg_schemas.py" "$RAW/arg_schemas.json" < "$RAW/qcombined.ndjson"
 
+echo "# 8b/9 whale rowCounts (24h max — for seeder calibration)"
+logs 'container:"xyne-logging-bridge" AND event:"zero_query_complete" | stats by (query) max(rowCount) as max_rows | sort by (max_rows desc) | limit 20' 24h 20 "$RAW/whale_rowcounts_24h.ndjson"
+
+echo "# 8c/9 storm sizing: worst 5-min concurrent-CG and connects/min (7d)"
+# Prom queries for peak concurrent CGs and connect rate — used by G27 storm scaling
+PEAK_CG=$(curl -s -G -H "Authorization: Bearer $GR_KEY" "$PROM" \
+  --data-urlencode "query=max_over_time(count(count by (zeroClientGroupId) (zero_socket_connected))5m)[7d])" \
+  | sed -n 's/.*"value":\[[0-9.]*,"\([^"]*\)"\].*/\1/p')
+PEAK_CONNECTS=$(curl -s -G -H "Authorization: Bearer $GR_KEY" "$PROM" \
+  --data-urlencode "query=max_over_time(rate(zero_socket_connected[5m])[7d:5m]) * 60" \
+  | sed -n 's/.*"value":\[[0-9.]*,"\([^"]*\)"\].*/\1/p')
+cat > "$RAW/storm_sizing.json" <<EOF
+{
+  "peak_concurrent_cgs_5min": ${PEAK_CG:-null},
+  "peak_connects_per_min_5min": ${PEAK_CONNECTS:-null},
+  "window": "7d",
+  "note": "worst 5-min bucket; use for G27 storm scaling and --ceiling lane CG count"
+}
+EOF
+echo "  peak concurrent CGs: ${PEAK_CG:-?}, peak connects/min: ${PEAK_CONNECTS:-?}"
+
 echo "# assemble art-baseline.json"
 python3 "$DIR/tools/build_baseline.py"
 python3 -c "import json; json.load(open('$DIR/art-baseline.json')); print('art-baseline.json is valid JSON')"
+
+echo "# 9/9 coverage diff: prod shapes vs replay corpus"
+python3 - "$DIR" <<'PY'
+import json, os, sys
+dir = sys.argv[1]
+bl = json.load(open(os.path.join(dir, "art-baseline.json")))
+prod_shapes = {q["name"] for q in bl["query_workload"]["queries"]}
+# The replay corpus is the baseline itself (replay.py loads from art-baseline.json).
+# Check the run report from the last ART run for actually-hydrated shapes.
+import glob
+runs = sorted(glob.glob(os.path.join(dir, "reports/run-*.json")))
+hydrated = set()
+if runs:
+    try:
+        r = json.load(open(runs[-1]))
+        hydrated = set(r.get("coverage", {}).get("queries_hydrated", 0) and
+                       r.get("per_query", {}).keys())
+    except Exception:
+        pass
+missing = prod_shapes - hydrated if hydrated else set()
+report = {
+    "prod_distinct_shapes": len(prod_shapes),
+    "last_run_hydrated": len(hydrated),
+    "missing_from_last_run": sorted(missing),
+    "missing_count": len(missing),
+}
+with open(os.path.join(dir, "reports/coverage-diff.json"), "w") as f:
+    json.dump(report, f, indent=2)
+print(f"  prod shapes: {len(prod_shapes)}, last run hydrated: {len(hydrated)}", end="")
+if missing:
+    print(f", missing: {len(missing)} -> {', '.join(sorted(missing)[:5])}")
+else:
+    print()
+PY
+
 echo "done."

@@ -259,6 +259,23 @@ def main() -> int:
 
     # G5 latency vs the blessed baseline for this run's shape
     g5_entry = None
+    # Check config hash — stale baseline refuses to gate
+    baseline_stale = False
+    if os.path.exists(a.baseline):
+        try:
+            bl_doc = json.load(open(a.baseline))
+            bl_hash = bl_doc.get("config_hash")
+            if bl_hash:
+                import hashlib as _hl
+                h = _hl.sha256()
+                for p in ["art-baseline.json", "tools/seed_prod_scale.py",
+                          "harness/replay.py", "harness/workload.py"]:
+                    if os.path.exists(p):
+                        h.update(open(p, "rb").read())
+                if h.hexdigest()[:16] != bl_hash:
+                    baseline_stale = True
+        except Exception:
+            pass
     if not os.path.exists(a.baseline):
         results.append(("G5 latency", "SKIP",
                         "no local baseline — run --update-baseline on a good run"))
@@ -275,6 +292,10 @@ def main() -> int:
                             "run of this shape with --update-baseline"))
         else:
             g5_entry = entry
+            if baseline_stale:
+                results.append(("G5 latency", "WATCH",
+                               "baseline config_hash mismatch — catalog/seeder/harness changed "
+                               "since this baseline was blessed. Re-bless before trusting latency gates."))
             # steady-state (churn puts) is the clean signal; session-open puts
             # hydrate behind resume catch-up. Compare steady only when both
             # sides have it (old baselines/reports predate the split).
@@ -639,6 +660,38 @@ def main() -> int:
                            f"all queries within {LIVENESS_CEILING_MS}ms ceiling"))
     else:
         results.append(("G28 liveness-ceiling", "SKIP", "no parity report (run parity_gate.py)"))
+
+    # --- G29: shape coverage — distinct prod shapes (7d) vs shapes the replay
+    #     actually exercised. WATCH on any prod shape not exercised (not FAIL —
+    #     some shapes are intentionally skipped, like the mutation-matrix skip-list).
+    #     Converts "is our replay still representative?" from a manual question into
+    #     a gate that answers itself every run. ---
+    BASELINE_PATH = os.path.join(os.path.dirname(__file__), "..", "art-baseline.json")
+    if os.path.exists(BASELINE_PATH):
+        try:
+            bl = json.load(open(BASELINE_PATH))
+            prod_shapes = {q["name"] for q in bl.get("query_workload", {}).get("queries", [])}
+        except Exception:
+            prod_shapes = set()
+        # shapes the replay actually hydrated (from run report's per_query keys)
+        hydrated = set((run.get("per_query") or {}).keys())
+        if prod_shapes and hydrated:
+            missing = prod_shapes - hydrated
+            if missing:
+                results.append(("G29 shape-coverage", "WATCH",
+                               f"{len(missing)} prod shape(s) not exercised: "
+                               + ", ".join(sorted(missing)[:8])
+                               + (f" (+{len(missing)-8} more)" if len(missing) > 8 else "")))
+            else:
+                results.append(("G29 shape-coverage", "PASS",
+                               f"all {len(prod_shapes)} prod shapes exercised"))
+        elif prod_shapes:
+            results.append(("G29 shape-coverage", "SKIP",
+                           "run report has no per_query data"))
+        else:
+            results.append(("G29 shape-coverage", "SKIP", "no art-baseline.json"))
+    else:
+        results.append(("G29 shape-coverage", "SKIP", "no art-baseline.json"))
 
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))

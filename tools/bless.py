@@ -17,10 +17,25 @@ Exit 0 = blessed; 1 = cannot bless (gates failed); 2 = error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
+
+
+def config_hash() -> str:
+    """Hash of the catalog (art-baseline.json) + seeder config (seed_prod_scale.py)
+    + replay harness (replay.py, workload.py). A baseline blessed against one
+    config is invalid if the config changes — tie the hash so a stale baseline
+    refuses to gate rather than silently gating wrong."""
+    h = hashlib.sha256()
+    for path in ["art-baseline.json", "tools/seed_prod_scale.py",
+                 "harness/replay.py", "harness/workload.py"]:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                h.update(f.read())
+    return h.hexdigest()[:16]
 
 
 def main() -> int:
@@ -126,9 +141,15 @@ def main() -> int:
     print(f"  run: {run_path}")
 
     # check current baseline
+    cfg_hash = config_hash()
     if os.path.exists(a.baseline):
         with open(a.baseline) as f:
             bl = json.load(f)
+        bl_hash = bl.get("config_hash")
+        if bl_hash and bl_hash != cfg_hash:
+            print(f"  WARNING: baseline config_hash mismatch (baseline={bl_hash}, current={cfg_hash})")
+            print(f"  catalog/seeder/harness changed since this baseline was blessed.")
+            print(f"  Re-bless required: the stale baseline may gate wrong.")
         if shape in bl.get("shapes", {}):
             old = bl["shapes"][shape]
             print(f"  existing baseline: p50={old.get('p50')} p95={old.get('p95')}")
@@ -140,7 +161,7 @@ def main() -> int:
         return 0
 
     # invoke local_gate.py --update-baseline
-    print(f"\n  blessing shape {shape}...")
+    print(f"\n  blessing shape {shape} (config_hash={cfg_hash})...")
     cmd = [sys.executable, "tools/local_gate.py",
            "--run", run_path, "--update-baseline",
            "--baseline", a.baseline]
@@ -149,7 +170,15 @@ def main() -> int:
         print(f"  bless failed (rc={rc})", file=sys.stderr)
         return 2
 
-    print(f"  BLESSED: {shape}")
+    # stamp the config hash into the baseline so future runs can detect staleness
+    if os.path.exists(a.baseline):
+        with open(a.baseline) as f:
+            bl = json.load(f)
+        bl["config_hash"] = cfg_hash
+        with open(a.baseline, "w") as f:
+            json.dump(bl, f, indent=2)
+
+    print(f"  BLESSED: {shape} (config_hash={cfg_hash})")
     return 0
 
 
