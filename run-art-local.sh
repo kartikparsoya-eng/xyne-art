@@ -575,6 +575,28 @@ if [ "$NEGATIVE" = "1" ]; then
   fi
 fi
 
+# --- 6c1b) active wedge scenarios (gate G27) --------------------------------
+# Unlike the passive log gate (G26) which detects markers IF they happen,
+# these scenarios FORCE the conditions: cancel mid-hydrate, idle consumer,
+# churn leak, slow scan, reconnect-after-cancel. Runs after negative so
+# its cancel/churn doesn't skew G11's forged-state scenarios.
+WEDGE_SCENARIO_REPORT=""
+if [ "$NEGATIVE" = "1" ]; then
+  WEDGE_SCENARIO_REPORT="reports/wedge-scenarios-$TAG.json"
+  echo "== active wedge scenarios (G27) =="
+  PPROF_ARG=""
+  if [ -n "$PPROF_PORT" ]; then
+    PPROF_ARG="--pprof http://localhost:$PPROF_PORT"
+  fi
+  set +e
+  "$PY" harness/wedge_scenarios.py --target "$TARGET" \
+    --id-pool "$POOL" --client-schema "$CSCHEMA" \
+    --auth-pool "$AUTH_POOL" \
+    $PPROF_ARG --container "$ZCACHE" \
+    --out "$WEDGE_SCENARIO_REPORT"
+  set -e
+fi
+
 # --- 6c2) optional mutation matrix (gate G15) -------------------------------------
 # Push-path mutator TYPE coverage: every synthesizable mutator fired through
 # the real client push path, wave-converged Go-vs-TS (harness/mutation_matrix.py).
@@ -749,7 +771,8 @@ set +e
   ${UPGRADE_REPORT:+--upgrade "$UPGRADE_REPORT"} \
   ${PARITY_REPORT:+--parity "$PARITY_REPORT"} \
   ${PARK_REPORT:+--parks "$PARK_REPORT"} \
-  ${WEDGE_REPORT:+--wedge "$WEDGE_REPORT"}
+  ${WEDGE_REPORT:+--wedge "$WEDGE_REPORT"} \
+  ${WEDGE_SCENARIO_REPORT:+--wedge-scenarios "$WEDGE_SCENARIO_REPORT"}
 GATE=$?
 set -e
 echo ""
