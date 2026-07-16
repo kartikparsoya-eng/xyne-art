@@ -426,6 +426,10 @@ def main() -> int:
     ap.add_argument("--pprof", default="", help="Go pprof base URL")
     ap.add_argument("--container", default=None,
                     help="zero-cache container name (for log checks)")
+    ap.add_argument("--pg-container", default=None)
+    ap.add_argument("--pg-user", default="xyne")
+    ap.add_argument("--pg-db", default=None)
+    ap.add_argument("--cvr-schema", default=None)
     ap.add_argument("--only", default=None)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", default=None)
