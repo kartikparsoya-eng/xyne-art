@@ -57,7 +57,7 @@ PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 PLANNER_FLAG=""
 OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""
-CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0
+CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
@@ -87,6 +87,9 @@ while [ $# -gt 0 ]; do
     --memory) MEMORY="$2"; shift 2;;
     --bootstrap) BOOTSTRAP=1; shift;;
     --release) RELEASE=1; shift;;
+    --starvation) LANE="starvation"; shift;;
+    --parallel) LANE="parallel"; shift;;
+    --ceiling) LANE="ceiling"; shift;;
     --oracle) ORACLE=1; shift;;
     --chaos) CHAOS=1; LIFECYCLE=1; shift;;
     --negative) NEGATIVE=1; shift;;
@@ -116,6 +119,34 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+# Lane presets: three envelopes matching measured prod density (~46 CGs/core).
+# Starvation (2 cores): does it break? Wedges, GC pressure, scheduler stalls.
+# Parallel (4 cores): does the parallelism pay? A/B vs starvation lane.
+# Ceiling (3 cores): capacity number + graceful degradation past the knee.
+if [ "$LANE" = "starvation" ]; then
+  CPUS="2"; MEMORY="8g"
+  [ "$CONNS_SET" = "0" ] && CONNS=50
+  [ "$USERS" = "1" ] && USERS=10
+  [ "$DUR_SET" = "0" ] && DURATION=300
+  MUTATIONS=1; ORACLE=1; NEGATIVE=1; ZIPF=1.1; BOOTSTRAP=1
+  echo "[ART] starvation lane: cpus=$CPUS memory=$MEMORY conns=$CONNS users=$USERS dur=${DURATION}s"
+elif [ "$LANE" = "parallel" ]; then
+  CPUS="4"; MEMORY="10g"
+  [ "$CONNS_SET" = "0" ] && CONNS=50
+  [ "$USERS" = "1" ] && USERS=10
+  [ "$DUR_SET" = "0" ] && DURATION=300
+  MUTATIONS=1; ORACLE=1; NEGATIVE=1; ZIPF=1.1; BOOTSTRAP=1; PARITY=1
+  echo "[ART] parallel lane: cpus=$CPUS memory=$MEMORY conns=$CONNS users=$USERS dur=${DURATION}s (A/B vs starvation)"
+elif [ "$LANE" = "ceiling" ]; then
+  CPUS="3"; MEMORY="10g"
+  [ "$CONNS_SET" = "0" ] && CONNS=140
+  [ "$USERS" = "1" ] && USERS=20
+  [ "$DUR_SET" = "0" ] && DURATION=600
+  [ "$MUT_SET" = "0" ] && MUT_RATE=80
+  MUTATIONS=1; ORACLE=1; ZIPF=1.1; BOOTSTRAP=1; CAPACITY=1
+  echo "[ART] ceiling lane: cpus=$CPUS memory=$MEMORY conns=$CONNS users=$USERS dur=${DURATION}s writes=${MUT_RATE}/s"
+fi
 
 # --release: prod-shaped preset — resource caps + all gates + soak duration
 if [ "$RELEASE" = "1" ]; then
@@ -402,6 +433,19 @@ if [ "$MUTMATRIX" = "1" ]; then
   "$PY" tools/seed_all_tables.py --pg-container "$PG" --db "$DB" \
     --identity-user "$ALL_UIDS" | tail -2 | sed 's/^/  all-seed: /'
 fi
+
+# --- 3c) whale seeding for lane presets (prod-measured cardinalities) ----
+# The whale channel (2,200 participants) becomes the hottest entry in the
+# id-pool's ranked channel list. --link-whale adds the auth user to the
+# whale channel so the user-scoped harvest includes it in the zipf draw.
+if [ -n "$LANE" ]; then
+  echo "== seeding whale tenant for $LANE lane =="
+  "$PY" tools/seed_prod_scale.py --pg-container "$PG" --db "$DB" \
+    --whale --link-whale "$FIRST_UID" 2>&1 | sed 's/^/  /'
+  # Force pool re-harvest so whale IDs are included
+  REFRESH=1
+fi
+
 if [ -n "$TRACE" ]; then
   "$PY" tools/seed_aux_tables.py --pg-container "$PG" --db "$DB" \
     --groups 250 --canvases 100 | sed 's/^/  seed: /'

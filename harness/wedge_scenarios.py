@@ -356,14 +356,16 @@ async def sc_concurrent_cold_start_storm(ctx: Ctx) -> dict:
     Assert: all N hydrations complete within 30s (no wedge), no WEDGE markers
     in logs, goroutine count returns to baseline after all disconnect."""
     name = "concurrent-cold-start-storm"
-    expect = f"10 concurrent cold-starts complete <30s; no WEDGE; goroutines return to baseline"
+    expect = f"25 concurrent cold-starts in <60s; no WEDGE; goroutines return to baseline"
     if not hasattr(ctx, 'pprof') or not ctx.pprof:
         return result(name, "SKIP", expect, "no pprof URL — cannot check goroutine count")
 
     baseline_goroutines = pprof_goroutine_count(ctx.pprof)
 
-    # Open 10 client groups concurrently, each hydrating getCanvas
-    N = 10
+    # 25 CGs connecting within 60s — the prod deploy-reconnect shape.
+    # Prod: ~230 clients/pod reconnect over 2-3 min; scaled to the 2-core
+    # lane (25 CGs = 50 clients, ~1/5th of a pod's reconnect burst).
+    N = 25
     sessions = []
     cgid_base = f"art-storm-{uuid.uuid4().hex[:8]}"
 
@@ -401,8 +403,8 @@ async def sc_concurrent_cold_start_storm(ctx: Ctx) -> dict:
             if s is not None:
                 await close(s)
 
-    # Wait for server to clean up
-    await asyncio.sleep(3)
+    # Wait for server to clean up (25 CGs = more goroutines to drain)
+    await asyncio.sleep(5)
 
     # Check goroutine count returned to baseline
     after_goroutines = pprof_goroutine_count(ctx.pprof)
@@ -420,12 +422,12 @@ async def sc_concurrent_cold_start_storm(ctx: Ctx) -> dict:
         return result(name, "WATCH", expect,
                      f"WEDGE-ESCALATE in logs — progress handler was needed under storm "
                      f"(goroutines: {baseline_goroutines} -> {after_goroutines})")
-    if delta > 20:
+    if delta > 30:
         return result(name, "FAIL", expect,
                      f"goroutine leak after storm: {baseline_goroutines} -> {after_goroutines} "
-                     f"(+{delta} > +20 — pool readers not freed after concurrent cold-start)")
+                     f"(+{delta} > +30 — pool readers not freed after concurrent cold-start)")
     return result(name, "PASS", expect,
-                  f"10 concurrent cold-starts completed, no WEDGE markers, "
+                  f"25 concurrent cold-starts completed, no WEDGE markers, "
                   f"goroutines: {baseline_goroutines} -> {after_goroutines} (+{delta})")
 
 

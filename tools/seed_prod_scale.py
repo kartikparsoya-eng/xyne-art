@@ -361,43 +361,153 @@ def wipe(a):
 
 
 def seed_whale(a):
-    """Seed a single whale workspace with extreme cardinalities."""
-    print("seeding whale tenant...")
+    """Seed whale cardinalities matching measured prod (24h max rowCount).
+
+    Prod whales (24h):
+      channelParticipants: 2,144 rows on one channel (p50 is 24 → 89× skew)
+      ticketsQueryV2: 12,963 rows (15K tickets in one ws/board)
+      getUsersV2: 3,724 rows (4K users)
+      userUnreadActivities: 1,560 unread on one user
+      getStagesByBoardIds: 1,641 stages across boards
+      project_tags: ~1,100 tags
+
+    The whale channel/user are seeded so the id-pool generator's hotness
+    ranking (participant count DESC) puts them at index 0 — the zipf lane
+    hits them first and hardest.
+    """
+    print("seeding whale tenant (prod-measured cardinalities)...")
     whale_ws = "artwhale-workspace-0"
-    run_sql(a, "whale canvas (500 participants)", f"""
-INSERT INTO public.canvases (id, name, "workspaceId", "createdAt", "updatedAt")
-VALUES ('artwhale-canvas-0', 'Whale Canvas', '{whale_ws}', now(), now())
+    whale_channel = "artwhale-channel-0"
+    whale_user = "artwhale-user-0000"
+    whale_board = "artwhale-board-0"
+    whale_project = "artwhale-proj-0"
+
+    # 1. 4K users (getUsersV2 whale = 3,724 rows)
+    run_sql(a, "whale users (4K)", f"""
+INSERT INTO public.users (id, name, email, "authProvider", "providerUserId",
+  status, "userType", "workspaceId", role, "orgMemberId", "createdAt", "updatedAt")
+SELECT 'artwhale-user-' || lpad(i::text, 4, '0'),
+       'Whale User ' || i,
+       'whale-user-' || i || '@xyne.test',
+       'GOOGLE', 'whale-provider-' || i,
+       'ACTIVE', 'USER', '{whale_ws}', 'MEMBER',
+       'artwhale-member-' || lpad(i::text, 4, '0'),
+       now() - (i || ' second')::interval, now()
+FROM generate_series(0, 3999) i
 ON CONFLICT DO NOTHING;
 """)
-    run_sql(a, "whale canvas_participants (500)", f"""
-INSERT INTO public.canvas_participants (id, "canvasId", "userId", "createdAt")
-SELECT 'artwhale-cp-' || lpad(i::text, 4, '0'),
-       'artwhale-canvas-0',
+    run_sql(a, "whale org_members (4K)", f"""
+INSERT INTO public.org_members ("memberId", email, "orgId", "userId", role, "joinedAt")
+SELECT 'artwhale-member-' || lpad(i::text, 4, '0'),
+       'whale-user-' || i || '@xyne.test',
+       (SELECT "orgId" FROM public.organizations LIMIT 1),
        'artwhale-user-' || lpad(i::text, 4, '0'),
-       now() - (i || ' minute')::interval
-FROM generate_series(0, 499) i
+       'MEMBER', now() - (i || ' second')::interval
+FROM generate_series(0, 3999) i
+ON CONFLICT ("memberId") DO NOTHING;
+""")
+
+    # 2. One whale channel with 2,200 participants (channelParticipants whale = 2,144)
+    run_sql(a, "whale channel", f"""
+INSERT INTO public.channels (id, name, type, "scopeType", visibility, "createdBy",
+  "workspaceId", "participantCount", "isArchived", "createdAt", "updatedAt")
+VALUES ('{whale_channel}', 'Whale Channel', 'GROUP'::"ChannelType",
+        'workspace'::"ChannelScopeType", 'PRIVATE'::"ChannelVisibility",
+        '{whale_user}', '{whale_ws}', 2200, false, now(), now())
 ON CONFLICT DO NOTHING;
 """)
-    run_sql(a, "whale tickets (1000)", f"""
-INSERT INTO public.tickets (id, title, "projectId", "workspaceId", status, "createdAt", "updatedAt")
-SELECT 'artwhale-ticket-' || lpad(i::text, 4, '0'),
-       'Whale Ticket ' || i, 'artwhale-proj-0', '{whale_ws}',
-       'OPEN', now() - (i || ' minute')::interval, now()
-FROM generate_series(0, 999) i
+    # 2,200 channel_user_status entries (what channelParticipants query actually reads)
+    run_sql(a, "whale channel_user_status (2,200)", f"""
+INSERT INTO public.channel_user_status (id, "channelId", "userId", "lastViewedAt",
+  "isStarred", "isClosed", "unreadCount")
+SELECT 'artwhale-cus-' || lpad(i::text, 5, '0'),
+       '{whale_channel}',
+       'artwhale-user-' || lpad(i::text, 4, '0'),
+       now() - (i || ' minute')::interval,
+       (i % 10 = 0), (i % 7 = 0), (i % 50)
+FROM generate_series(0, 2199) i
 ON CONFLICT DO NOTHING;
 """)
-    run_sql(a, "whale messages (5000)", f"""
-INSERT INTO public.messages ("messageId", "conversationId", content, "senderId", "workspaceId", "createdAt", "msgType", "showInChannel", "isDeleted", "isSent", "hasAttachment")
-SELECT 'artwhale-msg-' || lpad(i::text, 5, '0'),
-       'artwhale-conv-0',
-       'Whale message ' || i,
-       'artwhale-user-0000', '{whale_ws}',
-       now() - ((5000 - i) || ' second')::interval,
-       'TEXT', true, false, true, false
-FROM generate_series(0, 4999) i
+
+    # 3. Whale board + project for the 15K tickets
+    run_sql(a, "whale board+project", f"""
+INSERT INTO public.boards (id, name, "projectId", "workspaceId", "createdAt", "updatedAt")
+VALUES ('{whale_board}', 'Whale Board', '{whale_project}', '{whale_ws}', now(), now())
+ON CONFLICT DO NOTHING;
+INSERT INTO public.projects (id, name, "workspaceId", "createdAt", "updatedAt")
+VALUES ('{whale_project}', 'Whale Project', '{whale_ws}', now(), now())
 ON CONFLICT DO NOTHING;
 """)
+
+    # 4. 15K tickets in one workspace/board (ticketsQueryV2 whale = 12,963)
+    run_sql(a, "whale tickets (15K)", f"""
+INSERT INTO public.tickets (id, title, description, status, "statusV2",
+  "createdBy", "updatedBy", "channelId",
+  priority, "xyneId", "projectId", "workspaceId", "boardId", "stageName",
+  "isArchived", "emailReplyEnabled", "statusUpdatedAt", "createdAt", "updatedAt")
+SELECT 'artwhale-ticket-' || lpad(i::text, 5, '0'),
+       'Whale Ticket ' || i, 'whale tenant ticket',
+       'NEW'::"TicketStatus", 'TODO'::"TicketStatusV2",
+       '{whale_user}', '{whale_user}', '{whale_channel}',
+       CASE i % 4 WHEN 0 THEN 'LOW'::"TicketPriority" WHEN 1 THEN 'MEDIUM'::"TicketPriority"
+                  WHEN 2 THEN 'HIGH'::"TicketPriority" ELSE 'CRITICAL'::"TicketPriority" END,
+       'whale-xyne-' || lpad(i::text, 5, '0'),
+       '{whale_project}', '{whale_ws}', '{whale_board}',
+       CASE i % 5 WHEN 0 THEN 'Todo' WHEN 1 THEN 'In Progress' WHEN 2 THEN 'Review'
+                  WHEN 3 THEN 'Done' ELSE 'Backlog' END,
+       false, false, now() - (i || ' second')::interval,
+       now() - (i || ' second')::interval, now()
+FROM generate_series(0, 14999) i
+ON CONFLICT DO NOTHING;
+""")
+
+    # 5. 1,650 stages across boards (getStagesByBoardIds whale = 1,641)
+    run_sql(a, "whale stages (1,650)", f"""
+INSERT INTO public.stages (id, name, eta, "boardId", "sequenceNumber", "createdBy",
+  "updatedBy", "createdAt", "updatedAt", "defaultTicketStatus", "defaultTicketStatusV2")
+SELECT 'artwhale-stage-' || lpad(i::text, 5, '0'),
+       'Stage ' || i, (i % 5) * 3600,
+       '{whale_board}', i,
+       '{whale_user}', '{whale_user}', now(), now(),
+       'NEW'::"TicketStatus", 'TODO'::"TicketStatusV2"
+FROM generate_series(0, 1649) i
+ON CONFLICT DO NOTHING;
+""")
+
+    # 6. 1,100 project tags (prod has ~1,100)
+    run_sql(a, "whale project_tags (1,100)", f"""
+INSERT INTO public.project_tags (id, name, "projectId", "createdAt")
+SELECT 'artwhale-tag-' || lpad(i::text, 4, '0'),
+       'Whale Tag ' || i, '{whale_project}', now()
+FROM generate_series(0, 1099) i
+ON CONFLICT DO NOTHING;
+""")
+
+    # 7. 1,600 unread activities on one user (userUnreadActivities whale = 1,560)
+    run_sql(a, "whale unread activities (1,600 on one user)", f"""
+INSERT INTO public.activities (id, "userId", "actorAction", "actionSource",
+  "actionSourceId", "actorId", classification, "isRead",
+  "createdAt", "updatedAt", "channelId")
+SELECT 'artwhale-act-' || lpad(i::text, 5, '0'),
+       '{whale_user}',
+       'mentioned you', 'mention', 'whale-src-' || i,
+       'artwhale-user-' || lpad((i % 100)::text, 4, '0'),
+       CASE i % 4 WHEN 0 THEN 'ACTIONABLE'::"ActivityClassification" WHEN 1 THEN 'FYI'::"ActivityClassification"
+                  WHEN 2 THEN 'SKIP'::"ActivityClassification" ELSE 'PENDING'::"ActivityClassification" END,
+       false,  -- all unread
+       now() - (i || ' second')::interval, now(),
+       '{whale_channel}'
+FROM generate_series(0, 1599) i
+ON CONFLICT DO NOTHING;
+""")
+
     print("whale tenant done")
+    print(f"  whale channel: {whale_channel} (2,200 participants)")
+    print(f"  whale user: {whale_user} (1,600 unread activities)")
+    print(f"  whale board: {whale_board} (15K tickets, 1,650 stages)")
+    print(f"  whale project: {whale_project} (1,100 tags)")
+    print(f"  whale workspace: {whale_ws} (4K users)")
+    print("  ^ these IDs will be ranked hottest in id-pool generation")
     return 0
 
 
@@ -479,12 +589,22 @@ def main() -> int:
                     help="seed boundary/poison values (unicode, huge JSON, max-int, empty strings)")
     ap.add_argument("--wide-rows", action="store_true",
                     help="seed rows with realistic payload sizes (10KB+ content bodies)")
+    ap.add_argument("--link-whale", default=None,
+                    help="link this userId to the whale channel so the user-scoped id-pool harvest includes it")
     a = ap.parse_args()
     if a.wipe:
         return wipe(a)
     rc = 0
     if a.whale:
         rc = seed_whale(a)
+        if a.link_whale:
+            run_sql(a, f"link whale channel to {a.link_whale}", f"""
+INSERT INTO public.channel_user_status (id, "channelId", "userId", "lastViewedAt",
+  "isStarred", "isClosed", "unreadCount")
+VALUES ('artwhale-cus-link-{a.link_whale}', 'artwhale-channel-0', '{a.link_whale}',
+        now(), false, false, 0)
+ON CONFLICT DO NOTHING;
+""")
     if a.poison:
         rc = seed_poison(a)
     if a.wide_rows:
