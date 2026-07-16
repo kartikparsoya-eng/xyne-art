@@ -48,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from protocol import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
 from workload import (  # noqa: E402
     ArgResolver, WeightedSampler, load_baseline,
-    query_put, init_connection_message, change_desired_queries_message,
+    query_put, query_del, init_connection_message, change_desired_queries_message,
 )
 
 # Reuse negative.py's infrastructure
@@ -342,6 +342,195 @@ async def sc_reconnect_after_cancel(ctx: Ctx) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Scenario 6: Concurrent cold-start storm (the production wedge trigger)
+# --------------------------------------------------------------------------- #
+async def sc_concurrent_cold_start_storm(ctx: Ctx) -> dict:
+    """Simulate the exact production wedge trigger: many client groups
+    simultaneously cold-hydrating the same deep-EXISTS query at once.
+    Production wedge had getCanvas with depth-6 EXISTS nesting (canvases →
+    canvas_participants → user_groups → user_group_mappings, plus canvases →
+    channels → channel_participants). This scenario opens N client groups
+    concurrently, each with the same query, forcing N simultaneous cold
+    hydrations of the EXISTS pattern.
+
+    Assert: all N hydrations complete within 30s (no wedge), no WEDGE markers
+    in logs, goroutine count returns to baseline after all disconnect."""
+    name = "concurrent-cold-start-storm"
+    expect = f"10 concurrent cold-starts complete <30s; no WEDGE; goroutines return to baseline"
+    if not hasattr(ctx, 'pprof') or not ctx.pprof:
+        return result(name, "SKIP", expect, "no pprof URL — cannot check goroutine count")
+
+    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+
+    # Open 10 client groups concurrently, each hydrating getCanvas
+    N = 10
+    sessions = []
+    cgid_base = f"art-storm-{uuid.uuid4().hex[:8]}"
+
+    async def open_and_hydrate(i: int) -> tuple[Session, float]:
+        cgid = f"{cgid_base}-{i}"
+        cid = f"art-cid-{i}-{uuid.uuid4().hex[:8]}"
+        put = ctx.benign_put()  # any query — what matters is concurrent cold-start
+        t0 = time.perf_counter()
+        s = await ctx.open(cgid, cid, puts=[put])
+        # Wait for hydration to start (got_hashes = first poke received)
+        await s.pump_until(lambda x: x.got_hashes or x.errors, 30)
+        elapsed = time.perf_counter() - t0
+        return s, elapsed
+
+    try:
+        # Fire all N concurrently
+        results_storm = await asyncio.gather(
+            *[open_and_hydrate(i) for i in range(N)],
+            return_exceptions=True,
+        )
+        # Unpack
+        for r in results_storm:
+            if isinstance(r, Exception):
+                if is_infra_error(r):
+                    return result(name, "INFRA", expect, f"connect failed: {r!r}")
+                sessions.append(None)
+            else:
+                sessions.append(r[0])
+    except Exception as e:
+        st = "INFRA" if is_infra_error(e) else "FAIL"
+        return result(name, st, expect, f"storm exception: {e!r}")
+    finally:
+        # Close all sessions
+        for s in sessions:
+            if s is not None:
+                await close(s)
+
+    # Wait for server to clean up
+    await asyncio.sleep(3)
+
+    # Check goroutine count returned to baseline
+    after_goroutines = pprof_goroutine_count(ctx.pprof)
+    delta = after_goroutines - baseline_goroutines if after_goroutines > 0 and baseline_goroutines > 0 else -1
+
+    # Check logs for WEDGE markers
+    markers = {}
+    if hasattr(ctx, 'container') and ctx.container:
+        markers = check_wedge_in_logs(ctx.container, since_s=60)
+
+    if markers.get("fatal"):
+        return result(name, "FAIL", expect,
+                     "WEDGE-FATAL in logs — progress handler failed under concurrent cold-start storm")
+    if markers.get("escalate"):
+        return result(name, "WATCH", expect,
+                     f"WEDGE-ESCALATE in logs — progress handler was needed under storm "
+                     f"(goroutines: {baseline_goroutines} -> {after_goroutines})")
+    if delta > 20:
+        return result(name, "FAIL", expect,
+                     f"goroutine leak after storm: {baseline_goroutines} -> {after_goroutines} "
+                     f"(+{delta} > +20 — pool readers not freed after concurrent cold-start)")
+    return result(name, "PASS", expect,
+                  f"10 concurrent cold-starts completed, no WEDGE markers, "
+                  f"goroutines: {baseline_goroutines} -> {after_goroutines} (+{delta})")
+
+
+# --------------------------------------------------------------------------- #
+# Scenario 7: Deep EXISTS stress (the exact production wedge pattern)
+# --------------------------------------------------------------------------- #
+async def sc_deep_exists_stress(ctx: Ctx) -> dict:
+    """Open a client group and repeatedly subscribe/unsubscribe to the
+    deepest-EXISTS query in the workload (getCanvas with depth-6 nesting).
+    Each subscribe triggers a cold hydration of the EXISTS N+1 pattern.
+    The production wedge was exactly this: getCanvas → Join → Filter(Exists)
+    → fetchExists → fetchSize → FlippedJoin.Fetch → fetchViaBoundReaderStream.
+
+    Assert: each hydration completes <10s (no wedge), no WEDGE-ESCALATE in
+    logs, goroutine count stable across subscribe/unsubscribe cycles."""
+    name = "deep-exists-stress"
+    expect = "5 subscribe/unsubscribe cycles of deep-EXISTS query; no WEDGE; <10s each"
+    if not hasattr(ctx, 'pprof') or not ctx.pprof:
+        return result(name, "SKIP", expect, "no pprof URL")
+
+    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+
+    # Find getCanvas in the sampler (it's the deep-EXISTS query that wedged)
+    canvas_put = None
+    for _ in range(50):
+        op = ctx.sampler.sample()
+        if op.name == "getCanvas":
+            args, ok = ctx.resolver.resolve(op)
+            if ok:
+                canvas_put = query_put(op.name, args)
+                break
+    if canvas_put is None:
+        return result(name, "SKIP", expect,
+                     "could not sample getCanvas from baseline — deep-EXISTS query not in workload")
+
+    cgid = f"art-exists-{uuid.uuid4().hex[:8]}"
+    cid = f"art-cid-{uuid.uuid4().hex[:8]}"
+
+    # Open connection
+    s = await ctx.open(cgid, cid, puts=[canvas_put])
+    max_hydrate_ms = 0
+    try:
+        # Wait for initial hydration
+        await s.pump_until(lambda x: x.got_hashes or x.errors, 30)
+        if not s.got_hashes:
+            return result(name, "SKIP", expect,
+                          f"initial hydration failed: tags={s.tags}")
+
+        # Now do 4 more subscribe/unsubscribe cycles with different canvas IDs
+        for cycle in range(4):
+            # Change desired queries: remove old, add new getCanvas with different arg
+            new_op = None
+            for _ in range(20):
+                op = ctx.sampler.sample()
+                if op.name == "getCanvas":
+                    args, ok = ctx.resolver.resolve(op)
+                    if ok:
+                        new_op = query_put(op.name, args)
+                        break
+            if not new_op:
+                continue  # skip cycle if can't sample
+
+            # Remove old hash, add new
+            old_hashes = list(s.got_hashes)
+            patch = [query_del(h) for h in old_hashes] + [new_op]
+            await s.ws.send(json.dumps(change_desired_queries_message(patch)))
+            t0 = time.perf_counter()
+            await s.pump_until(
+                lambda x: new_op["hash"] in x.got_hashes or x.errors,
+                30,
+            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            max_hydrate_ms = max(max_hydrate_ms, elapsed_ms)
+    except Exception as e:
+        st = "INFRA" if is_infra_error(e) else "FAIL"
+        return result(name, st, expect, f"stress exception: {e!r}")
+    finally:
+        await close(s)
+
+    await asyncio.sleep(2)
+    after_goroutines = pprof_goroutine_count(ctx.pprof)
+    delta = after_goroutines - baseline_goroutines if after_goroutines > 0 and baseline_goroutines > 0 else -1
+
+    markers = {}
+    if hasattr(ctx, 'container') and ctx.container:
+        markers = check_wedge_in_logs(ctx.container, since_s=60)
+
+    if markers.get("fatal"):
+        return result(name, "FAIL", expect,
+                     "WEDGE-FATAL — progress handler failed under deep-EXISTS stress")
+    if markers.get("escalate"):
+        return result(name, "WATCH", expect,
+                     f"WEDGE-ESCALATE — progress handler was needed (deep EXISTS may be slow)")
+    if max_hydrate_ms > 30000:
+        return result(name, "FAIL", expect,
+                     f"hydration took {max_hydrate_ms:.0f}ms > 30s — possible wedge")
+    if delta > 15:
+        return result(name, "WATCH", expect,
+                     f"goroutine delta +{delta} after EXISTS stress — check for pool reader leak")
+    return result(name, "PASS", expect,
+                 f"5 cycles, max hydrate {max_hydrate_ms:.0f}ms, no WEDGE, "
+                 f"goroutines {baseline_goroutines} -> {after_goroutines} (+{delta})")
+
+
+# --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
 async def run(a: argparse.Namespace) -> int:
@@ -355,6 +544,8 @@ async def run(a: argparse.Namespace) -> int:
         sc_churn_leak,
         sc_slow_scan_survives,
         sc_reconnect_after_cancel,
+        sc_concurrent_cold_start_storm,
+        sc_deep_exists_stress,
     ]
     if a.only:
         wanted = set(a.only.split(","))
