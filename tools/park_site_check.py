@@ -53,6 +53,11 @@ ALLOWLIST = [
     r"connectionOpener",
     r"connectionCleaner",
     r"connectionResetter",
+    # database/sql rolling transactions (DatabaseStorage keeps a tx open
+    # between checkpoints — every 5000 ops. The awaitDone goroutine is
+    # a channel receive waiting for Commit/Rollback, not a wedge.)
+    r"database/sql\.\(\*Tx\)\.awaitDone",
+    r"database/sql\.\(\*Rows\)\.awaitDone",
     # Transport
     r"net\.\(\*pipe\)\.read",
     r"net\.\(\*pipe\)\.write",
