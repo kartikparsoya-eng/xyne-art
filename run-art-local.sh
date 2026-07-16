@@ -953,7 +953,9 @@ echo ""
 # slower and by how much, not just a global pass/fail.
 if [ -n "$TS_BASELINE_REPORT" ] && [ -f "$TS_BASELINE_REPORT" ]; then
   echo "== Go vs TS baseline head-to-head =="
-  "$PY" - "$TS_BASELINE_REPORT" "reports/run-$TAG.json" 2>/dev/null <<'PYEOF' || true
+  # Find the latest Go run report (replay.py writes its own timestamp)
+  GO_RUN_REPORT="$(ls -t reports/run-*.json | head -1)"
+  "$PY" - "$TS_BASELINE_REPORT" "$GO_RUN_REPORT" 2>/dev/null <<'PYEOF' || true
 import json, sys
 ts_path, go_path = sys.argv[1], sys.argv[2]
 ts = json.load(open(ts_path))
