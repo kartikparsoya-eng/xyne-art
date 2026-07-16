@@ -178,6 +178,25 @@ def cvr_counts(pg_container: str, db: str, cvr_schema: str) -> dict:
         return {"cvr_instances": None, "cvr_art_instances": None}
 
 
+def wal_size(container: str) -> dict:
+    """Get WAL file size and DB file size from the container.
+    WAL growth is the early warning signal for WAL-pin starvation (W5)."""
+    try:
+        out = sh(["docker", "exec", container, "ls", "-la", "/var/zero/zero.db-wal"])
+        # Parse: -rw-r--r-- 1 root root 1234567 Jul 16 ... /var/zero/zero.db-wal
+        parts = out.split()
+        wal_bytes = int(parts[4]) if len(parts) > 4 else 0
+    except Exception:
+        wal_bytes = 0
+    try:
+        out = sh(["docker", "exec", container, "ls", "-la", "/var/zero/zero.db"])
+        parts = out.split()
+        db_bytes = int(parts[4]) if len(parts) > 4 else 0
+    except Exception:
+        db_bytes = 0
+    return {"wal_bytes": wal_bytes, "db_bytes": db_bytes}
+
+
 def slope_per_hour(samples: list[tuple[float, float]]) -> float | None:
     """Least-squares slope in units/hour over (ts, value) points."""
     pts = [(t, v) for t, v in samples if v is not None]
@@ -235,6 +254,7 @@ def main() -> int:
                     s["gc_num"] = gc.get("numgc")
                     s["gc_pause_total_ns"] = gc.get("pausetotalns")
             s.update(cvr_counts(a.pg_container, a.db, a.cvr_schema))
+            s.update(wal_size(a.container))
             f.write(json.dumps(s) + "\n")
             f.flush()
             rows.append(s)
@@ -249,7 +269,8 @@ def main() -> int:
         snapshot_cpu_profile(a.pprof, heap_prefix + ".cpu-profile-end.pb.gz", duration_s=30)
 
     metrics = ["cpu_pct", "rss_bytes", "goroutines", "heapalloc", "heapinuse",
-               "heapsys", "cvr_instances", "cvr_art_instances"]
+               "heapsys", "cvr_instances", "cvr_art_instances",
+               "wal_bytes", "db_bytes"]
     summary: dict = {"samples": len(rows),
                      "window_s": round(rows[-1]["ts"], 1) if rows else 0}
 
@@ -308,10 +329,21 @@ def main() -> int:
                      f"{'bounded' if delta < 50 else 'possible leak'}"),
         }
     
+    # WAL growth alert: WAL-pin starvation (W5) shows as WAL file growth
+    # without corresponding DB growth. >100MB/h = WATCH.
+    if "wal_bytes" in summary:
+        w = summary["wal_bytes"]
+        if w.get("slope_per_hour") and w["slope_per_hour"] > 100_000_000:
+            summary["wal_growth_alert"] = {
+                "slope_per_hour": w["slope_per_hour"],
+                "verdict": "WATCH",
+                "note": f"WAL growing {w['slope_per_hour'] / 1e6:.0f}MB/h — possible WAL-pin starvation",
+            }
+    
     with open(spath, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"resource summary: {spath}")
-    for m in ("rss_bytes", "goroutines", "heapinuse", "cvr_art_instances"):
+    for m in ("rss_bytes", "goroutines", "heapinuse", "cvr_art_instances", "wal_bytes"):
         if m in summary:
             v = summary[m]
             print(f"  {m}: {v['first']} -> {v['last']} "

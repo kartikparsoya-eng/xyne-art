@@ -619,6 +619,27 @@ def main() -> int:
     _consume_report(a.wedge, "G26", "progress-handler", "no wedge report (run wedge_injector.py)")
     _consume_report(getattr(a, "wedge_scenarios"), "G27", "wedge-scenarios", "no wedge scenario report (run wedge_scenarios.py)")
 
+    # --- G28: liveness ceiling — any single query >60s = FAIL regardless of
+    #     aggregate completion %. Converts every future hang class into a red
+    #     build. Uses the parity report's per-query primary (Go) p95 latency. ---
+    LIVENESS_CEILING_MS = 60000  # 60s
+    if a.parity and os.path.exists(a.parity):
+        with open(a.parity) as f:
+            pdoc = json.load(f)
+        offenders = []
+        for r in pdoc.get("ratios", []):
+            p95 = r.get("primary", 0)
+            if p95 > LIVENESS_CEILING_MS:
+                offenders.append(f"{r.get('query','?')}={p95:.0f}ms")
+        if offenders:
+            results.append(("G28 liveness-ceiling", "FAIL",
+                           f"{len(offenders)} query(ies) exceeded {LIVENESS_CEILING_MS}ms: " + ", ".join(offenders[:5])))
+        else:
+            results.append(("G28 liveness-ceiling", "PASS",
+                           f"all queries within {LIVENESS_CEILING_MS}ms ceiling"))
+    else:
+        results.append(("G28 liveness-ceiling", "SKIP", "no parity report (run parity_gate.py)"))
+
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))
     width = max(len(g) for g, _, _ in results)

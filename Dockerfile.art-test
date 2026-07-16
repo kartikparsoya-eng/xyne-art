@@ -1,0 +1,3 @@
+FROM zero-cache-go:local-arm64-napi
+COPY --from=go-ivm:art-v5 /usr/local/lib/libgoivm.so /opt/go-ivm/libgoivm.so
+COPY --from=go-ivm:art-v5 /usr/local/lib/libgoivm.buildinfo /opt/go-ivm/libgoivm.buildinfo

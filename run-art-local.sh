@@ -57,6 +57,7 @@ PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 PLANNER_FLAG=""
 OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""
+CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
@@ -82,6 +83,10 @@ while [ $# -gt 0 ]; do
     --soak) SOAK=1; LIFECYCLE=1; shift;;
     --clean) CLEAN=1; shift;;
     --zipf) ZIPF="${2:-1.1}"; shift 2;;
+    --cpus) CPUS="$2"; shift 2;;
+    --memory) MEMORY="$2"; shift 2;;
+    --bootstrap) BOOTSTRAP=1; shift;;
+    --release) RELEASE=1; shift;;
     --oracle) ORACLE=1; shift;;
     --chaos) CHAOS=1; LIFECYCLE=1; shift;;
     --negative) NEGATIVE=1; shift;;
@@ -111,6 +116,68 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+# --release: prod-shaped preset — resource caps + all gates + soak duration
+if [ "$RELEASE" = "1" ]; then
+  [ -z "$CPUS" ] && CPUS="1.5"
+  [ -z "$MEMORY" ] && MEMORY="8g"
+  [ -z "$DUR_SET" ] && DURATION="600"
+  LIFECYCLE=1; ORACLE=1; MUTATIONS=1; NEGATIVE=1; MUTMATRIX=1
+  PROTOCOL=1; TELEMETRY=1; DETERMINISM=1; PARITY=1; IMAGEAUDIT=1
+  echo "[ART] --release: cpus=$CPUS memory=$MEMORY duration=${DURATION}s all-gates"
+fi
+
+# --bootstrap: start the art container with resource caps before running
+if [ "$BOOTSTRAP" = "1" ]; then
+  ART_NAME="${OVERRIDE_CONTAINER:-xyne-sandbox-rust-test-zero-cache-art}"
+  echo "[ART] bootstrapping container: $ART_NAME"
+  docker stop "$ART_NAME" 2>/dev/null; docker rm "$ART_NAME" 2>/dev/null
+  CPU_FLAGS=""
+  [ -n "$CPUS" ] && CPU_FLAGS="--cpus=$CPUS"
+  MEM_FLAGS=""
+  [ -n "$MEMORY" ] && MEM_FLAGS="--memory=$MEMORY"
+  # Copy auth secrets from the TS mirror container
+  AUTH_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_AUTH_SECRET 2>/dev/null)
+  ZERO_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_SECRET 2>/dev/null)
+  PPROF_PORT="${OVERRIDE_PPROF_PORT:-6061}"
+  docker run -d \
+    --name "$ART_NAME" \
+    --network sandbox-net \
+    -p ${PPROF_PORT}:6061 \
+    $CPU_FLAGS $MEM_FLAGS \
+    -e ZERO_AUTH_SECRET="$AUTH_SECRET" \
+    -e ZERO_SECRET="$ZERO_SECRET" \
+    -e NODE_ENV=development \
+    -e ZERO_APP_ID=sandbox_rust_test_art \
+    -e ZERO_UPSTREAM_DB="postgresql://xyne:xyne123@xyne-sandbox-postgres:5432/sandbox_rust_test_db" \
+    -e ZERO_CHANGE_DB="postgresql://xyne:xyne123@xyne-sandbox-postgres:5432/sandbox_rust_test_db" \
+    -e ZERO_CVR_DB="postgresql://xyne:xyne123@xyne-sandbox-postgres:5432/sandbox_rust_test_db" \
+    -e ZERO_QUERY_URL="http://xyne-sandbox-rust-test-backend:3001/api/zero/query" \
+    -e ZERO_MUTATE_URL="http://xyne-sandbox-rust-test-backend:3001/api/zero/push" \
+    -e GO_IVM_PPROF_ADDR=0.0.0.0:6061 \
+    -e GO_IVM_GOGC=200 \
+    -e GO_IVM_HYDRATE_READERS=8 \
+    -e ZERO_NUM_SYNC_WORKERS=4 \
+    -e GO_IVM_HYDRATE_CHUNK_SIZE=500 \
+    -v zero_cache_art_rust_test:/var/zero \
+    -l "traefik.enable=true" \
+    -l "traefik.http.routers.zero-art.rule=Host(\`rust-test.localhost\`) && PathPrefix(\`/zero-art\`)" \
+    -l "traefik.http.routers.zero-art.entrypoints=web" \
+    -l "traefik.http.routers.zero-art.middlewares=zero-art-stripprefix" \
+    -l "traefik.http.middlewares.zero-art-stripprefix.stripprefix.prefixes=/zero-art" \
+    -l "traefik.http.services.zero-art.loadbalancer.server.port=4848" \
+    zero-cache-go:art-test-v5
+  echo "[ART] waiting for container to be ready..."
+  for i in $(seq 1 30); do
+    sleep 5
+    if docker logs "$ART_NAME" 2>&1 | grep -q "zero-cache ready"; then
+      echo "[ART] container ready after $((i*5))s"
+      break
+    fi
+    echo "  $((i*5))s..."
+  done
+fi
+
 # Trace mode replays REAL prod sessions — every statistical-shape knob would
 # be silently ignored; make the conflict loud instead.
 if [ -n "$TRACE" ]; then
@@ -134,6 +201,8 @@ fi
 if [ "$SOAK" = "1" ]; then
   [ "$CONNS_SET" = "1" ] || CONNS=20
   [ "$DUR_SET" = "1" ] || DURATION=3600
+  [ "$USERS" = "1" ] && USERS=10
+  MUTATIONS=1; ORACLE=1
 fi
 
 # Derived sandbox names (see xy-repo/xyne-spaces/.sandboxes/<name>/docker-compose.yml)

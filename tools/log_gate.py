@@ -253,6 +253,48 @@ def window_minutes(since: str) -> float:
         return 10.0
 
 
+# --- Unknown log-signature detector ---
+# Normalizes ERROR/WARN lines to signatures (strip IDs, numbers, durations)
+# and flags signatures not seen in a blessed baseline. Catches new failure
+# modes the blocklist doesn't know about yet.
+
+SIG_ID_RE = re.compile(r"\b[0-9a-f]{8,}\b")  # hex IDs (8+ chars)
+SIG_NUM_RE = re.compile(r"\b\d+\b")  # standalone numbers
+SIG_DUR_RE = re.compile(r"\d+(?:\.\d+)?(?:ms|s|m|µs|ns|h)")  # durations
+SIG_CG_RE = re.compile(r"cg=[^\s]+")  # client group IDs
+SIG_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+SIG_BASELINE_PATH = os.path.join(os.path.dirname(__file__), "..", "reports",
+                                 "log-signatures-baseline.json")
+
+
+def normalize_signature(line: str) -> str:
+    """Strip variable parts from a log line to produce a stable signature."""
+    s = line.strip()
+    s = SIG_UUID_RE.sub("*", s)
+    s = SIG_CG_RE.sub("cg=*", s)
+    s = SIG_DUR_RE.sub("*", s)
+    s = SIG_ID_RE.sub("*", s)
+    s = SIG_NUM_RE.sub("*", s)
+    return s[:200]  # cap length
+
+
+def scan_unknown_signatures(container: str, since: str) -> set:
+    """Extract ERROR/WARN signatures from container logs."""
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--since", since, container],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return set()
+    sigs = set()
+    for line in out.stderr.splitlines() + out.stdout.splitlines():
+        # Match ERROR/WARN level lines (structured logs or plain)
+        if not re.search(r"\b(ERROR|WARN|error|warn)\b", line, re.I):
+            continue
+        sigs.add(normalize_signature(line))
+    return sigs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="G13 server-log health gate.")
     ap.add_argument("--containers", required=True,
@@ -270,6 +312,8 @@ def main() -> int:
                          "thrashing, not healing (reference TS: ~8/min at 1x "
                          "prod load; 4x-compressed storms ran >45/min)")
     ap.add_argument("--out", default=None, help="write the JSON report here")
+    ap.add_argument("--update-baseline", action="store_true",
+                    help="bless the current run's ERROR/WARN signatures as the baseline")
     a = ap.parse_args()
 
     since = a.since
@@ -319,6 +363,38 @@ def main() -> int:
         if r["watch"]:
             raise_to("WATCH")
             report["details"] += [f"{name}: {w}" for w in r["watch"]]
+
+    # --- Unknown log-signature detector: flag ERROR/WARN lines not seen in
+    #     a blessed baseline. Catches new failure modes the blocklist
+    #     doesn't know about. First run = --update-baseline to seed. ---
+    baseline = set()
+    if os.path.exists(SIG_BASELINE_PATH):
+        try:
+            baseline = set(json.load(open(SIG_BASELINE_PATH)).get("signatures", []))
+        except Exception:
+            pass
+    all_sigs = set()
+    for name in [c.strip() for c in a.containers.split(",") if c.strip()]:
+        all_sigs |= scan_unknown_signatures(name, since)
+    unknown = all_sigs - baseline
+    if a.update_baseline:
+        os.makedirs(os.path.dirname(SIG_BASELINE_PATH), exist_ok=True)
+        with open(SIG_BASELINE_PATH, "w") as f:
+            json.dump({"signatures": sorted(all_sigs | baseline)}, f, indent=2)
+        report["details"].append(f"baseline updated: {len(all_sigs)} signatures")
+    elif unknown:
+        if len(unknown) > 5:
+            raise_to("FAIL")
+            report["details"].append(
+                f"unknown-signatures: {len(unknown)} new ERROR/WARN signatures "
+                f"(>5 threshold) — possible new failure mode: "
+                + "; ".join(list(unknown)[:3]))
+        else:
+            raise_to("WATCH")
+            report["details"].append(
+                f"unknown-signatures: {len(unknown)} new ERROR/WARN signature(s): "
+                + "; ".join(list(unknown)[:3]))
+    report["signature_counts"] = {"total": len(all_sigs), "baseline": len(baseline), "unknown": len(unknown)}
 
     if a.out:
         with open(a.out, "w") as f:

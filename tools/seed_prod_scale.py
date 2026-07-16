@@ -345,7 +345,7 @@ UNION ALL SELECT 'conversation_participants: ' || count(*) FROM public.conversat
 
 
 def wipe(a):
-    print("wiping artscale-% rows (child-first)...")
+    print("wiping artscale-%/artwhale-%/artpoison-%/artwide-% rows (child-first)...")
     tables = [
         "conversation_participants", "channel_participants", "channel_sections",
         "bookmarks", "activities", "ticket_activities", "sub_tickets",
@@ -353,10 +353,114 @@ def wipe(a):
         "user_group_mappings", "user_groups", "users",
     ]
     for t in tables:
-        col = "\"memberId\"" if t == "org_members" else "id"
-        r = psql(a, f"DELETE FROM public.{t} WHERE {col} LIKE 'artscale-%';")
+        col = '"memberId"' if t == "org_members" else "id"
+        r = psql(a, f"DELETE FROM public.{t} WHERE {col} LIKE 'artscale-%' OR {col} LIKE 'artwhale-%' OR {col} LIKE 'artpoison-%' OR {col} LIKE 'artwide-%';")
         print(f"  {t}: deleted {r}")
     print("done")
+    return 0
+
+
+def seed_whale(a):
+    """Seed a single whale workspace with extreme cardinalities."""
+    print("seeding whale tenant...")
+    whale_ws = "artwhale-workspace-0"
+    run_sql(a, "whale canvas (500 participants)", f"""
+INSERT INTO public.canvases (id, name, "workspaceId", "createdAt", "updatedAt")
+VALUES ('artwhale-canvas-0', 'Whale Canvas', '{whale_ws}', now(), now())
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "whale canvas_participants (500)", f"""
+INSERT INTO public.canvas_participants (id, "canvasId", "userId", "createdAt")
+SELECT 'artwhale-cp-' || lpad(i::text, 4, '0'),
+       'artwhale-canvas-0',
+       'artwhale-user-' || lpad(i::text, 4, '0'),
+       now() - (i || ' minute')::interval
+FROM generate_series(0, 499) i
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "whale tickets (1000)", f"""
+INSERT INTO public.tickets (id, title, "projectId", "workspaceId", status, "createdAt", "updatedAt")
+SELECT 'artwhale-ticket-' || lpad(i::text, 4, '0'),
+       'Whale Ticket ' || i, 'artwhale-proj-0', '{whale_ws}',
+       'OPEN', now() - (i || ' minute')::interval, now()
+FROM generate_series(0, 999) i
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "whale messages (5000)", f"""
+INSERT INTO public.messages ("messageId", "conversationId", content, "senderId", "workspaceId", "createdAt", "msgType", "showInChannel", "isDeleted", "isSent", "hasAttachment")
+SELECT 'artwhale-msg-' || lpad(i::text, 5, '0'),
+       'artwhale-conv-0',
+       'Whale message ' || i,
+       'artwhale-user-0000', '{whale_ws}',
+       now() - ((5000 - i) || ' second')::interval,
+       'TEXT', true, false, true, false
+FROM generate_series(0, 4999) i
+ON CONFLICT DO NOTHING;
+""")
+    print("whale tenant done")
+    return 0
+
+
+def seed_poison(a):
+    """Seed boundary/poison values that have bitten us in production."""
+    print("seeding poison rows...")
+    run_sql(a, "poison unicode user", f"""
+INSERT INTO public.users (id, name, email, "authProvider", "providerUserId", status, "userType", "workspaceId", role, "createdAt", "updatedAt")
+VALUES ('artpoison-unicode-user', 'ユーザー Poison', 'poison-unicode@xyne.test', 'GOOGLE', 'poison-unicode', 'ACTIVE', 'USER', '{WS}', 'MEMBER', now(), now())
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "poison huge-json canvas", f"""
+INSERT INTO public.canvases (id, name, "workspaceId", metadata, "createdAt", "updatedAt")
+VALUES ('artpoison-huge-json', 'Poison JSON Canvas', '{WS}',
+        '{"blob":"' || repeat('X', 1048576) || '"}', now(), now())
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "poison max-int message", f"""
+INSERT INTO public.messages ("messageId", "conversationId", content, "senderId", "workspaceId", "createdAt", "msgType", "showInChannel", "isDeleted", "isSent", "hasAttachment")
+VALUES ('artpoison-maxint-msg', 'artpoison-conv', '9007199254740993', 'artpoison-user-0', '{WS}', now(), 'TEXT', true, false, true, false)
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "poison empty-entity bookmark", f"""
+INSERT INTO public.bookmarks (id, "userId", "entityType", "entityId", "workspaceId", "createdAt")
+VALUES ('artpoison-empty-entity', 'artpoison-user-0', 'CANVAS', '', '{WS}', now())
+ON CONFLICT DO NOTHING;
+""")
+    print("poison rows done")
+    return 0
+
+
+def seed_wide_rows(a):
+    """Seed rows with realistic payload sizes (wide rows)."""
+    print("seeding wide rows...")
+    run_sql(a, "wide messages (10KB x100)", f"""
+INSERT INTO public.messages ("messageId", "conversationId", content, "senderId", "workspaceId", "createdAt", "msgType", "showInChannel", "isDeleted", "isSent", "hasAttachment")
+SELECT 'artwide-msg-' || lpad(i::text, 4, '0'),
+       'artwide-conv',
+       repeat('This is a realistic message body. ', 312),
+       'artwide-user-0', '{WS}', now() - (i || ' minute')::interval,
+       'TEXT', true, false, true, false
+FROM generate_series(0, 99) i
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "wide canvases (50KB x50)", """
+INSERT INTO public.canvases (id, name, "workspaceId", metadata, "createdAt", "updatedAt")
+SELECT 'artwide-canvas-' || lpad(i::text, 4, '0'),
+       'Wide Canvas ' || i, '""" + WS + """',
+       '{\"shapes\":[' || repeat('{\"type\":\"rect\",\"x\":100,\"y\":200,\"w\":300,\"h\":150},', 800) || '{}]}',
+       now() - (i || ' hour')::interval, now()
+FROM generate_series(0, 49) i
+ON CONFLICT DO NOTHING;
+""")
+    run_sql(a, "wide ticket_activities (5KB x20)", """
+INSERT INTO public.ticket_activities (id, "ticketId", "activityType", value, "timestamp", "updatedBy")
+SELECT 'artwide-act-' || lpad(i::text, 4, '0'),
+       'artwide-ticket-0', 'STATUS_CHANGE',
+       '{\"from\":\"OPEN\",\"to\":\"IN_PROGRESS\",\"comment\":\"' || repeat('x', 5000) || '\"}',
+       now() - (i || ' hour')::interval, 'artwide-user-0'
+FROM generate_series(0, 19) i
+ON CONFLICT DO NOTHING;
+""")
+    print("wide rows done")
     return 0
 
 
@@ -369,10 +473,25 @@ def main() -> int:
     ap.add_argument("--scale", type=float, default=1.0,
                     help="scale factor (1.0 = default prod-scale targets)")
     ap.add_argument("--wipe", action="store_true")
+    ap.add_argument("--whale", action="store_true",
+                    help="seed a whale tenant with extreme cardinalities")
+    ap.add_argument("--poison", action="store_true",
+                    help="seed boundary/poison values (unicode, huge JSON, max-int, empty strings)")
+    ap.add_argument("--wide-rows", action="store_true",
+                    help="seed rows with realistic payload sizes (10KB+ content bodies)")
     a = ap.parse_args()
     if a.wipe:
         return wipe(a)
-    return seed(a)
+    rc = 0
+    if a.whale:
+        rc = seed_whale(a)
+    if a.poison:
+        rc = seed_poison(a)
+    if a.wide_rows:
+        rc = seed_wide_rows(a)
+    if not (a.whale or a.poison or a.wide_rows):
+        rc = seed(a)
+    return rc
 
 
 if __name__ == "__main__":

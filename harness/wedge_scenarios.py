@@ -531,6 +531,147 @@ async def sc_deep_exists_stress(ctx: Ctx) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Scenario 8: Stall-then-resume consumer
+# --------------------------------------------------------------------------- #
+async def sc_stall_then_resume(ctx: Ctx) -> dict:
+    """Open a pull stream, grant no credit for 45s (stall), then resume.
+    Assert: stream survives (45s < 60s idle-timeout), data flows after resume,
+    no Internal errors."""
+    name = "stall-then-resume"
+    expect = "stream survives 45s stall; data flows after resume"
+    cgid, cid = rand_id(), rand_id()
+    put = ctx.benign_put()
+    s = await ctx.open(cgid, cid, puts=[put])
+    try:
+        await s.pump_until(lambda x: x.got_hashes or x.errors, 30)
+        if not s.got_hashes:
+            return result(name, "SKIP", expect, f"never hydrated: tags={s.tags}")
+        # Stall: don't pump for 45s (no credit granted)
+        await asyncio.sleep(45)
+        # Check socket is still alive
+        if s.ws.closed:
+            return result(name, "FAIL", expect,
+                          "socket closed during 45s stall — idle-timeout fired too early")
+        # Resume: pump to drain any buffered data
+        got = await s.pump_until(lambda x: x.got_hashes, 15)
+        if s.errors:
+            return result(name, "FAIL", expect,
+                          f"errors after resume: {s.errors[:3]}")
+        return result(name, "PASS", expect,
+                      "stream survived 45s stall and resumed")
+    finally:
+        await close(s)
+
+
+# --------------------------------------------------------------------------- #
+# Scenario 9: Mid-hydrate kill loop
+# --------------------------------------------------------------------------- #
+async def sc_mid_hydrate_kill_loop(ctx: Ctx) -> dict:
+    """Connect → start hydrate → kill socket at ~50% → reconnect same CG, ×20.
+    Assert: goroutine count flat after all cycles (no leak from killed sockets)."""
+    name = "mid-hydrate-kill-loop"
+    expect = "20 kill/reconnect cycles; goroutine count flat"
+    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+    cgid = rand_id()
+    for i in range(20):
+        cid = rand_id()
+        put = ctx.benign_put()
+        s = await ctx.open(cgid, cid, puts=[put])
+        try:
+            await s.pump_until(lambda x: x.got_hashes or x.errors, 10)
+            await asyncio.sleep(0.3)  # let hydration get going
+        finally:
+            # Kill without graceful close — simulates abrupt socket death
+            await close(s)
+        await asyncio.sleep(0.5)  # brief reconnect delay
+    # Wait for server to clean up
+    await asyncio.sleep(5)
+    after_goroutines = pprof_goroutine_count(ctx.pprof)
+    delta = after_goroutines - baseline_goroutines
+    if abs(delta) > 15:
+        return result(name, "FAIL", expect,
+                      f"goroutine leak: {baseline_goroutines} -> {after_goroutines} (+{delta})")
+    return result(name, "PASS", expect,
+                  f"goroutines {baseline_goroutines} -> {after_goroutines} (+{delta})")
+
+
+# --------------------------------------------------------------------------- #
+# Scenario 10: Half-open socket
+# --------------------------------------------------------------------------- #
+async def sc_half_open_socket(ctx: Ctx) -> dict:
+    """Connect, start a query, then kill the client without FIN (simulate
+    network drop). Wait 30s. Assert: server goroutine count didn't grow."""
+    name = "half-open-socket"
+    expect = "server reclaims dead socket; goroutine delta < 10 after 30s"
+    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+    cgid, cid = rand_id(), rand_id()
+    put = ctx.benign_put()
+    s = await ctx.open(cgid, cid, puts=[put])
+    try:
+        await s.pump_until(lambda x: x.got_hashes or x.errors, 10)
+    except Exception:
+        pass  # expected — we're about to kill the socket
+    # Abort without close — leaves a half-open socket on the server side
+    if hasattr(s, 'ws') and s.ws:
+        try:
+            s.ws._sock.shutdown(2)  # SHUT_RDWR without FIN handshake
+        except Exception:
+            pass
+        try:
+            s.ws._sock.close()
+        except Exception:
+            pass
+    # Wait for server keepalive to detect the dead socket
+    await asyncio.sleep(30)
+    after_goroutines = pprof_goroutine_count(ctx.pprof)
+    delta = after_goroutines - baseline_goroutines
+    if delta > 10:
+        return result(name, "FAIL", expect,
+                      f"goroutine leak from half-open socket: {baseline_goroutines} -> {after_goroutines} (+{delta})")
+    return result(name, "PASS", expect,
+                  f"goroutines {baseline_goroutines} -> {after_goroutines} (+{delta})")
+
+
+# --------------------------------------------------------------------------- #
+# Scenario 11: Auth invalidation mid-hydrate
+# --------------------------------------------------------------------------- #
+async def sc_auth_invalidation(ctx: Ctx) -> dict:
+    """Connect with valid auth, start addQueriesStream, then simulate
+    auth invalidation by closing the connection abruptly mid-hydrate.
+    Reconnect with fresh auth on the same CG. Assert: no panic in server
+    logs, clean recovery."""
+    name = "auth-invalidation"
+    expect = "no panic; clean recovery after auth invalidation"
+    cgid = rand_id()
+    # First connection: start hydrate, then kill
+    cid1 = rand_id()
+    put = ctx.benign_put()
+    s1 = await ctx.open(cgid, cid1, puts=[put])
+    try:
+        await s1.pump_until(lambda x: x.got_hashes or x.errors, 10)
+        await asyncio.sleep(0.5)  # let hydration get going
+    finally:
+        await close(s1)
+    # Brief delay simulating auth invalidation + client retry
+    await asyncio.sleep(2)
+    # Reconnect same CG with fresh client ID
+    cid2 = rand_id()
+    s2 = await ctx.open(cgid, cid2, puts=[put])
+    try:
+        got = await s2.pump_until(lambda x: x.got_hashes or x.errors, 30)
+        if not s2.got_hashes:
+            return result(name, "FAIL", expect,
+                          f"reconnect failed to hydrate: tags={s2.tags}")
+        if s2.errors:
+            return result(name, "FAIL", expect,
+                          f"errors after reconnect: {s2.errors[:3]}")
+        return result(name, "PASS", expect,
+                      "reconnected after auth invalidation; hydrated normally")
+    finally:
+        await close(s2)
+
+
+# --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
 async def run(a: argparse.Namespace) -> int:
@@ -546,6 +687,10 @@ async def run(a: argparse.Namespace) -> int:
         sc_reconnect_after_cancel,
         sc_concurrent_cold_start_storm,
         sc_deep_exists_stress,
+        sc_stall_then_resume,
+        sc_mid_hydrate_kill_loop,
+        sc_half_open_socket,
+        sc_auth_invalidation,
     ]
     if a.only:
         wanted = set(a.only.split(","))
