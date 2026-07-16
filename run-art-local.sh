@@ -133,7 +133,7 @@ if [ "$LANE" = "starvation" ]; then
   MUTATIONS=1; ORACLE=1; NEGATIVE=1; ZIPF=1.1; BOOTSTRAP=1
   echo "[ART] starvation lane: cpus=$CPUS memory=$MEMORY conns=$CONNS users=$USERS dur=${DURATION}s"
 elif [ "$LANE" = "parallel" ]; then
-  CPUS="4"; MEMORY="10g"
+  CPUS="4"; MEMORY="6g"  # 10g OOM-kills on Mac (TS+backend+pg share host RAM)
   [ "$CONNS_SET" = "0" ] && CONNS=50
   [ "$USERS" = "1" ] && USERS=10
   [ "$DUR_SET" = "0" ] && DURATION=300
