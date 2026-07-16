@@ -585,8 +585,8 @@ if [ "$NEGATIVE" = "1" ]; then
   WEDGE_SCENARIO_REPORT="reports/wedge-scenarios-$TAG.json"
   echo "== active wedge scenarios (G27) =="
   PPROF_ARG=""
-  if [ -n "$PPROF_PORT" ]; then
-    PPROF_ARG="--pprof http://localhost:$PPROF_PORT"
+  if [ -n "$OVERRIDE_PPROF_PORT" ]; then
+    PPROF_ARG="--pprof http://localhost:$OVERRIDE_PPROF_PORT"
   fi
   set +e
   "$PY" harness/wedge_scenarios.py --target "$TARGET" \
@@ -725,7 +725,7 @@ fi
 # only sanctioned park sites). A goroutine parked in a SQLite CGO call or a
 # mutex wait is a wedge that must fail the gate.
 PARK_REPORT=""
-if [ -n "$PPROF_PORT" ] && curl -s "http://localhost:$PPROF_PORT/debug/pprof/goroutine?debug=2" > "reports/goroutines-$TAG.txt" 2>/dev/null; then
+if [ -n "$OVERRIDE_PPROF_PORT" ] && curl -s "http://localhost:$OVERRIDE_PPROF_PORT/debug/pprof/goroutine?debug=2" > "reports/goroutines-$TAG.txt" 2>/dev/null; then
   PARK_REPORT="reports/parks-$TAG.json"
   echo "== park-site invariant (D4) =="
   set +e; "$PY" tools/park_site_check.py --dump "reports/goroutines-$TAG.txt" --out "$PARK_REPORT"; set -e
@@ -740,8 +740,8 @@ fi
 WEDGE_REPORT="reports/wedge-$TAG.json"
 echo "== progress handler gate (G26) =="
 PPROF_ARG=""
-if [ -n "$PPROF_PORT" ]; then
-  PPROF_ARG="--pprof http://localhost:$PPROF_PORT"
+if [ -n "$OVERRIDE_PPROF_PORT" ]; then
+  PPROF_ARG="--pprof http://localhost:$OVERRIDE_PPROF_PORT"
 fi
 set +e; "$PY" tools/wedge_injector.py \
   --container "$ZCACHE" \
