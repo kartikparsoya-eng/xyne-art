@@ -149,6 +149,8 @@ def main() -> int:
                     help="upgrade_path.py report json for gate G24 (default: skip)")
     ap.add_argument("--parity", default=None,
                     help="parity_gate.py report json for gate G25 (default: skip)")
+    ap.add_argument("--parks", default=None,
+                   help="park_site_check.py report json for gate D4 (default: skip)")
     ap.add_argument("--baseline", default=BASELINE_DEFAULT)
     ap.add_argument("--update-baseline", action="store_true",
                     help="bless this run's latencies as the baseline for its shape and exit")
@@ -609,6 +611,7 @@ def main() -> int:
     _consume_report(getattr(a, "image_audit"), "G23", "image-audit", "no image audit (run image_audit.py)")
     _consume_report(a.upgrade, "G24", "upgrade", "no upgrade report (run upgrade_path.py)")
     _consume_report(a.parity, "G25", "latency-parity", "no parity report (run parity_gate.py)")
+    _consume_report(a.parks, "D4", "park-site-invariant", "no park-site report (run park_site_check.py)")
 
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))

@@ -697,6 +697,18 @@ if [ "$DRAIN" = "1" ]; then
   set +e; "$PY" tools/drain_test.py --target "$TARGET" --container "$ZCACHE" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --drain-budget-s "$DRAIN_BUDGET" --out "$DRAIN_REPORT"; set -e
 fi
 
+# --- 6f) park-site invariant (D4) ----------------------------------------------
+# Grab a goroutine dump from pprof and check for goroutines parked in a
+# frame outside the allowlist (gate.acquire, TSFN park, pool admission — the
+# only sanctioned park sites). A goroutine parked in a SQLite CGO call or a
+# mutex wait is a wedge that must fail the gate.
+PARK_REPORT=""
+if [ -n "$PPROF_PORT" ] && curl -s "http://localhost:$PPROF_PORT/debug/pprof/goroutine?debug=2" > "reports/goroutines-$TAG.txt" 2>/dev/null; then
+  PARK_REPORT="reports/parks-$TAG.json"
+  echo "== park-site invariant (D4) =="
+  set +e; "$PY" tools/park_site_check.py --dump "reports/goroutines-$TAG.txt" --out "$PARK_REPORT"; set -e
+fi
+
 # --- 7) the verdict --------------------------------------------------------------
 echo ""
 set +e
@@ -716,7 +728,8 @@ set +e
   ${CAPACITY_REPORT:+--capacity "$CAPACITY_REPORT"} \
   ${IMAGEAUDIT_REPORT:+--image-audit "$IMAGEAUDIT_REPORT"} \
   ${UPGRADE_REPORT:+--upgrade "$UPGRADE_REPORT"} \
-  ${PARITY_REPORT:+--parity "$PARITY_REPORT"}
+  ${PARITY_REPORT:+--parity "$PARITY_REPORT"} \
+  ${PARK_REPORT:+--parks "$PARK_REPORT"}
 GATE=$?
 set -e
 echo ""
