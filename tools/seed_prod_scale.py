@@ -410,10 +410,10 @@ ON CONFLICT ("memberId") DO NOTHING;
     # 2. One whale channel with 2,200 participants (channelParticipants whale = 2,144)
     run_sql(a, "whale channel", f"""
 INSERT INTO public.channels (id, name, type, "scopeType", visibility, "createdBy",
-  "workspaceId", "participantCount", "isArchived", "createdAt", "updatedAt")
-VALUES ('{whale_channel}', 'Whale Channel', 'GROUP'::"ChannelType",
-        'workspace'::"ChannelScopeType", 'PRIVATE'::"ChannelVisibility",
-        '{whale_user}', '{whale_ws}', 2200, false, now(), now())
+  "workspaceId", "projectId", "participantCount", "isArchived", "createdAt", "updatedAt")
+VALUES ('{whale_channel}', 'Whale Channel', 'DEFAULT'::"ChannelType",
+        'DEFAULT'::"ChannelScopeType", 'PRIVATE'::"ChannelVisibility",
+        '{whale_user}', '{whale_ws}', '{whale_project}', 2200, false, now(), now())
 ON CONFLICT DO NOTHING;
 """)
     # 2,200 channel_user_status entries (what channelParticipants query actually reads)
@@ -431,31 +431,34 @@ ON CONFLICT DO NOTHING;
 
     # 3. Whale board + project for the 15K tickets
     run_sql(a, "whale board+project", f"""
-INSERT INTO public.boards (id, name, "projectId", "workspaceId", "createdAt", "updatedAt")
-VALUES ('{whale_board}', 'Whale Board', '{whale_project}', '{whale_ws}', now(), now())
+INSERT INTO public.projects (id, name, code, "ticketSequence", "workspaceId", type, "createdBy", "createdAt")
+VALUES ('{whale_project}', 'Whale Project', 'WHL', 1, '{whale_ws}',
+        'DEFAULT'::"ProjectType", '{whale_user}', now())
 ON CONFLICT DO NOTHING;
-INSERT INTO public.projects (id, name, "workspaceId", "createdAt", "updatedAt")
-VALUES ('{whale_project}', 'Whale Project', '{whale_ws}', now(), now())
+INSERT INTO public.boards (id, name, "boardType", "projectId", "workspaceId", "createdBy", "createdAt")
+VALUES ('{whale_board}', 'Whale Board', 'DEFAULT'::"BoardType", '{whale_project}', '{whale_ws}',
+        '{whale_user}', now())
 ON CONFLICT DO NOTHING;
 """)
 
     # 4. 15K tickets in one workspace/board (ticketsQueryV2 whale = 12,963)
     run_sql(a, "whale tickets (15K)", f"""
 INSERT INTO public.tickets (id, title, description, status, "statusV2",
-  "createdBy", "updatedBy", "channelId",
+  "createdBy", "updatedBy", "conversationId", "channelId",
   priority, "xyneId", "projectId", "workspaceId", "boardId", "stageName",
-  "isArchived", "emailReplyEnabled", "statusUpdatedAt", "createdAt", "updatedAt")
+  "isArchived", "emailReplyEnabled", "lastEmailAt", "statusUpdatedAt",
+  "createdAt", "updatedAt")
 SELECT 'artwhale-ticket-' || lpad(i::text, 5, '0'),
        'Whale Ticket ' || i, 'whale tenant ticket',
        'NEW'::"TicketStatus", 'TODO'::"TicketStatusV2",
-       '{whale_user}', '{whale_user}', '{whale_channel}',
+       '{whale_user}', '{whale_user}', 'artwhale-conv-' || lpad((i % 100)::text, 4, '0'), '{whale_channel}',
        CASE i % 4 WHEN 0 THEN 'LOW'::"TicketPriority" WHEN 1 THEN 'MEDIUM'::"TicketPriority"
                   WHEN 2 THEN 'HIGH'::"TicketPriority" ELSE 'CRITICAL'::"TicketPriority" END,
        'whale-xyne-' || lpad(i::text, 5, '0'),
        '{whale_project}', '{whale_ws}', '{whale_board}',
        CASE i % 5 WHEN 0 THEN 'Todo' WHEN 1 THEN 'In Progress' WHEN 2 THEN 'Review'
                   WHEN 3 THEN 'Done' ELSE 'Backlog' END,
-       false, false, now() - (i || ' second')::interval,
+       false, false, now(), now() - (i || ' second')::interval,
        now() - (i || ' second')::interval, now()
 FROM generate_series(0, 14999) i
 ON CONFLICT DO NOTHING;

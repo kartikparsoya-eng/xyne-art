@@ -551,9 +551,9 @@ async def sc_stall_then_resume(ctx: Ctx) -> dict:
         # Stall: don't pump for 45s (no credit granted)
         await asyncio.sleep(45)
         # Check socket is still alive
-        if s.ws.closed:
+        if s.closed_reason:
             return result(name, "FAIL", expect,
-                          "socket closed during 45s stall — idle-timeout fired too early")
+                          f"socket closed during 45s stall — idle-timeout fired too early: {s.closed_reason[:80]}")
         # Resume: pump to drain any buffered data
         got = await s.pump_until(lambda x: x.got_hashes, 15)
         if s.errors:

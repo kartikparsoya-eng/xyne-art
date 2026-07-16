@@ -163,14 +163,16 @@ fi
 if [ "$BOOTSTRAP" = "1" ]; then
   ART_NAME="${OVERRIDE_CONTAINER:-xyne-sandbox-rust-test-zero-cache-art}"
   echo "[ART] bootstrapping container: $ART_NAME"
-  docker stop "$ART_NAME" 2>/dev/null; docker rm "$ART_NAME" 2>/dev/null
+  docker stop "$ART_NAME" 2>/dev/null || true; docker rm "$ART_NAME" 2>/dev/null || true
   CPU_FLAGS=""
   [ -n "$CPUS" ] && CPU_FLAGS="--cpus=$CPUS"
   MEM_FLAGS=""
   [ -n "$MEMORY" ] && MEM_FLAGS="--memory=$MEMORY"
   # Copy auth secrets from the TS mirror container
-  AUTH_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_AUTH_SECRET 2>/dev/null)
-  ZERO_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_SECRET 2>/dev/null)
+  AUTH_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_AUTH_SECRET 2>/dev/null || true)
+  ZERO_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_SECRET 2>/dev/null || true)
+  # ZERO_SECRET not always set — fall back to ZERO_AUTH_SECRET (same value in sandbox)
+  [ -z "$ZERO_SECRET" ] && ZERO_SECRET="$AUTH_SECRET"
   PPROF_PORT="${OVERRIDE_PPROF_PORT:-6061}"
   docker run -d \
     --name "$ART_NAME" \
@@ -613,11 +615,11 @@ if [ "$TS_BASELINE" = "1" ]; then
   TS_RUN_REPORT="$(ls -t reports/run-*.json | head -1)"
   TS_RES_SUMMARY="reports/resources-$TS_TAG.summary.json"
   if [ -f "$TS_RUN_REPORT" ]; then
-    # Bless the TS baseline (stamps config_hash so it self-invalidates on change)
+    # Bless the TS baseline into local-baseline.json (stamps config_hash so it self-invalidates on change)
     set +e
     "$PY" tools/local_gate.py --run "$TS_RUN_REPORT" \
       --resources "$TS_RES_SUMMARY" \
-      --update-baseline --baseline "reports/ts-baseline.json"
+      --update-baseline --baseline "reports/local-baseline.json"
     set -e
     TS_BASELINE_REPORT="$TS_RUN_REPORT"
     echo "======== TS BASELINE BLESSED → running Go candidate ========"
