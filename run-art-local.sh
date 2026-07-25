@@ -193,6 +193,7 @@ if [ "$BOOTSTRAP" = "1" ]; then
     -e GO_IVM_HYDRATE_READERS=8 \
     -e ZERO_NUM_SYNC_WORKERS=4 \
     -e GO_IVM_HYDRATE_CHUNK_SIZE=500 \
+    -e GO_IVM_STEP_ROWS_SHIM=1 \
     -v zero_cache_art_rust_test:/var/zero \
     -l "traefik.enable=true" \
     -l "traefik.http.routers.zero-art.rule=Host(\`rust-test.localhost\`) && PathPrefix(\`/zero-art\`)" \
@@ -718,7 +719,7 @@ if [ "$ORACLE" = "1" ]; then
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
     --id-pool "$POOL" --client-schema "$CSCHEMA" \
     --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
-    --pairs 3 --duration 45 --quiesce-s 20 \
+    --pairs 3 --duration 90 --quiesce-s 120 \
     ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${ORACLE_MUTFLAGS[@]+"${ORACLE_MUTFLAGS[@]}"} \
     --out "$ORACLE_REPORT"
   set -e

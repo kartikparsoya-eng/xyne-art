@@ -264,6 +264,18 @@ SIG_NUM_RE = re.compile(r"\b\d+\b")  # standalone numbers
 SIG_DUR_RE = re.compile(r"\d+(?:\.\d+)?(?:ms|s|m|µs|ns|h)")  # durations
 SIG_CG_RE = re.compile(r"cg=[^\s]+")  # client group IDs
 SIG_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+# Structured-log field normalization (JSON key:value pairs with dynamic IDs)
+SIG_FIELD_RES = [
+    re.compile(r'\"clientGroupID\":\"[^"]+\"'),
+    re.compile(r'\"instance\":\"[^"]+\"'),
+    re.compile(r'\"lock\":\"[^"]+\"'),
+    re.compile(r'\"clientID\":\"[^"]+\"'),
+    re.compile(r'\"wsID\":\"[^"]+\"'),
+    re.compile(r'\"stateVersion\":\"[^"]+\"'),
+    re.compile(r'\"hash\":\"[^"]+\"'),
+    re.compile(r'\"queryHash\":\"[^"]+\"'),
+    re.compile(r'\"transformationHash\":\"[^"]+\"'),
+]
 SIG_BASELINE_PATH = os.path.join(os.path.dirname(__file__), "..", "reports",
                                  "log-signatures-baseline.json")
 
@@ -273,6 +285,8 @@ def normalize_signature(line: str) -> str:
     s = line.strip()
     s = SIG_UUID_RE.sub("*", s)
     s = SIG_CG_RE.sub("cg=*", s)
+    for rx in SIG_FIELD_RES:
+        s = rx.sub(lambda m: m.group(0).split(":")[0] + ':"*"', s)
     s = SIG_DUR_RE.sub("*", s)
     s = SIG_ID_RE.sub("*", s)
     s = SIG_NUM_RE.sub("*", s)

@@ -95,6 +95,7 @@ class Materializer:
         self.table_row_count: dict[str, int] = {}        # table -> total rows seen
         self.zero_result_tables: set[str] = set()         # tables that got 0 rows
         self.streaming_queries: set[str] = set()         # queries still streaming at quiesce
+        self.row_query: dict[tuple, set] = {}            # (table, key) -> {query_name} that emitted it
 
     def _key(self, table: str, obj: dict) -> str:
         pk = self.pks.get(table)
@@ -105,6 +106,10 @@ class Materializer:
     def apply_rows_patch(self, patch: list, got_hashes: list = None,
                          poke_start_time: float = None) -> None:
         tables_in_this_poke: set[str] = set()
+        # queries active in THIS poke (for per-row attribution)
+        poke_qnames = {self.hash_query.get(gh.get("hash")) for gh in (got_hashes or [])
+                       if isinstance(gh, dict) and gh.get("op") == "put"}
+        poke_qnames.discard(None)
         for op in patch or []:
             if not isinstance(op, dict):
                 continue
@@ -114,7 +119,10 @@ class Materializer:
             rows = self.state.setdefault(table, {})
             if kind == "put":
                 val = op.get("value") or {}
-                rows[self._key(table, val)] = val
+                k = self._key(table, val)
+                rows[k] = val
+                if poke_qnames:
+                    self.row_query.setdefault((table, k), set()).update(poke_qnames)
                 self.rows_applied += 1
                 self.table_row_count[table] = self.table_row_count.get(table, 0) + 1
             elif kind == "update":
@@ -180,7 +188,15 @@ def diff_states(a: Materializer, b: Materializer, max_examples: int = 3) -> dict
         # sample rows: only_mirror
         for k in only_b[:max_examples]:
             examples.append({"table": table, "kind": "only_mirror", "key": k,
-                             "primary": None, "mirror": rb[k]})
+                             "primary": None, "mirror": rb[k],
+                             "mirror_query": sorted(b.row_query.get((table, k), set())),
+                             "primary_query": sorted(a.row_query.get((table, k), set()))})
+        # ALL only_mirror rows with their emitting query (targeted attribution)
+        if only_b:
+            import sys as _sys
+            for k in only_b:
+                mq = sorted(b.row_query.get((table, k), set()))
+                print(f"[attrib] only_mirror {table} {k} <- mirror_query={mq}", file=_sys.stderr)
         # sample rows: value_mismatch + column-level diff
         for k in differ[:max_examples]:
             prow, mrow = ra[k], rb[k]

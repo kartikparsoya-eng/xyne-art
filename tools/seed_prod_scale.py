@@ -35,7 +35,7 @@ import argparse
 import subprocess
 import sys
 
-WS = "cmr1unwn2002s6p43dmi2ygla"  # bulk-seeded workspace
+WS = "cmrvpyw4f0002bbpbeu7nnpcr"  # sandbox Test Workspace
 
 
 def psql(a, sql: str) -> str:
@@ -226,11 +226,12 @@ ON CONFLICT DO NOTHING;
     # 9. Activities (scale to 20000)
     n_act = int(20000 * n)
     run_sql(a, f"activities ({n_act})", f"""
-INSERT INTO public.activities (id, "userId", "actorAction", "actionSource",
+INSERT INTO public.activities (id, "userId", "workspaceId", "actorAction", "actionSource",
   "actionSourceId", "actorId", classification, "isRead",
   "createdAt", "updatedAt", "conversationId", "channelId", "messageId", "ticketId")
 SELECT 'artscale-act-' || lpad(i::text, 5, '0'),
        (ARRAY[{','.join(f"'{uid}'" for uid in all_user_ids[:200])}])[(i % {min(len(all_user_ids), 200)}) + 1],
+       '{WS}',
        'mentioned you', 'mention', 'src-' || i,
        (ARRAY[{','.join(f"'{uid}'" for uid in all_user_ids[:200])}])[(i % {min(len(all_user_ids), 200)}) + 1],
        CASE i % 4 WHEN 0 THEN 'ACTIONABLE'::"ActivityClassification" WHEN 1 THEN 'FYI'::"ActivityClassification"
