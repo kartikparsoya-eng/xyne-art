@@ -332,8 +332,17 @@ fi
 
 if [ "$CLEAN" = "1" ]; then
   echo "== purging art-% CVR rows (both pods) + restarting primary =="
-  psql_q "DELETE FROM \"sandbox_${SLUG}_0/cvr\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
-  psql_q "DELETE FROM \"sandbox_${SLUG}_ts_0/cvr\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+  # Delete in FK-dependency order: desires → queries → clients → rows → rowsVersion → instances.
+  # Deleting from instances alone fails silently (FK constraints from queries/clients
+  # block it), leaving stale CVR rows that cause stateVersion mismatches on reconnect.
+  for _schema in "sandbox_${SLUG}_0/cvr" "sandbox_${SLUG}_ts_0/cvr"; do
+    psql_q "DELETE FROM \"$_schema\".desires    WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+    psql_q "DELETE FROM \"$_schema\".queries    WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+    psql_q "DELETE FROM \"$_schema\".clients    WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+    psql_q "DELETE FROM \"$_schema\".rows       WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+    psql_q "DELETE FROM \"$_schema\".\"rowsVersion\" WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+    psql_q "DELETE FROM \"$_schema\".instances  WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+  done
   docker restart "$ZCACHE" >/dev/null
   for _ in $(seq 1 45); do
     ST="$(docker inspect -f '{{.State.Health.Status}}' "$ZCACHE" 2>/dev/null || echo none)"
@@ -719,7 +728,7 @@ if [ "$ORACLE" = "1" ]; then
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
     --id-pool "$POOL" --client-schema "$CSCHEMA" \
     --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
-    --pairs 3 --duration 90 --quiesce-s 120 \
+    --pairs 3 --duration 90 --quiesce-s 180 \
     ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${ORACLE_MUTFLAGS[@]+"${ORACLE_MUTFLAGS[@]}"} \
     --out "$ORACLE_REPORT"
   set -e

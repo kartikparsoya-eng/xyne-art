@@ -301,8 +301,14 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
             stats.resumes += 1
 
         # websockets renamed extra_headers -> additional_headers around v12.
+        # compression=None: the zero-cache ws server uses noServer:true without
+        # perMessageDeflate, so it never negotiates the extension. websockets v16
+        # enables permessage-deflate by default; if the client sends compressed
+        # frames (RSV1 set) to a server that didn't agree, the server rejects
+        # them with WS_ERR_UNEXPECTED_RSV_1. Disabling compression avoids this.
         connect_kwargs: dict[str, Any] = {"subprotocols": [sec], "open_timeout": 20,
-                                          "max_size": None, "ping_interval": None}
+                                          "max_size": None, "ping_interval": None,
+                                          "compression": None}
         try:
             connect_kwargs["additional_headers"] = headers or None
             conn = websockets.connect(url, **connect_kwargs)

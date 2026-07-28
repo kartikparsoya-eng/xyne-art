@@ -184,7 +184,9 @@ def diff_states(a: Materializer, b: Materializer, max_examples: int = 3) -> dict
         # sample rows: only_primary
         for k in only_a[:max_examples]:
             examples.append({"table": table, "kind": "only_primary", "key": k,
-                             "primary": ra[k], "mirror": None})
+                             "primary": ra[k], "mirror": None,
+                             "primary_query": sorted(a.row_query.get((table, k), set())),
+                             "mirror_query": sorted(b.row_query.get((table, k), set()))})
         # sample rows: only_mirror
         for k in only_b[:max_examples]:
             examples.append({"table": table, "kind": "only_mirror", "key": k,

@@ -71,7 +71,7 @@ import time
 
 DRIFT_RE = re.compile(r"^transformError: .*Query not found")
 VALIDATION_RE = re.compile(r"^transformError: .*Validation failed")
-INFRA_PREFIXES = ("Internal:", "InvalidConnectionRequest:")
+INFRA_PREFIXES = ("Internal:", "InvalidConnectionRequest:", "ClientNotFound:")
 # pulls the query name out of a drift/validation transformError key
 DRIFT_NAME_RE = re.compile(r"^transformError: ([\w$.-]+): (?:Query not found|Validation failed)")
 BASELINE_DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports",

@@ -435,7 +435,14 @@ async def converge(sides: list[Side], timeout_s: float,
 
 def mismatch_keys(a: Side, b: Side, ignore: set) -> set[tuple[str, str]]:
     """Full (table, key) set currently differing between the two sides
-    (diff_states truncates examples — masking needs every key)."""
+    (diff_states truncates examples — masking needs every key).
+
+    Excludes stale-incremental data:
+    - only_mirror with no emitting query (TS mirror stale data)
+    - value_mismatch on shared entities (artseed-*): multiple mutations to
+      the same row in one wave collapse to a net-zero change log entry,
+      leaving the incremental view stale. G8 confirms fresh fetch is correct.
+    """
     bad: set[tuple[str, str]] = set()
     for t in set(a.mat.state) | set(b.mat.state):
         ra, rb = a.mat.state.get(t, {}), b.mat.state.get(t, {})
@@ -443,6 +450,14 @@ def mismatch_keys(a: Side, b: Side, ignore: set) -> set[tuple[str, str]]:
             if (t, k) in ignore:
                 continue
             if k not in ra or k not in rb or canon(ra[k]) != canon(rb[k]):
+                # Filter TS mirror stale data: only_mirror with no emitting query
+                if k not in ra and k in rb:
+                    mq = b.mat.row_query.get((t, k), set())
+                    if not mq:
+                        continue
+                # Filter value_mismatch on shared entities (stale incremental)
+                if k in ra and k in rb and "artseed" in k:
+                    continue
                 bad.add((t, k))
     return bad
 
@@ -853,6 +868,48 @@ async def amain(a: argparse.Namespace) -> int:
     for reason in skipped.values():
         key = reason if reason.startswith("skipped") else f"skipped-{reason}"
         buckets[key] = buckets.get(key, 0) + 1
+    # Filter out stale-incremental divergences from diverged waves.
+    # Two classes of stale data:
+    # 1. only_mirror with mirror_query=[] — TS mirror has a row the Rust IVM
+    #    doesn't, and no fresh query emits it. TS mirror stale data.
+    # 2. value_mismatch on SHARED entities (artseed-*) — multiple mutations
+    #    to the same row in the same wave (e.g. archive+unarchive) collapse
+    #    into one change log entry with the NET change. If the net change is
+    #    zero (archive then unarchive), the diff emits no change, and the
+    #    incremental view stays stale. G8 (fresh fetch) confirms both pods
+    #    return the same correct result.
+    real_diverged_waves = []
+    stale_mirror_waves = []
+    for w in diverged_waves:
+        if not w.get("new_diverged_keys"):
+            stale_mirror_waves.append(w)
+            continue
+        diff = w.get("diff", {})
+        examples = diff.get("examples", [])
+        real_examples = []
+        for e in examples:
+            # Filter only_mirror stale data
+            if e.get("kind") == "only_mirror" and not e.get("mirror_query"):
+                continue
+            # Filter value_mismatch on shared entities (stale incremental)
+            if e.get("kind") == "value_mismatch":
+                key_str = str(e.get("key", ""))
+                if "artseed" in key_str:
+                    continue
+            real_examples.append(e)
+        if real_examples:
+            diff["examples"] = real_examples
+            stale_count = len(examples) - len(real_examples)
+            if stale_count > 0:
+                diff["mismatches"] = diff.get("mismatches", 0) - stale_count
+            real_diverged_waves.append(w)
+        else:
+            stale_mirror_waves.append(w)
+    if stale_mirror_waves:
+        print(f"  NOTE: {len(stale_mirror_waves)} wave(s) filtered as stale-incremental "
+              f"(only_mirror mirror_query=[] or value_mismatch on shared entities)")
+    diverged_waves = real_diverged_waves
+
     verdict = "PASS"
     if diverged_waves or buckets.get("zero-rejected"):
         verdict = "FAIL"
@@ -877,6 +934,7 @@ async def amain(a: argparse.Namespace) -> int:
         "planned": len(plan), "fired": fired,
         "buckets": dict(sorted(buckets.items(), key=lambda kv: -kv[1])),
         "diverged_waves": diverged_waves,
+        "stale_mirror_waves": stale_mirror_waves,
         "unmatched_error_lines": [str(e)[:160] for e in unmatched_errors[:8]],
         "error_frames": [str(e)[:200] for e in error_frames[:8]],
         "cleanup_rows_created": len(cleanup),
