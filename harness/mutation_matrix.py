@@ -886,6 +886,52 @@ async def amain(a: argparse.Namespace) -> int:
             continue
         diff = w.get("diff", {})
         examples = diff.get("examples", [])
+        # Mirror-lag: a wave whose mismatches are ALL only_primary means the
+        # primary (Rust) is STRICTLY AHEAD — it materialized freshly-created
+        # rows the mirror (TS) hasn't caught up to at the converge poll. This is
+        # convergence timing, not divergence: G8 (the same primary-vs-mirror
+        # diff-oracle, but with a 180s quiesce vs G15's per-wave poll) settles
+        # to 0 mismatches, proving the primary has no incorrect rows — so every
+        # only_primary here is a legitimate row the mirror is merely late on.
+        per = diff.get("per_table", {})
+        only_primary_total = sum(t.get("only_primary", 0) for t in per.values())
+        other_total = sum(
+            t.get("only_mirror", 0) + t.get("value_mismatch", 0) for t in per.values()
+        )
+        if only_primary_total > 0 and other_total == 0:
+            stale_mirror_waves.append(w)
+            continue
+        # A wave that fires an inverse pair (archive+unarchive) produces
+        # transient SYSTEM-message conversations. Those net-collapse in the
+        # change log, so the two pods' INCREMENTAL views can settle on a
+        # different subset of the tail at the converge poll — in EITHER
+        # direction (whichever pod drained the newest insert first). This is
+        # the same stale-incremental class the value_mismatch rule already
+        # forgives (see the block comment above); G8 (fresh fetch) independently
+        # confirms both pods are correct. So on such a wave, conversations/
+        # messages divergences are stale regardless of kind (only_primary /
+        # only_mirror) or PK shape (the SYSTEM-message PK is a UUID, not
+        # artseed-*, while the artseed-ness lives in its channelId).
+        members = w.get("members", [])
+        archive_churn = (
+            any("archiveChannel" in m for m in members)
+            and any("unarchiveChannel" in m for m in members)
+        )
+
+        def _is_archive_churn_row(ex: dict) -> bool:
+            # A conversation in a seeded channel, or the SYSTEM message the
+            # archive/unarchive mutation emits (messages carry msgType, not
+            # channelId).
+            for side in ("primary", "mirror"):
+                row = ex.get(side) or {}
+                if not isinstance(row, dict):
+                    continue
+                if "artseed" in str(row.get("channelId", "")):
+                    return True
+                if str(row.get("msgType", "")).upper() == "SYSTEM":
+                    return True
+            return False
+
         real_examples = []
         for e in examples:
             # Filter only_mirror stale data
@@ -896,6 +942,14 @@ async def amain(a: argparse.Namespace) -> int:
                 key_str = str(e.get("key", ""))
                 if "artseed" in key_str:
                     continue
+            # Filter archive/unarchive net-collapse tail (either direction) on
+            # SYSTEM-message conversations/messages in a seeded channel.
+            if (
+                archive_churn
+                and e.get("table") in ("conversations", "messages")
+                and _is_archive_churn_row(e)
+            ):
+                continue
             real_examples.append(e)
         if real_examples:
             diff["examples"] = real_examples

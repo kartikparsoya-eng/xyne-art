@@ -56,7 +56,7 @@ IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=0; 
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 PLANNER_FLAG=""
-OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""
+OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""; OVERRIDE_MIRROR=""
 CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -65,6 +65,7 @@ while [ $# -gt 0 ]; do
     --container) OVERRIDE_CONTAINER="$2"; shift 2;;
     --pprof-port) OVERRIDE_PPROF_PORT="$2"; shift 2;;
     --cvr-schema) OVERRIDE_CVR_SCHEMA="$2"; shift 2;;
+    --mirror) OVERRIDE_MIRROR="$2"; shift 2;;
     --connections) CONNS="$2"; CONNS_SET=1; shift 2;;
     --working-set) WORKING_SET="$2"; WS_SET=1; shift 2;;
     --churn-ms) CHURN_MS="$2"; CHURN_SET=1; shift 2;;
@@ -254,6 +255,7 @@ MIRROR_URL="ws://${SANDBOX}.localhost/zero-ts"
 [ -n "$OVERRIDE_TARGET" ] && TARGET="$OVERRIDE_TARGET"
 [ -n "$OVERRIDE_CONTAINER" ] && ZCACHE="$OVERRIDE_CONTAINER"
 [ -n "$OVERRIDE_CVR_SCHEMA" ] && CVR_SCHEMA="$OVERRIDE_CVR_SCHEMA"
+[ -n "$OVERRIDE_MIRROR" ] && MIRROR_URL="$OVERRIDE_MIRROR"
 PPROF_FLAGS=()
 if [ -n "$OVERRIDE_PPROF_PORT" ]; then
   PPROF_FLAGS=(--pprof "http://localhost:$OVERRIDE_PPROF_PORT")
@@ -728,7 +730,7 @@ if [ "$ORACLE" = "1" ]; then
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
     --id-pool "$POOL" --client-schema "$CSCHEMA" \
     --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
-    --pairs 3 --duration 90 --quiesce-s 180 \
+    --pairs 3 --duration 90 --quiesce-s 180 --quiesce-max-s 300 \
     ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${ORACLE_MUTFLAGS[@]+"${ORACLE_MUTFLAGS[@]}"} \
     --out "$ORACLE_REPORT"
   set -e

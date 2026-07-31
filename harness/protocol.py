@@ -18,7 +18,7 @@ import urllib.parse
 from typing import Optional
 
 # Current mono protocol version (packages/zero-protocol/src/protocol-version.ts).
-DEFAULT_PROTOCOL_VERSION = 49
+DEFAULT_PROTOCOL_VERSION = 51
 
 
 def encode_sec_protocols(init_connection_message: Optional[list],
