@@ -26,3 +26,4 @@ __pycache__/
 *.pyc
 .DS_Store
 .playwright-mcp/
+go-ivm-sidecar-darwin-arm64
