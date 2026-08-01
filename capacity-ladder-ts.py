@@ -171,10 +171,13 @@ def run_art_step(cgs, duration):
 
     existing = set((ART_DIR / "reports").glob("run-*.json"))
 
+    # --container pins the resource sampler to the TS container. Without it,
+    # run-art-local.sh defaults ZCACHE to the rust container and samples the
+    # idle rust process instead of the TS engine under test (bogus CPU/RSS).
     cmd = (
         f"cd {ART_DIR} && ./run-art-local.sh "
         f"--connections {cgs} --duration {duration} "
-        f"--target {TARGET} --users 3"
+        f"--target {TARGET} --container {CONTAINER} --users 3"
     )
     r = run(cmd, check=False, timeout=duration + 120)
 
@@ -313,12 +316,22 @@ def main():
     except KeyboardInterrupt:
         print("\n  Interrupted by user")
     finally:
+        # Cleanup must never crash the run, or the results table/JSON below is
+        # lost (a failed post-restore restart would mask a good ladder).
         if not args.no_restore:
             print("\n--- Cleanup ---")
-            restore_override()
-            print("  Restarting with original config...")
-            run(f"cd {SANDBOX_DIR} && docker compose up -d zero-cache-ts", timeout=60)
-            wait_healthy()
+            try:
+                restore_override()
+                print("  Restarting with original config...")
+                r = run(f"cd {SANDBOX_DIR} && docker compose up -d zero-cache-ts",
+                        timeout=60, check=False)
+                if r.returncode != 0:
+                    print(f"  NOTE: post-restore restart failed (rc={r.returncode}); "
+                          f"the TS container from the ladder run is left in place.")
+                else:
+                    wait_healthy()
+            except Exception as e:  # noqa: BLE001 — cleanup must never crash results
+                print(f"  NOTE: cleanup hit {type(e).__name__}: {e}")
 
     if results:
         print_table(results, args.cpus, args.sync_workers)

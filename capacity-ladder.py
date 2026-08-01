@@ -189,10 +189,13 @@ def run_art_step(cgs, duration):
     # Count existing reports so we can detect the new one
     existing = set((ART_DIR / "reports").glob("run-*.json"))
 
+    # --container pins the resource sampler to the engine under test. Without it
+    # run-art-local.sh defaults ZCACHE to the rust container, so a TS run (or any
+    # non-default target) would sample the wrong (idle) container — bogus CPU/RSS.
     cmd = (
         f"cd {ART_DIR} && ./run-art-local.sh "
         f"--connections {cgs} --duration {duration} "
-        f"--target {TARGET} --users 3"
+        f"--target {TARGET} --container {CONTAINER} --users 3"
     )
     r = run(cmd, check=False, timeout=duration + 120)
 
