@@ -57,7 +57,7 @@ PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 PLANNER_FLAG=""
 OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""; OVERRIDE_MIRROR=""
-CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0
+CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0; FULLCATALOG=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
@@ -93,6 +93,7 @@ while [ $# -gt 0 ]; do
     --ceiling) LANE="ceiling"; shift;;
     --ts-baseline) TS_BASELINE=1; CLEAN=1; shift;;
     --oracle) ORACLE=1; shift;;
+    --full-catalog) ORACLE=1; FULLCATALOG=1; shift;;
     --chaos) CHAOS=1; LIFECYCLE=1; shift;;
     --negative) NEGATIVE=1; shift;;
     --mutation-matrix) MUTMATRIX=1; shift;;
@@ -724,13 +725,23 @@ if [ "$ORACLE" = "1" ]; then
     ORACLE_MUTFLAGS=(--enable-mutations --i-know-this-writes)
   fi
   ORACLE_REPORT="reports/diff-$TAG.json"
-  echo "== differential oracle (G8) =="
+  # full-catalog mode subscribes EVERY resolvable query once (no churn) so all
+  # ~151 shapes get differential coverage + two-sided hydration-parity checking;
+  # 1 pair is enough (it's the whole catalog) and no duration/churn is needed.
+  ORACLE_PAIRS=3; ORACLE_DURATION=90; ORACLE_QUIESCE=180
+  ORACLE_FULLCAT=()
+  if [ "$FULLCATALOG" = "1" ]; then
+    ORACLE_FULLCAT=(--full-catalog); ORACLE_PAIRS=1; ORACLE_DURATION=5; ORACLE_QUIESCE=45
+  fi
+  echo "== differential oracle (G8)${FULLCATALOG:+ [full-catalog]} =="
   set +e
   "$PY" harness/diff_oracle.py --primary "$TARGET" \
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
     --id-pool "$POOL" --client-schema "$CSCHEMA" \
     --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
-    --pairs 3 --duration 90 --quiesce-s 180 --quiesce-max-s 300 \
+    --pairs "$ORACLE_PAIRS" --duration "$ORACLE_DURATION" \
+    --quiesce-s "$ORACLE_QUIESCE" --quiesce-max-s 300 \
+    ${ORACLE_FULLCAT[@]+"${ORACLE_FULLCAT[@]}"} \
     ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${ORACLE_MUTFLAGS[@]+"${ORACLE_MUTFLAGS[@]}"} \
     --out "$ORACLE_REPORT"
   set -e

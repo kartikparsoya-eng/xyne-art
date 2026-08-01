@@ -314,17 +314,43 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
 
     # ONE set of initial puts, sent to BOTH sides.
     initial_puts = []
-    for _ in range(a.working_set):
-        for _ in range(10):
-            op = sampler.sample()
+    if getattr(a, "full_catalog", False):
+        # FULL-CATALOG SWEEP: subscribe EVERY resolvable query in the catalog
+        # (deduped by name) so all ~151 query SHAPES get differential coverage,
+        # not just a weighted working-set sample (~10) that leaves half the
+        # catalog never compared rust-vs-TS. No churn — hydrate all, then diff.
+        unresolved: list[str] = []
+        seen: set[str] = set()
+        for op in baseline.queries:
+            if op.name in seen:
+                continue
+            seen.add(op.name)
             args, ok = resolver.resolve(op)
-            if ok:
-                break
-        put = query_put(op.name, args, ttl_ms=300_000)
-        initial_puts.append(put)
-        # wire hash->query name for query->table attribution (#3)
+            if not ok:
+                unresolved.append(op.name)
+                continue
+            put = query_put(op.name, args, ttl_ms=300_000)
+            initial_puts.append(put)
+            for s in sides:
+                s.mat.hash_query[put["hash"]] = op.name
         for s in sides:
-            s.mat.hash_query[put["hash"]] = op.name
+            s.mat.unresolved = unresolved
+        if unresolved:
+            print(f"  [full-catalog] {len(initial_puts)} queries subscribed, "
+                  f"{len(unresolved)} unresolvable (no id-pool args): "
+                  f"{unresolved[:10]}")
+    else:
+        for _ in range(a.working_set):
+            for _ in range(10):
+                op = sampler.sample()
+                args, ok = resolver.resolve(op)
+                if ok:
+                    break
+            put = query_put(op.name, args, ttl_ms=300_000)
+            initial_puts.append(put)
+            # wire hash->query name for query->table attribution (#3)
+            for s in sides:
+                s.mat.hash_query[put["hash"]] = op.name
 
     extra = [tuple(p.split("=", 1)) for p in (a.extra_param or [])]
     init_msg = init_connection_message(initial_puts, client_schema=cschema)
@@ -387,7 +413,9 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
             await asyncio.sleep(interval)
 
     mut_task = asyncio.create_task(mutator())
-    while time.perf_counter() < t_end:
+    # full-catalog mode never churns the desired set — it subscribes everything
+    # once and relies on the quiesce loop below to wait for all to hydrate.
+    while not getattr(a, "full_catalog", False) and time.perf_counter() < t_end:
         await asyncio.sleep(a.churn_ms / 1000.0)
         patch = []
         if len(active) >= a.working_set:
@@ -443,6 +471,19 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
             pass
 
     d = diff_states(sides[0].mat, sides[1].mat)
+    # Two-sided HYDRATION PARITY: a query desired on both sides that hydrated
+    # (received a gotQueriesPatch {op:put}) on ONE side but NOT the other is a
+    # delivery divergence — the exact "silent delivery bug" shape that G9 can
+    # only WATCH single-sided (rust-only). Here it is DIFFERENTIAL and gated:
+    # identical desired-query traffic to two caches over the same DB MUST
+    # hydrate the same set of queries. A query that TS acks but rust never does
+    # (or vice-versa) is a real bug even if the rows it would carry are absent.
+    def _hydrated_names(mat: Materializer) -> set:
+        return {mat.hash_query.get(h) for h in mat.got_hashes} - {None}
+    prim_hyd = _hydrated_names(sides[0].mat)
+    mirr_hyd = _hydrated_names(sides[1].mat)
+    only_primary_hydrated = sorted(prim_hyd - mirr_hyd)
+    only_mirror_hydrated = sorted(mirr_hyd - prim_hyd)
     # build query->table attribution for mismatched tables (#3)
     mismatch_tables = set(d.get("per_table", {}).keys())
     query_attribution = {}
@@ -477,6 +518,11 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
                    "unknown_ops": sides[1].mat.unknown_ops,
                    "query_latency": _lat_summary(sides[1].mat.query_latency)},
         "got_hash_diff": len(sides[0].mat.got_hashes ^ sides[1].mat.got_hashes),
+        "only_primary_hydrated": only_primary_hydrated,
+        "only_mirror_hydrated": only_mirror_hydrated,
+        "hydration_parity_gap": len(only_primary_hydrated) + len(only_mirror_hydrated),
+        "catalog_driven": len(prim_hyd | mirr_hyd),
+        "catalog_unresolved": sorted(getattr(sides[0].mat, "unresolved", []) or []),
         "mutations_sent": muts["sent"],
         "mutations_acked": sides[0].lmid_acked,
         "quiesced": quiesced,
@@ -544,14 +590,30 @@ async def amain(a: argparse.Namespace) -> int:
 
     total_mismatch = sum(r.get("mismatches", 0) for r in results)
     conn_errors = [r for r in results if "error" in r]
+    # aggregate two-sided hydration-parity gap across pairs (self-diff is
+    # exempt: both sockets hit the same server so parity is trivially 0, and a
+    # non-zero value there would be a harness bug not an engine divergence)
+    self_diff = not a.mirror or a.mirror == a.primary
+    total_hydration_gap = 0 if self_diff else sum(
+        r.get("hydration_parity_gap", 0) for r in results)
+    only_primary_hydrated = sorted({q for r in results
+                                    for q in r.get("only_primary_hydrated", [])})
+    only_mirror_hydrated = sorted({q for r in results
+                                   for q in r.get("only_mirror_hydrated", [])})
     out = {
         "primary": a.primary, "mirror": a.mirror or a.primary,
-        "self_diff": not a.mirror or a.mirror == a.primary,
+        "self_diff": self_diff,
+        "full_catalog": bool(getattr(a, "full_catalog", False)),
         "pairs": a.pairs, "duration_s": a.duration, "quiesce_s": a.quiesce_s,
         "mutations": bool(a.enable_mutations),
         "mutations_sent": sum(r.get("mutations_sent", 0) for r in results),
         "mutations_acked": sum(r.get("mutations_acked", 0) for r in results),
         "total_mismatches": total_mismatch,
+        "hydration_parity_gap": total_hydration_gap,
+        "only_primary_hydrated": only_primary_hydrated,
+        "only_mirror_hydrated": only_mirror_hydrated,
+        "catalog_driven": max((r.get("catalog_driven", 0) for r in results),
+                              default=0),
         "connect_errors": len(conn_errors),
         "results": results,
     }
@@ -605,9 +667,25 @@ async def amain(a: argparse.Namespace) -> int:
             sq = r.get("streaming_at_quiesce", [])
             if sq:
                 print(f"    QUIESCE FAIL: {len(sq)} queries still streaming: {sq[:8]}")
-    verdict = "PASS" if total_mismatch == 0 and not conn_errors else "FAIL"
+    # DIFFERENTIAL hydration-parity failure: a query hydrated on exactly one
+    # side. Print loudly with the offending query names so it can be chased.
+    if total_hydration_gap:
+        if only_primary_hydrated:
+            print(f"  HYDRATION PARITY: {len(only_primary_hydrated)} quer(ies) "
+                  f"hydrated on PRIMARY(rust) but NOT MIRROR(ts): "
+                  f"{only_primary_hydrated[:12]}")
+        if only_mirror_hydrated:
+            print(f"  HYDRATION PARITY: {len(only_mirror_hydrated)} quer(ies) "
+                  f"hydrated on MIRROR(ts) but NOT PRIMARY(rust) — possible "
+                  f"rust delivery bug: {only_mirror_hydrated[:12]}")
+    verdict = ("PASS" if total_mismatch == 0 and not conn_errors
+               and total_hydration_gap == 0 else "FAIL")
     print(f"{mode} ORACLE: {verdict} ({total_mismatch} mismatches, "
-          f"{len(conn_errors)} connect errors) -> {a.out}")
+          f"{total_hydration_gap} hydration-parity gap, "
+          f"{len(conn_errors)} connect errors"
+          + (f", catalog_driven={out['catalog_driven']}"
+             if out.get('full_catalog') else "")
+          + f") -> {a.out}")
     return 0 if verdict == "PASS" else 1
 
 
@@ -634,6 +712,10 @@ def main() -> int:
     ap.add_argument("--quiesce-max-s", type=float, default=120.0,
                     help="hard cap on the quiesce wait (diff anyway + warn)")
     ap.add_argument("--zipf-s", type=float, default=0.0)
+    ap.add_argument("--full-catalog", action="store_true",
+                    help="subscribe EVERY resolvable catalog query on both sides "
+                         "(no churn) so all ~151 query shapes get differential "
+                         "coverage; bump --quiesce-max-s for the larger hydrate")
     ap.add_argument("--enable-mutations", action="store_true",
                     help="drive read-tracking writes on the primary socket "
                          "(replicates to both sides via the shared DB)")
