@@ -101,7 +101,13 @@ HARD_BLOCKING: list[tuple[str, str]] = [
     #     unknown-error allowlist below. (Kept in HARD_BLOCKING so they FAIL
     #     even when --unknown-errors is off.) ---
     ("cvr-version-not-bumped", r"Expected CVR version to have been bumped"),
-    ("diff-invalidated",       r"advance failed: Diff is no longer valid|Diff is no longer valid"),
+    # FATAL only: the napi-wrapped "advance failed:" teardown form that closes
+    # the client connection. Do NOT match the bare "Diff is no longer valid"
+    # text — since the stale-snapshot fix, that text also appears in the BENIGN
+    # INFO self-heal line ("resetting pipelines: Diff is no longer valid. prev
+    # db has advanced past X"), which is a recoverable rehydrate, not a teardown
+    # (counted in SELF_HEAL / resetting-pipelines below, rate-gated).
+    ("diff-invalidated",       r"advance failed: Diff is no longer valid"),
     ("missing-result-object",  r"Expected object at result"),
     ("bad-primary-key",        r"toPrimaryKeyString"),
 ]
