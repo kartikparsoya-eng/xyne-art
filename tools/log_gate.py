@@ -27,6 +27,20 @@ Scans `docker logs --since <run window>` of each container for:
   WATCH (thresholded):             Slow SQLite query spikes (count + max ms),
                                    generic ERROR-level volume
 
+  G13b INVERTED (--unknown-errors): every ERROR (and optionally WARN) line in
+                                   the window that is NOT allow-listed and NOT
+                                   an already-known blocking/self-heal signature
+                                   is an UNKNOWN_ERROR. This flips the gate from
+                                   "confirm known-good" to "surface unknowns" —
+                                   the class of bug (CVR-not-bumped, "Diff is no
+                                   longer valid", "Expected object at result")
+                                   that passed silently only because its
+                                   signature wasn't enumerated. mode: fail =
+                                   any unknown FAILs; warn (default) = WATCH;
+                                   off = skip. Those four known signatures are
+                                   now in HARD_BLOCKING (CONNECTION_FATAL) so
+                                   they FAIL hard regardless of this flag.
+
 Never mutates anything; exit 0 with a JSON report (2 on scan infra failure).
 local_gate.py consumes the report via --logs and folds it in as gate G13.
 """
@@ -80,6 +94,16 @@ HARD_BLOCKING: list[tuple[str, str]] = [
     # marker means the process died — that's a blocking FAIL if the pod
     # somehow survived (it shouldn't).
     ("go-wedge-fatal",      r"\[GO-IVM\]\[WEDGE-FATAL\]"),
+    # --- CONNECTION_FATAL: real prod bugs that slipped through the old
+    #     confirm-known-good model because their signatures weren't in any
+    #     list. Each corrupts the CVR / advance / result contract; a hit means
+    #     a client saw wrong or missing data. FAIL hard, regardless of the
+    #     unknown-error allowlist below. (Kept in HARD_BLOCKING so they FAIL
+    #     even when --unknown-errors is off.) ---
+    ("cvr-version-not-bumped", r"Expected CVR version to have been bumped"),
+    ("diff-invalidated",       r"advance failed: Diff is no longer valid|Diff is no longer valid"),
+    ("missing-result-object",  r"Expected object at result"),
+    ("bad-primary-key",        r"toPrimaryKeyString"),
 ]
 # Routine self-heal under load — the reference TS pod produces these too
 # (84/10min at 1x prod trace). Signal is the RATE, not the existence.
@@ -310,6 +334,84 @@ def scan_unknown_signatures(container: str, since: str) -> set:
     return sigs
 
 
+# --- Inverted gate (G13b): unrecognized ERROR/WARN => FAIL/WATCH ------------
+# The blocklist above answers "did a KNOWN-bad thing happen?". This flips the
+# model to "did an UNKNOWN thing happen?" — every ERROR (and WARN) line in the
+# window that is NOT explicitly allow-listed and NOT already a known
+# HARD_BLOCKING/SELF_HEAL signature is collected as an UNKNOWN_ERROR. Several
+# real prod bugs (CVR-not-bumped, "Diff is no longer valid", "Expected object
+# at result") passed silently under the old confirm-known-good model precisely
+# because their signatures weren't enumerated; this surfaces the next one
+# automatically. Unlike the baseline-diff detector below, this needs no blessed
+# baseline file to work.
+#
+# ALLOWLIST: known-benign / expected ERROR|WARN signatures (regex, matched
+# case-insensitively). Seeded from local_gate.py's excluded-drift strings
+# (Query not found / Validation failed / Internal: / InvalidConnectionRequest:
+# / ClientNotFound: / Rehome), the routine SELF_HEAL lines, and clearly-benign
+# operational lines (client disconnects, TTL/CVR purges). Keep this list SMALL,
+# explicit, and commented — every entry is a deliberate "this ERROR/WARN is not
+# a regression" decision.
+ALLOWLIST: list[tuple[str, str]] = [
+    # (label, regex) — mirrors local_gate.py DRIFT_RE / VALIDATION_RE /
+    # INFRA_PREFIXES / Rehome so the two gates agree on what is benign.
+    ("query-not-found",     r"Query not found"),          # sandbox build lacks a prod query (build drift)
+    ("validation-failed",   r"Validation failed"),        # synthetic workload data mismatch, not a server bug
+    ("internal-timeout",    r"\bInternal:\s"),            # infra blip / timeout
+    ("invalid-conn-req",    r"InvalidConnectionRequest"), # client sent a stale/rehomed connect request
+    ("client-not-found",    r"ClientNotFound"),           # client GC raced a late message
+    ("rehome-reconnect",    r"Rehome:? Reconnect required"), # operational reshuffle (--chaos), tracked in rehomes
+    # routine operational ERROR/WARN under load — not a fault:
+    ("client-disconnect",   r"client (disconnected|closed|gone)|websocket.*(closed|EOF)|connection reset by peer"),
+    ("ttl-purge",           r"(TTL|ttl).{0,20}(purge|expire|evict)|purging expired"),
+    ("cvr-gc",              r"(CVR|cvr).{0,20}(garbage.?collect|evict|purg)"),
+    ("context-canceled",    r"context canceled|context deadline exceeded"),  # client went away mid-request
+]
+
+
+def _known_labeled(line: str) -> str | None:
+    """Return a label if the line matches an already-known ALLOWLIST /
+    HARD_BLOCKING / SELF_HEAL signature, else None. Used to decide whether an
+    ERROR/WARN line is UNKNOWN (nothing recognizes it)."""
+    for label, pat in ALLOWLIST:
+        if re.search(pat, line, re.I):
+            return f"allow:{label}"
+    for label, pat in HARD_BLOCKING:
+        if re.search(pat, line, re.I):
+            return f"blocking:{label}"
+    for label, pat in SELF_HEAL:
+        if re.search(pat, line, re.I):
+            return f"self-heal:{label}"
+    return None
+
+
+def scan_unknown_errors(container: str, since: str, include_warn: bool) -> dict:
+    """Collect ERROR (and optionally WARN) lines not matched by ALLOWLIST or a
+    known HARD_BLOCKING/SELF_HEAL pattern. Returns distinct normalized
+    signatures with counts + a sample line."""
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--since", since, container],
+            capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return {"scan_error": str(e)}
+    lines = (out.stdout + "\n" + out.stderr).splitlines()
+    level_re = (re.compile(r'"level":"(ERROR|WARN)"|\blevel=(error|warn)\b|\b(ERROR|WARN)\b', re.I)
+                if include_warn else ERROR_RE)
+    unknown: dict[str, dict] = {}
+    scanned = 0
+    for ln in lines:
+        if not level_re.search(ln):
+            continue
+        scanned += 1
+        if _known_labeled(ln):
+            continue
+        sig = normalize_signature(ln)
+        e = unknown.setdefault(sig, {"count": 0, "sample": ln[:300]})
+        e["count"] += 1
+    return {"scanned": scanned, "unknown": unknown}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="G13 server-log health gate.")
     ap.add_argument("--containers", required=True,
@@ -329,6 +431,17 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="write the JSON report here")
     ap.add_argument("--update-baseline", action="store_true",
                     help="bless the current run's ERROR/WARN signatures as the baseline")
+    ap.add_argument("--unknown-errors", choices=["fail", "warn", "off"],
+                    default="warn",
+                    help="G13b inverted gate: how to treat ERROR/WARN log lines "
+                         "not matched by the ALLOWLIST or a known blocking/"
+                         "self-heal pattern. 'fail' => any unknown = FAIL; "
+                         "'warn' (default) => WATCH (loud, non-breaking); "
+                         "'off' => skip. Known CONNECTION_FATAL signatures still "
+                         "FAIL hard via HARD_BLOCKING regardless of this flag.")
+    ap.add_argument("--unknown-include-warn", action="store_true",
+                    help="G13b: also scan WARN-level lines for unknowns "
+                         "(default: ERROR-level only)")
     a = ap.parse_args()
 
     since = a.since
@@ -410,6 +523,41 @@ def main() -> int:
                 f"unknown-signatures: {len(unknown)} new ERROR/WARN signature(s): "
                 + "; ".join(list(unknown)[:3]))
     report["signature_counts"] = {"total": len(all_sigs), "baseline": len(baseline), "unknown": len(unknown)}
+
+    # --- G13b inverted gate: unrecognized ERROR/WARN => FAIL/WATCH. Additive;
+    #     the HARD_BLOCKING/SELF_HEAL/WATCH behavior above is untouched. ---
+    unknown_errors: dict[str, dict] = {}
+    ue_scanned = 0
+    if a.unknown_errors != "off":
+        for name in [c.strip() for c in a.containers.split(",") if c.strip()]:
+            ue = scan_unknown_errors(name, since, a.unknown_include_warn)
+            if "scan_error" in ue:
+                continue  # scan_container already raised ERROR for this container
+            ue_scanned += ue["scanned"]
+            for sig, e in ue["unknown"].items():
+                agg = unknown_errors.setdefault(sig, {"count": 0, "sample": e["sample"]})
+                agg["count"] += e["count"]
+        if unknown_errors:
+            distinct = len(unknown_errors)
+            total = sum(e["count"] for e in unknown_errors.values())
+            top = sorted(unknown_errors.items(), key=lambda kv: -kv[1]["count"])
+            summary = "; ".join(f"{e['count']}x {sig}" for sig, e in top[:3])
+            verdict = "FAIL" if a.unknown_errors == "fail" else "WATCH"
+            raise_to(verdict)
+            report["details"].append(
+                f"unrecognized-server-error [G13b]: {distinct} distinct new "
+                f"ERROR{'/WARN' if a.unknown_include_warn else ''} signature(s) "
+                f"({total}x total) not in allowlist/blocklist — {summary}")
+    report["unknown_errors"] = {
+        "mode": a.unknown_errors,
+        "include_warn": a.unknown_include_warn,
+        "level_lines_scanned": ue_scanned,
+        "distinct": len(unknown_errors),
+        "total": sum(e["count"] for e in unknown_errors.values()),
+        "signatures": [{"signature": sig, "count": e["count"], "sample": e["sample"]}
+                       for sig, e in sorted(unknown_errors.items(),
+                                            key=lambda kv: -kv[1]["count"])],
+    }
 
     if a.out:
         with open(a.out, "w") as f:
