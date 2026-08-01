@@ -348,13 +348,24 @@ def main():
     except KeyboardInterrupt:
         print("\n  Interrupted by user")
     finally:
-        # 4. Restore override
+        # 4. Restore override. Never let cleanup crash the run — otherwise the
+        # results table/JSON below is lost. The post-restore restart can fail
+        # legitimately (e.g. the original override pins linux/amd64 and only the
+        # local arm64 image is present); that must not mask a good ladder.
         if not args.no_restore:
             print("\n--- Cleanup ---")
-            restore_override()
-            print("  Restarting with original config...")
-            run(f"cd {SANDBOX_DIR} && docker compose up -d zero-cache", timeout=60)
-            wait_healthy()
+            try:
+                restore_override()
+                print("  Restarting with original config...")
+                r = run(f"cd {SANDBOX_DIR} && docker compose up -d zero-cache",
+                        timeout=60, check=False)
+                if r.returncode != 0:
+                    print(f"  NOTE: post-restore restart failed (rc={r.returncode}); "
+                          f"the rust container from the ladder run is left in place.")
+                else:
+                    wait_healthy()
+            except Exception as e:  # noqa: BLE001 — cleanup must never crash results
+                print(f"  NOTE: cleanup hit {type(e).__name__}: {e}")
 
     # 5. Results
     if results:
