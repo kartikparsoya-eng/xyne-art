@@ -45,10 +45,23 @@ def rid() -> str:
     return "art-" + "".join(r.choice("abcdefghijklmnop0123456789") for _ in range(10))
 
 
+def client_outcomes(results: list, expected: int) -> tuple[dict[str, int], bool]:
+    counts = {
+        "abrupt": sum(r[1] == "closed" and r[2] == 1006 for r in results),
+        "clean": sum(r[1] == "closed" and r[2] in (1000, 1001) for r in results),
+        "controlled": sum(r[1] == "control" for r in results),
+        "failed": sum(r[1] == "connect-failed" for r in results),
+    }
+    accounted = counts["clean"] + counts["controlled"]
+    counts["unnotified"] = max(0, expected - sum(counts.values()))
+    ok = accounted == expected and counts["abrupt"] == 0 and counts["failed"] == 0
+    return counts, ok
+
+
 async def _one_client(target: str, version: int, auth_token: str | None,
                       extra_params: list[tuple[str, str]], puts: list[dict],
                       client_schema: dict | None, stop: asyncio.Event,
-                      results: list, idx: int) -> None:
+                      results: list, ready: set[int], idx: int) -> None:
     import websockets
     cgid, cid = rid(), rid()
     params = {"clientGroupID": cgid, "clientID": cid, "baseCookie": "",
@@ -68,14 +81,37 @@ async def _one_client(target: str, version: int, auth_token: str | None,
         return
     close_code = None
     close_reason = ""
+    rows_seen = 0
+    control = None
     try:
         while not stop.is_set():
             try:
-                await asyncio.wait_for(ws.recv(), timeout=1.0)
+                raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
             except websockets.exceptions.ConnectionClosed as e:
                 close_code, close_reason = e.code, e.reason
+                break
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(msg, list) or not msg:
+                continue
+            tag = msg[0]
+            body = msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
+            if tag == "pokePart":
+                rows_seen += len(body.get("rowsPatch") or [])
+            elif tag == "pokeEnd" and rows_seen and not body.get("cancel"):
+                ready.add(idx)
+            elif tag == "poke":
+                rows_seen += sum(len(part.get("rowsPatch") or [])
+                                 for part in body.get("pokeParts") or []
+                                 if isinstance(part, dict))
+                if rows_seen:
+                    ready.add(idx)
+            elif tag == "error" and body.get("kind") == "Rehome":
+                control = "Rehome"
                 break
         if close_code is None:
             # stop fired; try a final recv to capture the close
@@ -90,7 +126,10 @@ async def _one_client(target: str, version: int, auth_token: str | None,
             await ws.close()
         except Exception:
             pass
-    results.append((idx, "closed", close_code, close_reason))
+    if control:
+        results.append((idx, "control", None, control))
+    else:
+        results.append((idx, "closed", close_code, close_reason))
 
 
 async def probe(a: argparse.Namespace) -> dict:
@@ -104,10 +143,26 @@ async def probe(a: argparse.Namespace) -> dict:
 
     stop = asyncio.Event()
     results: list = []
+    ready: set[int] = set()
     clients = [asyncio.create_task(_one_client(
         a.target, a.protocol_version, a.auth_token, a.extra_param, puts,
-        client_schema, stop, results, i)) for i in range(a.connections)]
-    await asyncio.sleep(3.0)  # let them hydrate (in-flight syncs established)
+        client_schema, stop, results, ready, i)) for i in range(a.connections)]
+    hydrate_deadline = time.perf_counter() + 20.0
+    while len(ready) < a.connections and time.perf_counter() < hydrate_deadline:
+        if all(client.done() for client in clients):
+            break
+        await asyncio.sleep(0.1)
+    if len(ready) != a.connections:
+        stop.set()
+        await asyncio.gather(*clients, return_exceptions=True)
+        failed = [r for r in results if r[1] == "connect-failed"]
+        checks.append({"name": "hydrate", "verdict": "ERROR",
+                       "detail": f"only {len(ready)}/{a.connections} clients hydrated; "
+                                 f"{len(failed)} connect-failed"})
+        return {"verdict": "ERROR", "checks": checks,
+                "summary": "drain setup did not establish all in-flight clients"}
+    checks.append({"name": "hydrate", "verdict": "PASS",
+                   "detail": f"{len(ready)}/{a.connections} clients hydrated"})
 
     t0 = time.perf_counter()
     # send SIGTERM
@@ -116,41 +171,50 @@ async def probe(a: argparse.Namespace) -> dict:
     checks.append({"name": "sigterm", "verdict": "PASS",
                    "detail": f"sent SIGTERM to {a.container}"})
 
-    # wait for all clients to observe a close (or budget)
-    try:
-        await asyncio.wait_for(asyncio.gather(*clients, return_exceptions=True),
-                               timeout=a.drain_budget_s)
-    except asyncio.TimeoutError:
-        pass
-    stop.set()
+    status, exit_code, oom = "?", "?", "?"
+    exit_deadline = t0 + a.drain_budget_s
+    while time.perf_counter() < exit_deadline:
+        inspect = subprocess.run(["docker", "inspect", "-f",
+                                  "{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}",
+                                  a.container], capture_output=True, text=True, timeout=10)
+        st = (inspect.stdout or "").strip().split("|")
+        status, exit_code, oom = (st + ["?", "?", "?"])[:3]
+        if status == "exited" and all(client.done() for client in clients):
+            break
+        await asyncio.sleep(0.1)
     drain_s = round(time.perf_counter() - t0, 2)
-
-    # inspect container exit
+    stop.set()
+    await asyncio.gather(*clients, return_exceptions=True)
     inspect = subprocess.run(["docker", "inspect", "-f",
                               "{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}",
                               a.container], capture_output=True, text=True, timeout=10)
     st = (inspect.stdout or "").strip().split("|")
     status, exit_code, oom = (st + ["?", "?", "?"])[:3]
 
-    abrupt = [r for r in results if r[1] == "closed" and r[2] == 1006]
-    clean = [r for r in results if r[1] == "closed" and r[2] in (1000, 1001)]
-    failed = [r for r in results if r[1] == "connect-failed"]
+    counts, notifications_ok = client_outcomes(results, a.connections)
 
-    checks.append({"name": "client-notification", "verdict": "PASS" if clean and not abrupt else "FAIL",
-                   "detail": f"{len(clean)} clean close, {len(abrupt)} abrupt(1006), "
-                             f"{len(failed)} connect-failed"})
+    checks.append({"name": "client-notification",
+                   "verdict": "PASS" if notifications_ok else "FAIL",
+                   "detail": f"{counts['clean']} clean close, {counts['abrupt']} abrupt(1006), "
+                             f"{counts['controlled']} Rehome, {counts['failed']} connect-failed, "
+                             f"{counts['unnotified']} unnotified"})
     checks.append({"name": "drain-time", "verdict": "PASS" if drain_s <= a.drain_budget_s else "FAIL",
                    "detail": f"drained in {drain_s}s (budget {a.drain_budget_s}s)"})
-    checks.append({"name": "exit-code", "verdict": "PASS" if exit_code == "0" else "FAIL",
+    exited_cleanly = status == "exited" and exit_code == "0"
+    checks.append({"name": "exit-code", "verdict": "PASS" if exited_cleanly else "FAIL",
                    "detail": f"container status={status} exit={exit_code} oom={oom}"})
 
     fail = any(c["verdict"] == "FAIL" for c in checks)
     verdict = "FAIL" if fail else "PASS"
-    summary = (f"drain {drain_s}s: {len(clean)} clean / {len(abrupt)} abrupt / "
-               f"{len(failed)} failed; exit={exit_code}")
+    summary = (f"drain {drain_s}s: {counts['clean']} clean / "
+               f"{counts['controlled']} Rehome / {counts['abrupt']} abrupt / "
+               f"{counts['failed']} failed / {counts['unnotified']} unnotified; "
+               f"exit={exit_code}")
     return {"verdict": verdict, "checks": checks, "summary": summary,
-            "drain_s": drain_s, "clean": len(clean), "abrupt": len(abrupt),
-            "connect_failed": len(failed), "exit_code": exit_code}
+            "drain_s": drain_s, "clean": counts["clean"],
+            "abrupt": counts["abrupt"], "controlled": counts["controlled"],
+            "connect_failed": counts["failed"], "unnotified": counts["unnotified"],
+            "exit_code": exit_code}
 
 
 def main() -> int:

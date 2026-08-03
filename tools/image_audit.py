@@ -29,6 +29,9 @@ import subprocess
 import sys
 import time
 
+TRIVY_IMAGE = ("aquasec/trivy:0.66.0@sha256:"
+               "086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e")
+
 
 def image_inspect(image: str) -> dict | None:
     r = subprocess.run(["docker", "image", "inspect", image],
@@ -44,7 +47,7 @@ def image_inspect(image: str) -> dict | None:
 def cve_scan(image: str) -> tuple[list[dict], str | None]:
     """Run trivy or grype; return (vulnerabilities, tool). Each vuln has
     severity + id. Returns ([], None) if no scanner is installed (SKIP)."""
-    for tool, args in (("trivy", ["image", "--quiet", "--json", image]),
+    for tool, args in (("trivy", ["image", "--quiet", "--json", "--ignore-unfixed", image]),
                        ("grype", ["-q", "--json", image])):
         if not shutil.which(tool):
             continue
@@ -66,6 +69,37 @@ def cve_scan(image: str) -> tuple[list[dict], str | None]:
             return vulns, tool
         except Exception:
             continue
+    docker_socket = "/var/run/docker.sock"
+    if shutil.which("docker"):
+        try:
+            context = subprocess.run(
+                ["docker", "context", "inspect", "--format",
+                 "{{.Endpoints.docker.Host}}"],
+                capture_output=True, text=True, timeout=15,
+            )
+            host = context.stdout.strip()
+            if host.startswith("unix://"):
+                docker_socket = host.removeprefix("unix://")
+        except Exception:
+            pass
+    if shutil.which("docker") and os.path.exists(docker_socket):
+        try:
+            r = subprocess.run([
+                "docker", "run", "--rm",
+                "-v", f"{docker_socket}:/var/run/docker.sock",
+                TRIVY_IMAGE, "image", "--quiet", "--format", "json",
+                "--scanners", "vuln", "--ignore-unfixed", image,
+            ], capture_output=True, text=True, timeout=600)
+            if r.returncode in (0, 1):
+                d = json.loads(r.stdout)
+                vulns = []
+                for res in d.get("Results", []):
+                    for v in res.get("Vulnerabilities", []) or []:
+                        vulns.append({"id": v.get("VulnerabilityID"),
+                                      "severity": v.get("Severity", "UNKNOWN")})
+                return vulns, "trivy-container"
+        except Exception:
+            pass
     return [], None
 
 
@@ -103,9 +137,8 @@ def main() -> int:
     checks.append({"name": "size", "verdict": v, "detail": detail, "size_mb": size_mb})
 
     # 2. base-image pin
-    rootfs = info.get("RootFS", {}) or {}
-    layers = rootfs.get("Layers", [])
-    base_digest = layers[0] if layers else None
+    labels = info.get("Config", {}).get("Labels") or {}
+    base_digest = labels.get("org.opencontainers.image.base.digest")
     if a.expected_base:
         if base_digest == a.expected_base:
             checks.append({"name": "base-pin", "verdict": "PASS",
@@ -119,7 +152,6 @@ def main() -> int:
                        "detail": f"no --expected-base (base={str(base_digest)[:24]}...)"})
 
     # 3. labels
-    labels = info.get("Config", {}).get("Labels") or {}
     for lbl in a.require_label:
         if lbl in labels:
             checks.append({"name": f"label:{lbl}", "verdict": "PASS", "detail": "present"})

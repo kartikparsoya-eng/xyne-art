@@ -90,7 +90,7 @@ def wait_healthy(timeout=60):
         running = r.stdout.strip().strip('"')
         if running == "true":
             # TS container has no healthcheck — verify it responds on the port
-            r2 = run(f"curl -sf http://localhost:4849/ -o /dev/null", check=False)
+            r2 = run("curl -sf http://localhost:4849/ -o /dev/null", check=False)
             if r2.returncode == 0:
                 return True
         time.sleep(2)
@@ -120,7 +120,7 @@ def setup_ladder_override(cpus, sync_workers):
     if OVERRIDE.exists():
         content = OVERRIDE.read_text()
         if "capacity-ladder" in content:
-            print(f"  WARNING: current override is already a ladder override — no original to back up")
+            print("  WARNING: current override is already a ladder override — no original to back up")
         else:
             shutil.copy2(OVERRIDE, BACKUP)
             print(f"  Backed up {OVERRIDE.name} -> {BACKUP.name}")
@@ -130,14 +130,14 @@ def setup_ladder_override(cpus, sync_workers):
 
 def restore_override():
     if not BACKUP.exists():
-        print(f"  No backup found — left ladder override in place")
+        print("  No backup found — left ladder override in place")
         return
     content = BACKUP.read_text()
     if "capacity-ladder" in content:
-        print(f"  WARNING: backup is also a ladder override — original was lost. Leaving in place.")
+        print("  WARNING: backup is also a ladder override — original was lost. Leaving in place.")
         return
     shutil.move(str(BACKUP), str(OVERRIDE))
-    print(f"  Restored original override")
+    print("  Restored original override")
 
 
 def restart_container():

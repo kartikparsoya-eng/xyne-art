@@ -17,7 +17,7 @@ Probes plain HTTP (no WS). Paths are configurable; zero-cache defaults:
   /healthz  (liveness — process up)
   /readyz   (readiness — serving)
 
-    .venv/bin/python tools/probe_readiness.py --http http://rust-test.localhost:8080 \\
+    .venv/bin/python tools/probe_readiness.py --http http://rust-test.localhost \\
         --ws-target ws://rust-test.localhost/zero --auth-token "$JWT" \\
         --out reports/readiness-$TAG.json
 
@@ -33,6 +33,9 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harness"))
+from protocol import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
 
 
 def http_status(url: str, timeout: float = 5.0) -> int | None:
@@ -54,8 +57,6 @@ async def ws_accepts(url_base: str, version: int, auth_token: str | None,
               "baseCookie": "", "ts": str(time.time() * 1000), "lmid": "0"}
     url = (url_base.rstrip("/") + f"/sync/v{version}/connect?"
            + urllib.parse.urlencode(params))
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harness"))
-    from protocol import encode_sec_protocols  # noqa: E402
     sec = encode_sec_protocols(None, auth_token)
     try:
         async with websockets.connect(url, subprotocols=[sec], open_timeout=timeout,
@@ -132,7 +133,7 @@ def main() -> int:
     ap.add_argument("--auth-token", default=None)
     ap.add_argument("--healthz-path", default="/healthz")
     ap.add_argument("--readyz-path", default="/readyz")
-    ap.add_argument("--protocol-version", type=int, default=49)
+    ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
     ap.add_argument("--stability-s", type=float, default=10.0, help="window to poll readiness for flapping")
     ap.add_argument("--poll-interval", type=float, default=1.0)
     ap.add_argument("--out", default=None)

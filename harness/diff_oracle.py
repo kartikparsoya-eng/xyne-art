@@ -50,7 +50,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from workload import (  # noqa: E402
-    ArgResolver, WeightedSampler, MutationSampler, load_baseline,
+    ArgResolver, SchemaSynthesizer, WeightedSampler, MutationSampler, load_baseline,
     query_put, query_del, change_desired_queries_message, init_connection_message,
     custom_mutation, push_message,
 )
@@ -301,6 +301,24 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
     rng = random.Random(a.seed + pair_idx)  # deterministic per pair
     sampler = WeightedSampler(baseline.queries, rng)
     resolver = ArgResolver.from_pool_file(a.id_pool, rng, zipf_s=a.zipf_s)
+    query_synth = None
+    if a.current_schema_doc is not None:
+        minimal_queries = {}
+        for name, entry in (a.current_schema_doc.get("queries") or {}).items():
+            args_schema = entry.get("args")
+            if args_schema is None:
+                minimal_queries[name] = {**entry, "args": {}}
+                continue
+            minimal_queries[name] = {
+                **entry,
+                "args": {key: schema for key, schema in args_schema.items()
+                         if not schema.get("optional") and not schema.get("hasDefault")},
+            }
+        query_synth = SchemaSynthesizer(
+            {"mutators": minimal_queries,
+             "enums": a.current_schema_doc.get("enums") or {}},
+            resolver.ids, resolver.scalars, {}, rng,
+        )
     cschema = json.load(open(a.client_schema)) if a.client_schema else None
     pks = {t: spec.get("primaryKey", []) for t, spec in
            (cschema or {}).get("tables", {}).items()}
@@ -320,12 +338,29 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         # not just a weighted working-set sample (~10) that leaves half the
         # catalog never compared rust-vs-TS. No churn — hydrate all, then diff.
         unresolved: list[str] = []
+        stale_catalog: list[str] = []
         seen: set[str] = set()
+        unique_ops = []
         for op in baseline.queries:
             if op.name in seen:
                 continue
             seen.add(op.name)
-            args, ok = resolver.resolve(op)
+            unique_ops.append(op)
+        start = pair_idx * a.catalog_batch_size
+        batch_ops = unique_ops[start:start + a.catalog_batch_size]
+        for op in batch_ops:
+            if a.current_query_names is not None and op.name not in a.current_query_names:
+                stale_catalog.append(op.name)
+                continue
+            if query_synth is not None:
+                args, _meta = query_synth.synth(op.name, int(time.time() * 1000))
+                ok = args is not None
+                if ok and op.name == "hierarchyCanvases":
+                    channel_id, channel_ok = resolver._resolve_key("channelId")
+                    args = {"scope": "channel", "channelId": channel_id}
+                    ok = channel_ok
+            else:
+                args, ok = resolver.resolve(op)
             if not ok:
                 unresolved.append(op.name)
                 continue
@@ -335,8 +370,9 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
                 s.mat.hash_query[put["hash"]] = op.name
         for s in sides:
             s.mat.unresolved = unresolved
+            s.mat.stale_catalog = stale_catalog
         if unresolved:
-            print(f"  [full-catalog] {len(initial_puts)} queries subscribed, "
+            print(f"  [full-catalog pair {pair_idx}] {len(initial_puts)} queries subscribed, "
                   f"{len(unresolved)} unresolvable (no id-pool args): "
                   f"{unresolved[:10]}")
     else:
@@ -522,7 +558,11 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         "only_mirror_hydrated": only_mirror_hydrated,
         "hydration_parity_gap": len(only_primary_hydrated) + len(only_mirror_hydrated),
         "catalog_driven": len(prim_hyd | mirr_hyd),
+        "catalog_expected": sorted({s.mat.hash_query[h]
+                                    for s in sides for h in s.mat.hash_query}),
+        "catalog_hydrated": sorted(prim_hyd | mirr_hyd),
         "catalog_unresolved": sorted(getattr(sides[0].mat, "unresolved", []) or []),
+        "catalog_stale": sorted(getattr(sides[0].mat, "stale_catalog", []) or []),
         "mutations_sent": muts["sent"],
         "mutations_acked": sides[0].lmid_acked,
         "quiesced": quiesced,
@@ -577,6 +617,16 @@ def check_versions(target: str) -> str | None:
 
 async def amain(a: argparse.Namespace) -> int:
     baseline = load_baseline(a.baseline)
+    a.current_query_names = None
+    a.current_schema_doc = None
+    if a.current_query_schema:
+        try:
+            with open(a.current_query_schema) as f:
+                schema_doc = json.load(f)
+            a.current_schema_doc = schema_doc
+            a.current_query_names = set((schema_doc.get("queries") or {}).keys())
+        except (OSError, ValueError) as e:
+            print(f"  WARNING: cannot load current query schema {a.current_query_schema}: {e}")
 
     # version check (#7): verify NAPI/SQLite before wasting a full run
     if a.version_check:
@@ -600,6 +650,30 @@ async def amain(a: argparse.Namespace) -> int:
                                     for q in r.get("only_primary_hydrated", [])})
     only_mirror_hydrated = sorted({q for r in results
                                    for q in r.get("only_mirror_hydrated", [])})
+    catalog_expected = {q for r in results for q in r.get("catalog_expected", [])}
+    catalog_hydrated = {q for r in results for q in r.get("catalog_hydrated", [])}
+    catalog_unresolved = {q for r in results for q in r.get("catalog_unresolved", [])}
+    catalog_stale = {q for r in results for q in r.get("catalog_stale", [])}
+    catalog_missing = sorted(catalog_expected - catalog_hydrated)
+    protocol_errors = sum(
+        sum(count for kind, count in (r.get(side, {}).get("errors") or {}).items()
+            if ":" not in kind)
+        for r in results for side in ("primary", "mirror")
+    )
+    catalog_total = len({op.name for op in baseline.queries})
+    catalog_accounted = catalog_expected | catalog_unresolved | catalog_stale
+    catalog_rows = {
+        side: sum(r.get(side, {}).get("rows", 0) for r in results)
+        for side in ("primary", "mirror")
+    }
+    oracle_failed = (
+        total_mismatch > 0 or bool(conn_errors) or total_hydration_gap > 0
+        or protocol_errors > 0
+        or (a.full_catalog and (bool(catalog_missing)
+                               or not catalog_expected
+                               or len(catalog_accounted) != catalog_total
+                               or min(catalog_rows.values()) == 0))
+    )
     out = {
         "primary": a.primary, "mirror": a.mirror or a.primary,
         "self_diff": self_diff,
@@ -612,9 +686,16 @@ async def amain(a: argparse.Namespace) -> int:
         "hydration_parity_gap": total_hydration_gap,
         "only_primary_hydrated": only_primary_hydrated,
         "only_mirror_hydrated": only_mirror_hydrated,
-        "catalog_driven": max((r.get("catalog_driven", 0) for r in results),
-                              default=0),
+        "catalog_driven": len(catalog_hydrated),
+        "catalog_expected": len(catalog_expected),
+        "catalog_total": catalog_total,
+        "catalog_unresolved": sorted(catalog_unresolved),
+        "catalog_stale": sorted(catalog_stale),
+        "catalog_missing": catalog_missing,
+        "catalog_rows": catalog_rows,
+        "protocol_errors": protocol_errors,
         "connect_errors": len(conn_errors),
+        "verdict": "FAIL" if oracle_failed else "PASS",
         "results": results,
     }
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
@@ -678,12 +759,11 @@ async def amain(a: argparse.Namespace) -> int:
             print(f"  HYDRATION PARITY: {len(only_mirror_hydrated)} quer(ies) "
                   f"hydrated on MIRROR(ts) but NOT PRIMARY(rust) — possible "
                   f"rust delivery bug: {only_mirror_hydrated[:12]}")
-    verdict = ("PASS" if total_mismatch == 0 and not conn_errors
-               and total_hydration_gap == 0 else "FAIL")
+    verdict = out["verdict"]
     print(f"{mode} ORACLE: {verdict} ({total_mismatch} mismatches, "
           f"{total_hydration_gap} hydration-parity gap, "
-          f"{len(conn_errors)} connect errors"
-          + (f", catalog_driven={out['catalog_driven']}"
+          f"{len(conn_errors)} connect errors, {protocol_errors} protocol errors"
+          + (f", catalog_driven={out['catalog_driven']}/{out['catalog_expected']}"
              if out.get('full_catalog') else "")
           + f") -> {a.out}")
     return 0 if verdict == "PASS" else 1
@@ -716,6 +796,12 @@ def main() -> int:
                     help="subscribe EVERY resolvable catalog query on both sides "
                          "(no churn) so all ~151 query shapes get differential "
                          "coverage; bump --quiesce-max-s for the larger hydrate")
+    ap.add_argument("--catalog-batch-size", type=int, default=50,
+                    help="maximum full-catalog queries per client (default 50; "
+                         "must remain below the server's desired-query limit)")
+    ap.add_argument("--current-query-schema", default="raw/arg-schemas.source.json",
+                    help="source-derived current query catalog; baseline-only names are "
+                         "reported as stale instead of sent to the app transformer")
     ap.add_argument("--enable-mutations", action="store_true",
                     help="drive read-tracking writes on the primary socket "
                          "(replicates to both sides via the shared DB)")
@@ -731,6 +817,8 @@ def main() -> int:
     a = ap.parse_args()
     if a.enable_mutations and not a.i_know_this_writes:
         ap.error("--enable-mutations writes real data; add --i-know-this-writes")
+    if a.full_catalog and a.catalog_batch_size <= 0:
+        ap.error("--catalog-batch-size must be positive")
     return asyncio.run(amain(a))
 
 

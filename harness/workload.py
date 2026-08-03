@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -138,6 +139,7 @@ DEFAULT_SCALARS: dict[str, list[Any]] = {
     # prisma enum BoardType {DEFAULT RELEASE NON_LINEAR}.
     "boardType": ["DEFAULT", "RELEASE"],
     "columnType": ["stage"],
+    "stageName": ["Backlog"],
     "groupBy": ["stage"],
     "classification": [[]],
     "types": [[]],
@@ -529,7 +531,7 @@ NS_ID_KEY = {
     "links": "linkId", "canvasVersion": "canvasVersionId",
     "channelSection": "sectionId", "nudges": "nudgeId",
     "collection": "collectionId", "form": "formId", "query": "queryId",
-    "automations": "workflowId", "workflow": "workflowId",
+    "automation": "workflowId", "automations": "workflowId", "workflow": "workflowId",
     "repo": "repoId", "recap": "recapId", "coe": "coeId",
     "merchant": "merchantId", "dashboard": "dashboardId",
     "invitation": "invitationId", "knowledgeDocument": "knowledgeDocumentId",
@@ -624,7 +626,12 @@ class SchemaSynthesizer:
         if key == "id":
             # bare `id` is family-scoped: resolve through the ns-mapped key
             # ONLY (raw overlay["id"] was cross-family poison — see NS_ID_KEY)
-            pool_key = NS_ID_KEY.get(ns) or f"{ns}#id"
+            pool_key = NS_ID_KEY.get(ns)
+            if pool_key is None:
+                pool_key = next((mapped for prefix, mapped in
+                                 sorted(NS_ID_KEY.items(), key=lambda item: -len(item[0]))
+                                 if ns.lower().startswith(prefix.lower())), None)
+            pool_key = pool_key or f"{ns}#id"
             tries = [pool_key]
             # CREATE phase: bare `id` is the NEW row's client-minted PK — a
             # pool draw is an existing PK and a guaranteed duplicate-key
@@ -675,6 +682,8 @@ class SchemaSynthesizer:
         """Returns (value, ok). ok=False => caller omits (optional) or skips."""
         t = s.get("type")
         lk = key.lower()
+        if s.get("nullable"):
+            return None, True
         # client-generated row PKs (conversations.send conversationId,
         # messages.react reactionId/countId, ...): a POOL value here is an
         # EXISTING pk -> guaranteed duplicate-key rejection. The matrix
@@ -780,7 +789,12 @@ class SchemaSynthesizer:
         if t in ("record", "any", "unknown"):
             # z.record()/z.any() accept {} — the cheapest valid instance
             return {}, True
-        return None, False                # date/bigint/tuple/opaque
+        if t == "opaque":
+            literals = re.findall(r"z\.literal\(['\"]([^'\"]+)['\"]\)",
+                                  s.get("src") or "")
+            if literals:
+                return literals[0], True
+        return None, False                # date/bigint/tuple or unsupported opaque
 
     def synth(self, name: str, now_ms: int, allow_fresh: bool = False,
               overlay_only: bool = False,

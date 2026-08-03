@@ -311,7 +311,7 @@ def main() -> int:
                                if slope_per_hour(vals) is not None else None),
         }
     spath = heap_prefix + ".summary.json"
-    
+
     # G6b goroutine leak detection: if the run was >=15min, assert
     # goroutine count delta is bounded. A growing goroutine count with
     # flat connection count = leaked goroutines (pool readers, hydrate
@@ -328,7 +328,7 @@ def main() -> int:
                      f"({g['first']} -> {g['last']}) — "
                      f"{'bounded' if delta < 50 else 'possible leak'}"),
         }
-    
+
     # WAL growth alert: WAL-pin starvation (W5) shows as WAL file growth
     # without corresponding DB growth. >100MB/h = WATCH.
     if "wal_bytes" in summary:
@@ -339,7 +339,7 @@ def main() -> int:
                 "verdict": "WATCH",
                 "note": f"WAL growing {w['slope_per_hour'] / 1e6:.0f}MB/h — possible WAL-pin starvation",
             }
-    
+
     with open(spath, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"resource summary: {spath}")

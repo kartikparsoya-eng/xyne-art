@@ -53,9 +53,9 @@ SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
 MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
 PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0; WRITE_PARITY=0; PROD_BUDGET=0
 IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=0; DRAIN_BUDGET=30
+CHAOS_MEAN_GAP=45
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
-PLANNER_FLAG=""
 OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""; OVERRIDE_MIRROR=""
 CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0; FULLCATALOG=0
 while [ $# -gt 0 ]; do
@@ -77,7 +77,6 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2;;
     --trace) TRACE="$2"; shift 2;;
     --time-compress) TCOMPRESS="$2"; shift 2;;
-    --planner-flag) PLANNER_FLAG="$2"; shift 2;;
     --user-id) USER_ID="$2"; shift 2;;
     --users) USERS="$2"; shift 2;;
     --lifecycle) LIFECYCLE=1; shift;;
@@ -95,6 +94,7 @@ while [ $# -gt 0 ]; do
     --oracle) ORACLE=1; shift;;
     --full-catalog) ORACLE=1; FULLCATALOG=1; shift;;
     --chaos) CHAOS=1; LIFECYCLE=1; shift;;
+    --chaos-mean-gap) CHAOS_MEAN_GAP="$2"; shift 2;;
     --negative) NEGATIVE=1; shift;;
     --mutation-matrix) MUTMATRIX=1; shift;;
     --refresh) REFRESH=1; shift;;
@@ -153,11 +153,15 @@ fi
 
 # --release: prod-shaped preset — resource caps + all gates + soak duration
 if [ "$RELEASE" = "1" ]; then
-  [ -z "$CPUS" ] && CPUS="1.5"
+  # The release image defaults to four sync workers. Keep the production gate
+  # at one CPU per worker; oversubscribing four workers onto 1.5 cores turns
+  # scheduler contention into false liveness failures.
+  [ -z "$CPUS" ] && CPUS="4"
   [ -z "$MEMORY" ] && MEMORY="8g"
-  [ -z "$DUR_SET" ] && DURATION="600"
+  [ "$DUR_SET" = "0" ] && DURATION="900"
+  [ -z "$PROFILE" ] && PROFILE="profiles/prod-7d.json"
   LIFECYCLE=1; ORACLE=1; MUTATIONS=1; NEGATIVE=1; MUTMATRIX=1
-  PROTOCOL=1; TELEMETRY=1; DETERMINISM=1; PARITY=1; IMAGEAUDIT=1
+  PROTOCOL=1; TELEMETRY=1; DETERMINISM=1; PARITY=1; IMAGEAUDIT=1; FULLCATALOG=1
   echo "[ART] --release: cpus=$CPUS memory=$MEMORY duration=${DURATION}s all-gates"
 fi
 
@@ -171,10 +175,12 @@ if [ "$BOOTSTRAP" = "1" ]; then
   MEM_FLAGS=""
   [ -n "$MEMORY" ] && MEM_FLAGS="--memory=$MEMORY"
   # Copy auth secrets from the TS mirror container
-  AUTH_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_AUTH_SECRET 2>/dev/null || true)
-  ZERO_SECRET=$(docker exec xyne-sandbox-rust-test-zero-cache-ts printenv ZERO_SECRET 2>/dev/null || true)
+  TS_CONTAINER="xyne-sandbox-${SANDBOX}-zero-cache-ts"
+  AUTH_SECRET=$(docker exec "$TS_CONTAINER" printenv ZERO_AUTH_SECRET 2>/dev/null || true)
+  ZERO_SECRET=$(docker exec "$TS_CONTAINER" printenv ZERO_SECRET 2>/dev/null || true)
   # ZERO_SECRET not always set — fall back to ZERO_AUTH_SECRET (same value in sandbox)
   [ -z "$ZERO_SECRET" ] && ZERO_SECRET="$AUTH_SECRET"
+  BOOTSTRAP_IMAGE="${IMAGE:-zero-cache-rust-ivm:latest}"
   PPROF_PORT="${OVERRIDE_PPROF_PORT:-6061}"
   docker run -d \
     --name "$ART_NAME" \
@@ -190,12 +196,10 @@ if [ "$BOOTSTRAP" = "1" ]; then
     -e ZERO_CVR_DB="postgresql://xyne:xyne123@xyne-sandbox-postgres:5432/sandbox_rust_test_db" \
     -e ZERO_QUERY_URL="http://xyne-sandbox-rust-test-backend:3001/api/zero/query" \
     -e ZERO_MUTATE_URL="http://xyne-sandbox-rust-test-backend:3001/api/zero/push" \
-    -e GO_IVM_PPROF_ADDR=0.0.0.0:6061 \
-    -e GO_IVM_GOGC=200 \
-    -e GO_IVM_HYDRATE_READERS=8 \
+    -e USE_RUST_IVM=true \
+    -e RUST_IVM_ADDON_PATH=/app/mono/packages/rust-ivm/napi/rust-ivm.node \
+    -e RUST_IVM_TSFN_QUEUE=64 \
     -e ZERO_NUM_SYNC_WORKERS=4 \
-    -e GO_IVM_HYDRATE_CHUNK_SIZE=500 \
-    -e GO_IVM_STEP_ROWS_SHIM=1 \
     -v zero_cache_art_rust_test:/var/zero \
     -l "traefik.enable=true" \
     -l "traefik.http.routers.zero-art.rule=Host(\`rust-test.localhost\`) && PathPrefix(\`/zero-art\`)" \
@@ -203,7 +207,7 @@ if [ "$BOOTSTRAP" = "1" ]; then
     -l "traefik.http.routers.zero-art.middlewares=zero-art-stripprefix" \
     -l "traefik.http.middlewares.zero-art-stripprefix.stripprefix.prefixes=/zero-art" \
     -l "traefik.http.services.zero-art.loadbalancer.server.port=4848" \
-    zero-cache-go:art-test-v5
+    "$BOOTSTRAP_IMAGE"
   echo "[ART] waiting for container to be ready..."
   for i in $(seq 1 30); do
     sleep 5
@@ -314,25 +318,18 @@ for c in "$BACKEND" "$ZCACHE" "$PG"; do
   fi
 done
 
+# Release mode promises a constrained production envelope. Apply the limits to
+# the selected existing cache container when no dedicated bootstrap container
+# was requested; merely assigning CPUS/MEMORY does not change Docker resources.
+if [ "$RELEASE" = "1" ] && [ "$BOOTSTRAP" = "0" ]; then
+  docker update --cpus "$CPUS" --memory "$MEMORY" "$ZCACHE" >/dev/null
+fi
+
 # --- 1) JWT secret from the backend container ---------------------------------
 SECRET="$(docker exec "$BACKEND" printenv ZERO_AUTH_SECRET)"
 [ -n "$SECRET" ] || { echo "ERROR: ZERO_AUTH_SECRET not set in $BACKEND" >&2; exit 1; }
 
 # --- 1b) optional clean slate ---------------------------------------------------
-# Planner-flag A/B mode (#7): if --planner-flag is set, inject the env var
-# into the container before the run. This enables flag-on/flag-off comparison
-# runs (e.g. enableQueryPlanner=true) so ART can gate a feature rollout.
-if [ -n "$PLANNER_FLAG" ]; then
-  echo "== planner-flag A/B: setting $PLANNER_FLAG on $ZCACHE =="
-  docker exec "$ZCACHE" sh -c "export $PLANNER_FLAG" 2>/dev/null || true
-  # Can't set env on a running container — set via docker inspect + recreate
-  # For now, pass as an extra-param to replay (the server reads it from query params)
-  # This is the forward-looking path: when enableQueryPlanner rolls out,
-  # run-art-local.sh --planner-flag enableQueryPlanner=true runs the A leg,
-  # then a second run without it is the B leg.
-  PLANNER_EXTRA="--extra-param $PLANNER_FLAG"
-fi
-
 if [ "$CLEAN" = "1" ]; then
   echo "== purging art-% CVR rows (both pods) + restarting primary =="
   # Delete in FK-dependency order: desires → queries → clients → rows → rowsVersion → instances.
@@ -367,17 +364,30 @@ fi
 
 # --- 2) pick the best-connected user(s) (most channel memberships) ------------
 if [ -n "$USER_ID" ]; then
-  ROWS="$(psql_q "SELECT u.id, u.email, coalesce(u.name,''), m.\"memberId\", u.\"workspaceId\"
+  ROWS="$(psql_q "SELECT u.id, u.email, coalesce(u.name,''), m.\"memberId\", u.\"workspaceId\", w.\"orgId\"
                  FROM users u JOIN org_members m ON m.email = u.email
+                 JOIN workspaces w ON w.id = u.\"workspaceId\"
                  WHERE u.id = '$USER_ID' LIMIT 1;")"
 else
-  ROWS="$(psql_q "SELECT u.id, u.email, coalesce(u.name,''), m.\"memberId\", u.\"workspaceId\"
-                 FROM users u
-                 JOIN org_members m ON m.email = u.email
-                 LEFT JOIN channel_user_status cus ON cus.\"userId\" = u.id
-                 WHERE u.\"workspaceId\" IS NOT NULL
-                 GROUP BY u.id, u.email, u.name, m.\"memberId\", u.\"workspaceId\"
-                 ORDER BY count(cus.id) DESC LIMIT $USERS;")"
+  ROWS="$(psql_q "WITH scored AS (
+                   SELECT u.id, u.email, coalesce(u.name,'') AS name,
+                          m.\"memberId\", u.\"workspaceId\", w.\"orgId\",
+                          count(cus.id) AS memberships
+                   FROM users u
+                   JOIN org_members m ON m.email = u.email
+                   JOIN workspaces w ON w.id = u.\"workspaceId\"
+                   LEFT JOIN channel_user_status cus ON cus.\"userId\" = u.id
+                   WHERE u.\"workspaceId\" IS NOT NULL
+                   GROUP BY u.id, u.email, u.name, m.\"memberId\", u.\"workspaceId\", w.\"orgId\"
+                 ), ranked AS (
+                   SELECT *, row_number() OVER (
+                     PARTITION BY \"workspaceId\" ORDER BY memberships DESC, id
+                   ) AS workspace_rank
+                   FROM scored
+                 )
+                 SELECT id, email, name, \"memberId\", \"workspaceId\", \"orgId\"
+                 FROM ranked WHERE workspace_rank = 1
+                 ORDER BY memberships DESC, id LIMIT $USERS;")"
 fi
 [ -n "$ROWS" ] || { echo "ERROR: no suitable user found in $DB" >&2; exit 1; }
 
@@ -385,13 +395,13 @@ fi
 AUTH_POOL="harness/auth-pool.json"
 ALL_UIDS=""; FIRST_UID=""; N_IDENT=0
 printf '[' > "$AUTH_POOL.tmp"
-while IFS='|' read -r UID_ EMAIL NAME MEMBER_ID WORKSPACE_ID; do
+while IFS='|' read -r UID_ EMAIL NAME MEMBER_ID WORKSPACE_ID ORG_ID; do
   [ -n "$UID_" ] || continue
   TOKEN="$("$PY" tools/mint_local_jwt.py --secret "$SECRET" --sub "$UID_" --email "$EMAIL" \
           --name "${NAME:-ART}" --member-id "$MEMBER_ID" --workspace-id "$WORKSPACE_ID" | tail -1)"
   [ "$N_IDENT" -gt 0 ] && printf ',' >> "$AUTH_POOL.tmp"
-  "$PY" -c "import json,sys; print(json.dumps({'token': sys.argv[1], 'userID': sys.argv[2]}))" \
-      "$TOKEN" "$UID_" >> "$AUTH_POOL.tmp"
+  "$PY" -c "import json,sys; print(json.dumps({'token': sys.argv[1], 'userID': sys.argv[2], 'workspaceID': sys.argv[3], 'memberID': sys.argv[4], 'orgID': sys.argv[5]}))" \
+      "$TOKEN" "$UID_" "$WORKSPACE_ID" "$MEMBER_ID" "$ORG_ID" >> "$AUTH_POOL.tmp"
   ALL_UIDS="${ALL_UIDS:+$ALL_UIDS,}$UID_"
   [ -z "$FIRST_UID" ] && FIRST_UID="$UID_" && FIRST_EMAIL="$EMAIL" && JWT="$TOKEN"
   N_IDENT=$((N_IDENT+1))
@@ -555,7 +565,8 @@ if [ "$CHAOS" = "1" ]; then
   # connections open — keeps G1 meaningful) and leave 30s tail for recovery.
   CHAOS_REPORT="reports/chaos-$TAG.json"
   ( sleep 20 && "$PY" tools/chaos.py --zc-container "$ZCACHE" --pg-container "$PG" \
-      --duration $((DURATION > 60 ? DURATION - 50 : 30)) --out "$CHAOS_REPORT" ) &
+      --duration $((DURATION > 60 ? DURATION - 50 : 30)) \
+      --mean-gap-s "$CHAOS_MEAN_GAP" --out "$CHAOS_REPORT" ) &
   CHAOS_PID=$!
   echo "== chaos injection armed (pause-zc/pause-pg, report: $CHAOS_REPORT) =="
 fi
@@ -726,14 +737,18 @@ if [ "$ORACLE" = "1" ]; then
   fi
   ORACLE_REPORT="reports/diff-$TAG.json"
   # full-catalog mode subscribes EVERY resolvable query once (no churn) so all
-  # ~151 shapes get differential coverage + two-sided hydration-parity checking;
-  # 1 pair is enough (it's the whole catalog) and no duration/churn is needed.
+  # ~151 shapes get differential coverage + two-sided hydration-parity checking.
+  # The server accepts at most 100 desired queries per client, so shard the
+  # catalog into independent 50-query pairs instead of silently comparing the
+  # first 100 and accepting matching transform errors for the rest.
   ORACLE_PAIRS=3; ORACLE_DURATION=90; ORACLE_QUIESCE=180
   ORACLE_FULLCAT=()
   if [ "$FULLCATALOG" = "1" ]; then
-    ORACLE_FULLCAT=(--full-catalog); ORACLE_PAIRS=1; ORACLE_DURATION=5; ORACLE_QUIESCE=45
+    ORACLE_FULLCAT=(--full-catalog --catalog-batch-size 50); ORACLE_PAIRS=4; ORACLE_DURATION=5; ORACLE_QUIESCE=45
   fi
-  echo "== differential oracle (G8)${FULLCATALOG:+ [full-catalog]} =="
+  ORACLE_LABEL=""
+  [ "$FULLCATALOG" = "1" ] && ORACLE_LABEL=" [full-catalog]"
+  echo "== differential oracle (G8)$ORACLE_LABEL =="
   set +e
   "$PY" harness/diff_oracle.py --primary "$TARGET" \
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
@@ -844,13 +859,19 @@ fi
 if [ "$TELEMETRY" = "1" ]; then
   TELEMETRY_REPORT="reports/telemetry-$TAG.json"
   echo "== telemetry-contract test (G17) =="
-  set +e; "$PY" tools/telemetry_contract.py --container "$ZCACHE" --since "${DURATION}s" --baseline art-baseline.json --out "$TELEMETRY_REPORT"; set -e
+  set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json --out "$TELEMETRY_REPORT"; set -e
 fi
 if [ "$READINESS" = "1" ]; then
   READINESS_REPORT="reports/readiness-$TAG.json"
-  : "${HTTP_PORT:=8080}"
+  READINESS_HTTP="http${TARGET#ws}"
+  if [ -n "$HTTP_PORT" ]; then
+    READINESS_TARGET="${TARGET#*://}"
+    READINESS_HOST="${READINESS_TARGET%%/*}"
+    READINESS_PATH="/${READINESS_TARGET#*/}"
+    READINESS_HTTP="http://${READINESS_HOST}:${HTTP_PORT}${READINESS_PATH}"
+  fi
   echo "== readiness/liveness contract (G19) =="
-  set +e; "$PY" tools/probe_readiness.py --http "http://${SANDBOX}.localhost:${HTTP_PORT}" --ws-target "$TARGET" --auth-token "$JWT" --out "$READINESS_REPORT"; set -e
+  set +e; "$PY" tools/probe_readiness.py --http "$READINESS_HTTP" --ws-target "$TARGET" --auth-token "$JWT" --out "$READINESS_REPORT"; set -e
 fi
 if [ "$DETERMINISM" = "1" ]; then
   DETERMINISM_REPORT="reports/determinism-$TAG.json"
@@ -873,7 +894,11 @@ if [ "$IMAGEAUDIT" = "1" ]; then
   fi
   if [ -n "$IMAGE" ]; then
     echo "== image supply-chain audit (G23): $IMAGE =="
-    set +e; "$PY" tools/image_audit.py --image "$IMAGE" --out "$IMAGEAUDIT_REPORT"; set -e
+    set +e; "$PY" tools/image_audit.py --image "$IMAGE" \
+      --size-budget-mb 600 --size-hard-mb 700 \
+      --expected-base sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 \
+      --require-label org.opencontainers.image.base.name \
+      --out "$IMAGEAUDIT_REPORT"; set -e
   else
     echo "NOTE: could not determine image ref for $ZCACHE — pass --image" >&2
   fi
@@ -881,13 +906,24 @@ fi
 if [ "$CAPACITY" = "1" ]; then
   CAPACITY_REPORT="reports/capacity-$TAG.json"
   echo "== capacity-cliff sweep (G22): ladder $CAPACITY_LADDER =="
-  set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --ladder "$CAPACITY_LADDER" --blessed-conns "$CAPACITY_BLESSED" --out "$CAPACITY_REPORT"; set -e
+  set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" \
+    --id-pool "$POOL" --client-schema "$CSCHEMA" --ladder "$CAPACITY_LADDER" \
+    --blessed-conns "$CAPACITY_BLESSED" --out "$CAPACITY_REPORT"; set -e
 fi
 if [ "$PARITY" = "1" ]; then
   PARITY_REPORT="reports/parity-$TAG.json"
-  echo "== latency-parity gate (G25): Go vs TS =="
+  echo "== latency-parity gate (G25): Rust vs TS =="
   if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
-    PARITY_FLAGS=(--drive --primary-target "$TARGET" --mirror-target "$MIRROR_URL")
+    if [ "$RELEASE" = "1" ]; then
+      echo "  equalizing parity resources: cpus=$CPUS memory=$MEMORY"
+      docker update --cpus "$CPUS" --memory "$MEMORY" "$ZCACHE" "$MIRROR_POD" >/dev/null
+      docker restart "$ZCACHE" "$MIRROR_POD" >/dev/null
+      wait_mirror_ready "$ZCACHE" 180 || true
+      wait_mirror_ready "$MIRROR_POD" 180 || true
+    fi
+    PARITY_FLAGS=(--drive --primary-target "$TARGET" --mirror-target "$MIRROR_URL"
+      --connections "$CONNS" --working-set "$WORKING_SET" --duration 180)
+    [ -n "$PROFILE" ] && PARITY_FLAGS+=(--profile "$PROFILE")
     [ "$CASCADE" = "1" ] && PARITY_FLAGS+=(--cascade)
     [ "$OVERSAMPLE" = "1" ] && PARITY_FLAGS+=(--oversample)
     [ "$WRITE_PARITY" = "1" ] && PARITY_FLAGS+=(--write-parity)

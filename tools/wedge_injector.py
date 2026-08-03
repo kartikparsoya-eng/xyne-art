@@ -38,8 +38,6 @@ import argparse
 import json
 import re
 import subprocess
-import sys
-import time
 import urllib.request
 
 
@@ -210,7 +208,6 @@ def main() -> int:
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)
 
-    verdict_rank = {"PASS": 0, "WATCH": 1, "FAIL": 2, "ERROR": 3}
     print(f"G26 progress-handler gate: {result['verdict']}")
     for d in result["details"]:
         print(f"  {d}")

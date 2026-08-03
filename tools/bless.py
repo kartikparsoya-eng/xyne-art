@@ -148,8 +148,8 @@ def main() -> int:
         bl_hash = bl.get("config_hash")
         if bl_hash and bl_hash != cfg_hash:
             print(f"  WARNING: baseline config_hash mismatch (baseline={bl_hash}, current={cfg_hash})")
-            print(f"  catalog/seeder/harness changed since this baseline was blessed.")
-            print(f"  Re-bless required: the stale baseline may gate wrong.")
+            print("  catalog/seeder/harness changed since this baseline was blessed.")
+            print("  Re-bless required: the stale baseline may gate wrong.")
         if shape in bl.get("shapes", {}):
             old = bl["shapes"][shape]
             print(f"  existing baseline: p50={old.get('p50')} p95={old.get('p95')}")

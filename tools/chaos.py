@@ -13,12 +13,13 @@ the bug classes normal replay can't reach:
 
 Events are exponentially spaced (mean --mean-gap-s). Containers are ALWAYS
 unpaused (finally-block), even on crash/ctrl-C. After the last event the tool
-waits for the zero-cache healthcheck and writes a summary JSON.
+waits for the zero-cache healthcheck, or verifies process state when the image
+does not define a Docker HEALTHCHECK, and writes a summary JSON.
 
     python3 tools/chaos.py --duration 120 --out reports/chaos.json
     python3 tools/chaos.py --actions pause-zc --mean-gap-s 30 --pause-s 10 ...
 
-Exit 0 = all events reverted + zero-cache healthy at end; 1 = otherwise.
+Exit 0 = all events reverted + zero-cache healthy/running at end; 1 = otherwise.
 NOTE: pausing postgres briefly affects every sandbox on this host — local
 dev use only. Run with --lifecycle replay so clients expect reconnects.
 """
@@ -38,8 +39,20 @@ def sh(*cmd: str, timeout: int = 30) -> tuple[int, str]:
 
 
 def health(container: str) -> str:
-    rc, out = sh("docker", "inspect", "-f", "{{.State.Health.Status}}", container)
-    return out if rc == 0 else "unknown"
+    template = ("{{.State.Running}} "
+                "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}")
+    rc, out = sh("docker", "inspect", "-f", template, container)
+    if rc != 0:
+        return "unknown"
+    running, _, status = out.partition(" ")
+    if status and status != "none":
+        return status
+    return "running" if running == "true" else "stopped"
+
+
+def recovery_ok(all_reverted: bool, final_health: str) -> bool:
+    """A running container is the strongest local signal without HEALTHCHECK."""
+    return all_reverted and final_health in ("healthy", "running")
 
 
 def main() -> int:
@@ -161,15 +174,15 @@ def main() -> int:
             sh("docker", "exec", netem_container,
                "tc", "qdisc", "del", "dev", iface, "root")
 
-    # Recovery check: zero-cache healthcheck must go green.
+    # Recovery check: prefer HEALTHCHECK, fall back to process state when absent.
     final_health = "unknown"
     for _ in range(45):
         final_health = health(a.zc_container)
-        if final_health == "healthy":
+        if final_health in ("healthy", "running"):
             break
         time.sleep(2)
 
-    ok = all_reverted and final_health == "healthy"
+    ok = recovery_ok(all_reverted, final_health)
     summary = {"events": events, "n_events": len(events),
                "all_reverted": all_reverted, "final_health": final_health,
                "verdict": "PASS" if ok else "FAIL"}

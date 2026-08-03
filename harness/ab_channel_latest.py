@@ -110,8 +110,6 @@ async def measure_one(args: dict, tag: str) -> float:
     sec_protocol = encode_sec_protocols(None, token)
 
     url = build_connect_url(cgid, cid)
-    t0 = time.monotonic()
-
     try:
         async with websockets.connect(
             url,
@@ -162,7 +160,6 @@ async def run_variant(label: str, args: dict, trials: int) -> list[float]:
         lat = await measure_one(args, f"{label}-{i}")
         if lat > 0:
             latencies.append(lat)
-            pct = (i + 1) / trials * 100
             print(f"  {label} trial {i+1:3d}/{trials}: {lat:8.1f} ms", file=sys.stderr)
         else:
             print(f"  {label} trial {i+1:3d}/{trials}: FAILED", file=sys.stderr)
@@ -218,8 +215,8 @@ async def main():
 
     # Warmup (excluded from results)
     print("== warmup ==", file=sys.stderr)
-    warmup_before = await run_variant("warmup-A", args_before, WARMUP)
-    warmup_after = await run_variant("warmup-B", args_after, WARMUP)
+    await run_variant("warmup-A", args_before, WARMUP)
+    await run_variant("warmup-B", args_after, WARMUP)
 
     # A/B/A/B alternating to control for temporal drift
     print("== measured trials ==", file=sys.stderr)

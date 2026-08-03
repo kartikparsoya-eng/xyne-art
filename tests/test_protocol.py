@@ -13,11 +13,11 @@ import urllib.parse
 from protocol import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols
 
 
-def test_protocol_version_is_49():
+def test_protocol_version_is_51():
     # packages/zero-protocol/src/protocol-version.ts. Bump this test when the
     # mono default moves; updating the constant without the test is exactly
     # the silent-drift this suite exists to catch.
-    assert DEFAULT_PROTOCOL_VERSION == 49
+    assert DEFAULT_PROTOCOL_VERSION == 51
 
 
 def test_encode_sec_protocols_structure():

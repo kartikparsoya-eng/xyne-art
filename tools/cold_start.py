@@ -36,12 +36,34 @@ import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harness"))
 from protocol import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
-from workload import ArgResolver, load_baseline, query_put, init_connection_message  # noqa: E402
+from workload import (  # noqa: E402
+    ArgResolver, SchemaSynthesizer, WeightedSampler, init_connection_message,
+    load_baseline, query_put,
+)
 
 
 def rid() -> str:
     r = random.SystemRandom()
     return "art-" + "".join(r.choice("abcdefghijklmnop0123456789") for _ in range(10))
+
+
+def hydration_frame(msg: object) -> tuple[int, bool, str | None]:
+    """Return (row patch count, completed poke, protocol error)."""
+    if not isinstance(msg, list) or not msg:
+        return 0, False, None
+    tag = msg[0]
+    body = msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
+    if tag in ("error", "transformError"):
+        return 0, False, str(body.get("kind") or body.get("queryName") or tag)
+    if tag == "pokePart":
+        return len(body.get("rowsPatch") or []), False, None
+    if tag == "pokeEnd":
+        return 0, not body.get("cancel"), None
+    if tag == "poke":
+        rows = sum(len(part.get("rowsPatch") or [])
+                   for part in body.get("pokeParts") or [] if isinstance(part, dict))
+        return rows, True, None
+    return 0, False, None
 
 
 async def _await_open(target: str, version: int, auth_token: str | None,
@@ -100,27 +122,70 @@ async def probe(a: argparse.Namespace) -> dict:
                 "summary": f"never came up in {boot_ms}ms (infra or boot hang)"}
 
     # 3. drive a small working set and wait for first poke (hydration)
-    try:
-        baseline = load_baseline(a.id_pool.replace("id-pool", "id-pool") or a.baseline)
-    except Exception:
-        baseline = None
-    rng = random.Random(0)
+    baseline = load_baseline(a.baseline)
+    rng = random.Random(42)
     resolver = ArgResolver.from_pool_file(a.id_pool, rng)
-    # pick the top-3 weighted queries for a minimal hydration probe
-    if baseline:
-        ops = sorted(baseline.queries, key=lambda o: -o.weight)[:3]
-        puts = []
-        for op in ops:
-            args, _ = resolver.resolve(op)
-            puts.append(query_put(op.name, args))
-    else:
-        puts = [query_put("userBookmarks", {})]
+    schema_doc = None
+    if a.current_query_schema and os.path.exists(a.current_query_schema):
+        with open(a.current_query_schema) as f:
+            schema_doc = json.load(f)
+        current = schema_doc.get("queries") or {}
+        baseline.queries = [op for op in baseline.queries if op.name in current]
+        baseline.oneshots = [op for op in baseline.oneshots if op.name in current]
+    query_synth = None
+    if schema_doc is not None:
+        minimal_queries = {}
+        for name, entry in (schema_doc.get("queries") or {}).items():
+            args_schema = entry.get("args")
+            minimal_queries[name] = {
+                **entry,
+                "args": {} if args_schema is None else {
+                    key: schema for key, schema in args_schema.items()
+                    if not schema.get("optional") and not schema.get("hasDefault")
+                },
+            }
+        query_synth = SchemaSynthesizer(
+            {"mutators": minimal_queries,
+             "enums": schema_doc.get("enums") or {}},
+            resolver.ids, resolver.scalars, {}, rng,
+        )
+    sampler = WeightedSampler(baseline.all_read_ops, rng)
+    puts = []
+    query_names = []
+    seen_hashes = set()
+    attempts = 0
+    while len(puts) < a.queries and attempts < a.queries * 100:
+        attempts += 1
+        op = sampler.sample()
+        if query_synth is not None:
+            args, _ = query_synth.synth(op.name, int(time.time() * 1000))
+            ok = args is not None
+        else:
+            args, ok = resolver.resolve(op)
+        if not ok:
+            continue
+        put = query_put(op.name, args)
+        if put["hash"] in seen_hashes:
+            continue
+        seen_hashes.add(put["hash"])
+        puts.append(put)
+        query_names.append(op.name)
+    if len(puts) != a.queries:
+        await ws.close()
+        checks.append({"name": "hydrate-setup", "verdict": "ERROR",
+                       "detail": f"resolved only {len(puts)}/{a.queries} queries"})
+        total_ms = round((time.perf_counter() - t0) * 1000)
+        return {"verdict": "ERROR", "checks": checks, "boot_ms": boot_ms,
+                "hydrate_ms": None, "total_ms": total_ms,
+                "summary": "could not build an evidentiary hydration query set"}
     init = init_connection_message(puts,
                                     client_schema=json.load(open(a.client_schema)) if a.client_schema else None)
     await ws.send(json.dumps(init))
     t_send = time.perf_counter()
     hydrate_deadline = t_send + a.hydrate_budget_ms / 1000.0
     got_poke = False
+    rows_seen = 0
+    protocol_error = None
     while time.perf_counter() < hydrate_deadline:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
@@ -130,7 +195,12 @@ async def probe(a: argparse.Namespace) -> dict:
             break
         try:
             msg = json.loads(raw)
-            if isinstance(msg, list) and msg and msg[0] in ("poke", "admin"):
+            row_ops, completed, frame_error = hydration_frame(msg)
+            rows_seen += row_ops
+            if frame_error:
+                protocol_error = frame_error
+                break
+            if completed and rows_seen:
                 got_poke = True
                 break
         except Exception:
@@ -141,14 +211,16 @@ async def probe(a: argparse.Namespace) -> dict:
 
     if not got_poke:
         checks.append({"name": "hydrate", "verdict": "FAIL",
-                       "detail": f"no poke within {a.hydrate_budget_ms}ms "
-                                 f"(hydration stalled or no desired queries)"})
+                       "detail": (f"protocol error: {protocol_error}" if protocol_error
+                                  else f"no nonempty completed poke within "
+                                       f"{a.hydrate_budget_ms}ms")})
         return {"verdict": "ERROR", "checks": checks, "boot_ms": boot_ms,
                 "hydrate_ms": hydrate_ms, "total_ms": total_ms,
                 "summary": f"boot {boot_ms}ms OK but never hydrated in {hydrate_ms}ms"}
 
     checks.append({"name": "hydrate", "verdict": "PASS",
-                   "detail": f"first poke in {hydrate_ms}ms"})
+                   "detail": f"first completed hydration in {hydrate_ms}ms "
+                             f"({rows_seen} row patches)"})
     over = total_ms > a.budget_ms
     verdict = "FAIL" if over else "PASS"
     checks.append({"name": "budget", "verdict": verdict,
@@ -157,7 +229,8 @@ async def probe(a: argparse.Namespace) -> dict:
                f"total={total_ms}ms (budget {a.budget_ms}ms) "
                f"{'OVER' if over else 'OK'}")
     return {"verdict": verdict, "checks": checks, "boot_ms": boot_ms,
-            "hydrate_ms": hydrate_ms, "total_ms": total_ms, "summary": summary}
+            "hydrate_ms": hydrate_ms, "total_ms": total_ms, "summary": summary,
+            "rows_seen": rows_seen, "queries": query_names}
 
 
 def main() -> int:
@@ -169,6 +242,8 @@ def main() -> int:
     ap.add_argument("--extra-param", action="append", default=[], help="k=v connect-URL params")
     ap.add_argument("--id-pool", default=None)
     ap.add_argument("--client-schema", default=None)
+    ap.add_argument("--current-query-schema", default="raw/arg-schemas.source.json")
+    ap.add_argument("--queries", type=int, default=8)
     ap.add_argument("--baseline", default="art-baseline.json")
     ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
     ap.add_argument("--boot-budget-ms", type=int, default=60000)

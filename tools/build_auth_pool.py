@@ -74,7 +74,7 @@ def psql(a, sql: str) -> list[list[str]]:
 # three sandbox@xyne.ai users.id rows has channel_user_status rows (1,977) —
 # picking another yields a zero-visibility identity.
 USERS_SQL = """
-SELECT DISTINCT ON (u.id) u.id, u.email, u.name, om."memberId", w.id,
+SELECT DISTINCT ON (u.id) u.id, u.email, u.name, om."memberId", w.id, w."orgId",
     (SELECT count(*) FROM public.channel_user_status cus2
      WHERE cus2."userId" = u.id) AS memb
 FROM public.users u
@@ -118,10 +118,10 @@ def main() -> int:
     rows: list[list[str]] = []
     for em in [e.strip().replace("'", "") for e in a.extra_emails.split(",") if e.strip()]:
         got = psql(a, USERS_SQL.format(where=f"u.email = '{em}'"))
-        got.sort(key=lambda r: -int(r[5] or 0))      # most-visible users.id first
+        got.sort(key=lambda r: -int(r[6] or 0))      # most-visible users.id first
         rows += got
     bulk = psql(a, USERS_SQL.format(where=f"u.email LIKE '{like}'"))
-    bulk.sort(key=lambda r: (r[1], -int(r[5] or 0)))  # bulk-user-000..NNN
+    bulk.sort(key=lambda r: (r[1], -int(r[6] or 0)))  # bulk-user-000..NNN
     rows += bulk
 
     pool, seen = [], set()
@@ -129,14 +129,16 @@ def main() -> int:
         # dedupe by email too: duplicate users rows sharing an email resolve
         # to the SAME org_members row (email join) — keep the users.id that
         # actually holds the channel memberships (memb rank above)
-        if len(r) != 6 or r[0] in seen or r[1] in seen:
+        if len(r) != 7 or r[0] in seen or r[1] in seen:
             continue
-        uid, email, name, member_id, ws_id, _memb = r
+        uid, email, name, member_id, ws_id, org_id, _memb = r
         seen.update((uid, email))
         pool.append({
             "token": mint(secret, uid, email, name or "ART User", a.ttl,
                           member_id or None, ws_id or None),
-            "userID": uid, "email": email, "name": name,
+            "userID": uid, "workspaceID": ws_id,
+            "memberID": member_id, "orgID": org_id,
+            "email": email, "name": name,
         })
 
     if not pool:

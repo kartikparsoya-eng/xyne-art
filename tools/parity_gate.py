@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""parity_gate.py — G25: Go-vs-TS latency-parity gate.
+"""parity_gate.py — G25: Rust-vs-TS latency-parity gate.
 
-The ART catches Go-vs-Go regressions (did this commit make things worse?) but
-NOT Go-vs-TS fundamental architecture gaps (a missing query planner, an N+1,
+The ART catches Rust-vs-Rust regressions (did this commit make things worse?)
+but NOT Rust-vs-TS fundamental architecture gaps (a missing query planner, an N+1,
 a missing index). The diff oracle (G8) proves Go and TS return identical ROWS;
 it emits zero latency. A query like userAllChannels (weight 254, ~0.7%) that
 is 5x slower on Go than TS due to a missing N+1 optimization sails clean
 through the correctness oracle — same rows, different cost. This gate closes
 that hole: it drives identical load at both builds, computes the per-query
-Go/TS latency RATIO, and FAILs when one build is structurally slower than the
-other beyond the noise floor.
+Rust/TS latency RATIO, and FAILs when Rust is structurally slower than TS
+beyond the noise floor. A faster Rust implementation is not a regression.
 
 Why a RATIO, not absolute numbers: both builds hit the IDENTICAL sandbox, so
 sandbox-size differences cancel. If Go is 5x slower than TS at 100 channels,
@@ -86,9 +86,9 @@ def compute_ratios(primary_pq: dict, mirror_pq: dict,
         query is 1.1x, under the factor)
 
     primary = the build under test (Go); mirror = the reference (TS).
-    A query where primary is slower -> offender (Go regressed vs TS).
-    A query where mirror is slower -> offender too (TS regressed vs Go) —
-    parity is bidirectional; either direction is a finding.
+    A query where primary is slower -> offender (Rust regressed vs TS).
+    A query where mirror is slower is recorded but passes: TS is the
+    correctness oracle and performance floor, not the build under test.
     """
     offenders: list[dict] = []
     compared = 0
@@ -109,8 +109,8 @@ def compute_ratios(primary_pq: dict, mirror_pq: dict,
                            "ratio": round(pv / mv, 2) if mv else None,
                            "verdict": "SKIP", "detail": f"mirror {quantile} {mv}ms < {min_baseline_ms}ms baseline"})
             continue
-        # bidirectional ratio: always >= 1.0 (max/min), so a query where EITHER
-        # build is slower triggers the factor check (parity is symmetric)
+        # Keep the symmetric ratio for diagnostics, but only a slower primary
+        # can fail this directional production-readiness gate.
         slower, faster = (pv, mv) if pv >= mv else (mv, pv)
         ratio = slower / faster if faster else float("inf")
         delta = abs(pv - mv)
@@ -120,7 +120,7 @@ def compute_ratios(primary_pq: dict, mirror_pq: dict,
                  "direction": direction,
                  "samples": {"primary": ps, "mirror": ms}}
         ratios.append(entry)
-        if ratio > factor and delta > min_delta_ms:
+        if direction == "primary-slower" and ratio > factor and delta > min_delta_ms:
             entry["verdict"] = "FAIL"
             offenders.append(entry)
         else:
@@ -264,7 +264,8 @@ def compute_write_parity(primary_pokes: list[float], mirror_pokes: list[float],
     detail = {"primary_p95": ps["p95"], "mirror_p95": ms["p95"],
               "ratio": ratio, "delta_ms": delta, "direction": direction,
               "samples": {"primary": ps["samples"], "mirror": ms["samples"]}}
-    verdict = "FAIL" if ratio > factor and delta > min_delta_ms else "PASS"
+    verdict = ("FAIL" if direction == "primary-slower"
+               and ratio > factor and delta > min_delta_ms else "PASS")
     return {"compared": compared, "stats": {"primary": ps, "mirror": ms},
             "offenders": [detail] if verdict == "FAIL" else [],
             "verdict": verdict, "detail": detail}
@@ -275,7 +276,8 @@ def compute_write_parity(primary_pokes: list[float], mirror_pokes: list[float],
 # --------------------------------------------------------------------------- #
 def drive_replay(target: str, auth_token: str | None, id_pool: str,
                  conns: int, working_set: int, churn_ms: int, duration: int,
-                 extra: list[str], protocol: int, tag: str, label: str) -> str:
+                 extra: list[str], protocol: int, tag: str, label: str,
+                 profile: str | None = None) -> str:
     out_dir = f"reports/parity-{tag}-{label}.json"
     cmd = [sys.executable, "harness/replay.py",
            "--target", target, "--id-pool", id_pool,
@@ -285,6 +287,8 @@ def drive_replay(target: str, auth_token: str | None, id_pool: str,
            "--client-schema", "harness/client-schema.json"]
     if auth_token:
         cmd += ["--auth-token", auth_token]
+    if profile:
+        cmd += ["--profile", profile]
     cmd += extra
     subprocess.run(cmd, check=False, timeout=duration + 120)
     # replay.py writes run-TIMESTAMP.json inside out_dir — find it
@@ -298,6 +302,29 @@ def load_run_latencies(path: str) -> tuple[dict, dict]:
     d = json.load(open(path))
     return (d.get("latency_by_query") or {},
             d.get("client_latency_steady_ms") or {})
+
+
+def validate_run(path: str) -> tuple[dict | None, str | None]:
+    """Reject incomplete replay arms before computing performance ratios."""
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except Exception as e:
+        return None, f"cannot load replay report {path}: {type(e).__name__}: {e}"
+    cfg = doc.get("config") or {}
+    counters = doc.get("counters") or {}
+    requested = int(cfg.get("connections") or 0)
+    opened = int(counters.get("opened") or 0)
+    failed = int(counters.get("failed_open") or 0)
+    errors = int(counters.get("errors") or 0)
+    if requested <= 0:
+        return None, "replay report has no positive requested connection count"
+    if opened != requested or failed != 0:
+        return None, (f"incomplete arm: opened={opened}/{requested}, "
+                      f"failed_open={failed}")
+    if errors != 0:
+        return None, f"arm emitted {errors} protocol error(s)"
+    return doc, None
 
 
 # --------------------------------------------------------------------------- #
@@ -487,8 +514,15 @@ async def amain(a: argparse.Namespace) -> dict:
 
     # --- consume mode ---
     if a.primary_run and a.mirror_run:
-        primary_pq, _ = load_run_latencies(a.primary_run)
-        mirror_pq, _ = load_run_latencies(a.mirror_run)
+        p_doc, p_error = validate_run(a.primary_run)
+        m_doc, m_error = validate_run(a.mirror_run)
+        if p_error or m_error:
+            checks.append({"name": "consume", "verdict": "ERROR",
+                           "detail": "; ".join(e for e in (p_error, m_error) if e)})
+            return {"verdict": "ERROR", "checks": checks,
+                    "summary": "invalid parity replay arm"}
+        primary_pq = p_doc.get("latency_by_query") or {}
+        mirror_pq = m_doc.get("latency_by_query") or {}
         checks.append({"name": "consume", "verdict": "PASS",
                        "detail": f"loaded {len(primary_pq)} + {len(mirror_pq)} per-query latencies"})
     # --- drive mode ---
@@ -500,14 +534,29 @@ async def amain(a: argparse.Namespace) -> dict:
         extra = []
         for p in a.extra_param:
             extra += ["--extra-param", p]
-        p_path = drive_replay(a.primary_target, a.auth_token, a.id_pool,
-                              a.connections, a.working_set, a.churn_ms,
-                              a.duration, extra, a.protocol_version, tag, "primary")
-        m_path = drive_replay(a.mirror_target, a.auth_token, a.id_pool,
-                              a.connections, a.working_set, a.churn_ms,
-                              a.duration, extra, a.protocol_version, tag, "mirror")
-        primary_pq, _ = load_run_latencies(p_path)
-        mirror_pq, _ = load_run_latencies(m_path)
+        try:
+            p_path = drive_replay(a.primary_target, a.auth_token, a.id_pool,
+                                  a.connections, a.working_set, a.churn_ms,
+                                  a.duration, extra, a.protocol_version, tag, "primary",
+                                  a.profile)
+            m_path = drive_replay(a.mirror_target, a.auth_token, a.id_pool,
+                                  a.connections, a.working_set, a.churn_ms,
+                                  a.duration, extra, a.protocol_version, tag, "mirror",
+                                  a.profile)
+        except (OSError, subprocess.SubprocessError) as e:
+            checks.append({"name": "drive", "verdict": "ERROR",
+                           "detail": f"replay invocation failed: {type(e).__name__}: {e}"})
+            return {"verdict": "ERROR", "checks": checks,
+                    "summary": "parity replay invocation failed"}
+        p_doc, p_error = validate_run(p_path)
+        m_doc, m_error = validate_run(m_path)
+        if p_error or m_error:
+            checks.append({"name": "drive", "verdict": "ERROR",
+                           "detail": "; ".join(e for e in (p_error, m_error) if e)})
+            return {"verdict": "ERROR", "checks": checks,
+                    "summary": "invalid parity replay arm"}
+        primary_pq = p_doc.get("latency_by_query") or {}
+        mirror_pq = m_doc.get("latency_by_query") or {}
         checks.append({"name": "drive", "verdict": "PASS",
                        "detail": f"replay vs primary ({len(primary_pq)} q) + mirror ({len(mirror_pq)} q)"})
     else:
@@ -612,7 +661,7 @@ async def amain(a: argparse.Namespace) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="G25: Go-vs-TS latency-parity gate.")
+    ap = argparse.ArgumentParser(description="G25: Rust-vs-TS latency-parity gate.")
     # consume mode
     ap.add_argument("--primary-run", default=None, help="Go run report (consume mode)")
     ap.add_argument("--mirror-run", default=None, help="TS run report (consume mode)")
@@ -629,6 +678,8 @@ def main() -> int:
     ap.add_argument("--working-set", type=int, default=12)
     ap.add_argument("--churn-ms", type=int, default=750)
     ap.add_argument("--duration", type=int, default=180)
+    ap.add_argument("--profile", default=None,
+                    help="behavior profile passed identically to both replay arms")
     # ratio rules (mirror G5b noise floor)
     ap.add_argument("--factor", type=float, default=2.0,
                     help="FAIL when primary/mirror ratio exceeds this (default 2.0)")

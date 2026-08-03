@@ -72,9 +72,9 @@ def seed(a):
     conversations = psql(a, f'SELECT "conversationId" FROM public.conversations ORDER BY "conversationId" LIMIT {int(5000 * n)}')
     conv_ids = conversations.strip().split("\n")
 
-    boards = psql(a, f"SELECT id FROM public.boards ORDER BY id LIMIT 10")
+    boards = psql(a, "SELECT id FROM public.boards ORDER BY id LIMIT 10")
     board_ids = boards.strip().split("\n") if boards.strip() else ["artscale-board-0"]
-    projects = psql(a, f"SELECT id FROM public.projects ORDER BY id LIMIT 10")
+    projects = psql(a, "SELECT id FROM public.projects ORDER BY id LIMIT 10")
     project_ids = projects.strip().split("\n") if projects.strip() else ["artscale-proj-0"]
 
     print(f"  existing: {len(user_ids)} users, {len(channel_ids)} channels, {len(conv_ids)} conversations")
@@ -122,7 +122,7 @@ ON CONFLICT DO NOTHING;
     # Generate unique (userId, userGroupId) pairs: user = i % n_pool, group = (i / n_pool) % n_groups
     # This guarantees no duplicate pairs since each i maps to a unique (user, group) combo
     n_ugm = int(15000 * n)
-    all_users = psql(a, f"SELECT id FROM public.users WHERE email LIKE 'bulk-user-%' OR email LIKE 'scale-user-%' ORDER BY email LIMIT 500")
+    all_users = psql(a, "SELECT id FROM public.users WHERE email LIKE 'bulk-user-%' OR email LIKE 'scale-user-%' ORDER BY email LIMIT 500")
     all_user_ids = all_users.strip().split("\n") if all_users.strip() else user_ids
     n_pool = min(len(all_user_ids), 200)
     run_sql(a, f"user_group_mappings ({n_ugm})", f"""
@@ -397,7 +397,7 @@ SELECT 'artwhale-user-' || lpad(i::text, 4, '0'),
 FROM generate_series(0, 3999) i
 ON CONFLICT DO NOTHING;
 """)
-    run_sql(a, "whale org_members (4K)", f"""
+    run_sql(a, "whale org_members (4K)", """
 INSERT INTO public.org_members ("memberId", email, "orgId", "userId", role, "joinedAt")
 SELECT 'artwhale-member-' || lpad(i::text, 4, '0'),
        'whale-user-' || i || '@xyne.test',

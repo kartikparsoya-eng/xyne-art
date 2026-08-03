@@ -63,6 +63,11 @@ HARD_BLOCKING: list[tuple[str, str]] = [
     ("breaker-tripped",     r"reset circuit breaker tripped"),
     ("rpc-init-timeout",    r"RPC init timed out"),
     ("go-init-failed",      r"Go backend init failed"),
+    ("rust-thread-panic",   r"thread ['\"].*['\"] panicked|engine advance panic"),
+    ("rust-advance-panic",  r"\[rust-ivm\] advance(?: streamed)? panicked"),
+    ("rust-init-failed",    r"\[rust-ivm\].*(snapshotter|source|engine).*init.*failed"),
+    ("rust-ast-parse",      r"AST parse error for qid="),
+    ("sqlite-corrupt",      r"database disk image is malformed|SQLITE_CORRUPT"),
     # go-ivm's wedge watchdog (landed 2026-07-08): a per-CG handler running
     # past ~90s logs [GO-IVM][WEDGE] cg=… method=… every tick and dumps all
     # goroutine stacks ONCE per incident between WEDGE-STACKS BEGIN/END
@@ -308,11 +313,35 @@ SIG_FIELD_RES = [
 ]
 SIG_BASELINE_PATH = os.path.join(os.path.dirname(__file__), "..", "reports",
                                  "log-signatures-baseline.json")
+SIG_SCHEMA = 2
 
 
 def normalize_signature(line: str) -> str:
     """Strip variable parts from a log line to produce a stable signature."""
     s = line.strip()
+    try:
+        event = json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        event = None
+    if isinstance(event, dict):
+        # Query ASTs, SQL text, IDs, and stack traces describe the context, not
+        # the failure class. Keeping them made one Slow SQLite warning produce
+        # thousands of distinct signatures. Retain only stable routing and
+        # diagnostic fields, then normalize dynamic values below.
+        semantic = {
+            key: event[key]
+            for key in (
+                "level", "worker", "component", "class", "method", "name",
+                "errorKind", "error", "errorMsg", "message",
+            )
+            if key in event and isinstance(event[key], (str, int, float, bool))
+        }
+        body = event.get("errorBody")
+        if isinstance(body, dict):
+            for key in ("kind", "message"):
+                if isinstance(body.get(key), (str, int, float, bool)):
+                    semantic[f"errorBody.{key}"] = body[key]
+        s = json.dumps(semantic, sort_keys=True, separators=(",", ":"))
     s = SIG_UUID_RE.sub("*", s)
     s = SIG_CG_RE.sub("cg=*", s)
     for rx in SIG_FIELD_RES:
@@ -320,7 +349,23 @@ def normalize_signature(line: str) -> str:
     s = SIG_DUR_RE.sub("*", s)
     s = SIG_ID_RE.sub("*", s)
     s = SIG_NUM_RE.sub("*", s)
-    return s[:200]  # cap length
+    return s[:500]  # cap pathological unstructured messages
+
+
+def is_error_or_warn_level(line: str) -> bool:
+    """Match the event level, not words such as "error" in an INFO message."""
+    try:
+        event = json.loads(line)
+        level = event.get("level")
+        if isinstance(level, str):
+            return level.upper() in {"ERROR", "WARN", "WARNING"}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return bool(re.search(
+        r"(?:^|\s)(?:ERROR|WARN|WARNING)(?:\s|:)|\blevel=(?:error|warn|warning)\b",
+        line,
+        re.I,
+    ))
 
 
 def scan_unknown_signatures(container: str, since: str) -> set:
@@ -333,8 +378,9 @@ def scan_unknown_signatures(container: str, since: str) -> set:
         return set()
     sigs = set()
     for line in out.stderr.splitlines() + out.stdout.splitlines():
-        # Match ERROR/WARN level lines (structured logs or plain)
-        if not re.search(r"\b(ERROR|WARN|error|warn)\b", line, re.I):
+        if not is_error_or_warn_level(line):
+            continue
+        if _known_labeled(line):
             continue
         sigs.add(normalize_signature(line))
     return sigs
@@ -366,7 +412,13 @@ ALLOWLIST: list[tuple[str, str]] = [
     ("internal-timeout",    r"\bInternal:\s"),            # infra blip / timeout
     ("invalid-conn-req",    r"InvalidConnectionRequest"), # client sent a stale/rehomed connect request
     ("client-not-found",    r"ClientNotFound"),           # client GC raced a late message
-    ("rehome-reconnect",    r"Rehome:? Reconnect required"), # operational reshuffle (--chaos), tracked in rehomes
+    ("rehome-reconnect",    r'Rehome:? Reconnect required|"kind":"Rehome"'), # operational reshuffle, tracked in rehomes
+    ("unauthorized-client", r"Unauthorized"),             # negative/auth suite deliberately violates ownership
+    ("auth-invalidated",    r"AuthInvalidated|Failed to decode auth token"), # invalid-token negative case
+    ("cancelled-init",      r"shut down before initialization completed"), # cancel-mid-hydrate teardown
+    ("slow-materialize",    r"Slow query materialization"), # timing signal, tracked separately above
+    ("slow-sqlite",         r"Slow SQLite query"), # count/duration gated by scan_container
+    ("mutation-replayed",   r'"error":"alreadyProcessed"'), # lifecycle resend after lost ack
     # routine operational ERROR/WARN under load — not a fault:
     ("client-disconnect",   r"client (disconnected|closed|gone)|websocket.*(closed|EOF)|connection reset by peer"),
     ("ttl-purge",           r"(TTL|ttl).{0,20}(purge|expire|evict)|purging expired"),
@@ -504,7 +556,9 @@ def main() -> int:
     baseline = set()
     if os.path.exists(SIG_BASELINE_PATH):
         try:
-            baseline = set(json.load(open(SIG_BASELINE_PATH)).get("signatures", []))
+            baseline_doc = json.load(open(SIG_BASELINE_PATH))
+            if baseline_doc.get("schema") == SIG_SCHEMA:
+                baseline = set(baseline_doc.get("signatures", []))
         except Exception:
             pass
     all_sigs = set()
@@ -514,7 +568,8 @@ def main() -> int:
     if a.update_baseline:
         os.makedirs(os.path.dirname(SIG_BASELINE_PATH), exist_ok=True)
         with open(SIG_BASELINE_PATH, "w") as f:
-            json.dump({"signatures": sorted(all_sigs | baseline)}, f, indent=2)
+            json.dump({"schema": SIG_SCHEMA,
+                       "signatures": sorted(all_sigs | baseline)}, f, indent=2)
         report["details"].append(f"baseline updated: {len(all_sigs)} signatures")
     elif unknown:
         if len(unknown) > 5:

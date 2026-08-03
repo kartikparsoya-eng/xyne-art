@@ -130,6 +130,7 @@ class Session:
     tags: dict[str, int] = field(default_factory=dict)
     last_cookie: str = ""
     got_hashes: set = field(default_factory=set)
+    put_rows: dict[str, list[dict]] = field(default_factory=dict)
     connected: bool = False
     closed_reason: str = ""
 
@@ -185,6 +186,11 @@ class Session:
             for got in body.get("gotQueriesPatch", []) or []:
                 if got.get("op") == "put" and got.get("hash"):
                     self.got_hashes.add(got["hash"])
+            for op in body.get("rowsPatch", []) or []:
+                if (isinstance(op, dict) and op.get("op") == "put"
+                        and isinstance(op.get("value"), dict)):
+                    table = str(op.get("tableName", "?"))
+                    self.put_rows.setdefault(table, []).append(op["value"])
         return True
 
     def error_kinds(self) -> list[str]:
@@ -276,7 +282,8 @@ def is_infra_error(e: BaseException) -> bool:
 
 
 def result(name: str, status: str, expect: str, observed: str) -> dict:
-    icon = {"PASS": "ok", "FAIL": "XX", "SKIP": "--", "INFRA": "!!"}[status]
+    icon = {"PASS": "ok", "FAIL": "XX", "SKIP": "--", "WATCH": "??",
+            "INFRA": "!!"}[status]
     print(f"  [{icon}] {name:<24} {status:<4} expect: {expect}")
     print(f"       observed: {observed}")
     return {"name": name, "status": status, "expect": expect, "observed": observed}
@@ -503,9 +510,9 @@ async def sc_reconnect_storm(ctx: Ctx, n: int = 8) -> dict:
         # pump all sockets concurrently; older ones should get closed. The
         # survivor gets an adaptive wait (hydration under 8x churn is slow).
         last = sessions[-1]
-        won = (lambda x: x.errors or (x.connected and (  # noqa: E731
-            x.tags.get("pokeStart", 0) > 0 or x.tags.get("pokeEnd", 0) > 0
-            or x.got_hashes)))
+        won = (lambda x: x.errors or (x.connected  # noqa: E731
+                                      and x.tags.get("pokeEnd", 0) > 0
+                                      and bool(x.got_hashes)))
         await asyncio.gather(*(s.pump(12) for s in sessions[:-1]),
                              last.pump_until(won, 30))
     finally:
@@ -513,9 +520,8 @@ async def sc_reconnect_storm(ctx: Ctx, n: int = 8) -> dict:
             await close(s)
     internal = [e for s in sessions for e in s.errors if e.get("kind") == "Internal"]
     last = sessions[-1]
-    survivor_ok = last.connected and (last.tags.get("pokeStart", 0) > 0
-                                      or last.tags.get("pokeEnd", 0) > 0
-                                      or last.got_hashes)
+    completed_pokes = last.tags.get("pokeEnd", 0)
+    survivor_ok = last.connected and completed_pokes > 0 and bool(last.got_hashes)
     olds_alive = sum(1 for s in sessions[:-1]
                      if s.tags.get("pokeEnd", 0) > 0 and not s.closed_reason)
     if internal:
@@ -523,10 +529,10 @@ async def sc_reconnect_storm(ctx: Ctx, n: int = 8) -> dict:
                       f"{len(internal)}x Internal: {internal[0].get('message', '')[:60]}")
     if not survivor_ok:
         return result(name, "FAIL", expect,
-                      f"final socket never served: tags={last.tags} "
+                      f"final socket did not complete a hydrated poke: tags={last.tags} "
                       f"close={last.closed_reason}")
     return result(name, "PASS", expect,
-                  f"survivor poked (pokes={last.tags.get('pokeEnd', 0)}), "
+                  f"survivor hydrated and completed {completed_pokes} poke(s), "
                   f"{olds_alive} stale sockets still being served, 0 Internal")
 
 
@@ -668,16 +674,15 @@ async def sc_ttl_purge(ctx: Ctx) -> dict:
 
 
 async def sc_cross_workspace_isolation(ctx: Ctx) -> dict:
-    """Cross-workspace data isolation (#9): two users in different workspaces
-    connect with identical queries. They must NOT see each other's data —
-    workspace scoping is enforced by the upstream API server's query handler,
-    not by zero-cache. If user A's hydration includes rows from user B's
-    workspace, it's a permission leak at the query layer.
+    """Cross-workspace data isolation (#9): each user can hydrate its own
+    workspace, while user B cannot hydrate user A's workspace by supplying its
+    ID directly. This checks materialized rows, not merely query acknowledgments.
 
-    This test requires >=2 identities with different workspaceIDs in the
-    auth pool. If the auth pool only has one workspace, SKIPs."""
+    This test requires >=2 identities from different organizations. Sibling
+    workspaces in one organization are intentionally visible to organization
+    members under WorkspacesACL and are not an isolation boundary."""
     name = "cross-workspace-isolation"
-    expect = "users in different workspaces see disjoint data sets"
+    expect = "each user sees its own workspace; user B cannot read user A's"
     if len(ctx.identities) < 2:
         return result(name, "SKIP", expect,
                       "needs >=2 identities (run with --auth-pool and --users 2)")
@@ -692,44 +697,69 @@ async def sc_cross_workspace_isolation(ctx: Ctx) -> dict:
     if not ws_a or not ws_b:
         return result(name, "SKIP", expect,
                       "identities lack workspaceID field — can't verify cross-workspace isolation")
-    # Open connections for both users with the same query
-    cgid_a, cid_a = rand_id(), rand_id()
-    cgid_b, cid_b = rand_id(), rand_id()
-    put = ctx.benign_put()
-    s_a = await ctx.open(cgid_a, cid_a, ident_i=0, puts=[put])
-    s_b = await ctx.open(cgid_b, cid_b, ident_i=1, puts=[put])
+    org_a = ident_a.get("orgID", "")
+    org_b = ident_b.get("orgID", "")
+    member_a = ident_a.get("memberID", "")
+    member_b = ident_b.get("memberID", "")
+    if org_a and org_b and org_a == org_b:
+        return result(name, "SKIP", expect,
+                      "identities are in sibling workspaces of the same organization; "
+                      "WorkspacesACL intentionally grants organization-member access")
+    if member_a and member_b and member_a == member_b:
+        return result(name, "SKIP", expect,
+                      "identities share one organization member; sibling workspace access "
+                      "is allowed by WorkspacesACL")
+    if not org_a or not org_b:
+        return result(name, "SKIP", expect,
+                      "auth pool lacks orgID metadata; regenerate it with run-art-local.sh "
+                      "before asserting an organization isolation boundary")
+    put_a = query_put("getWorkspaceById", {"workspaceId": ws_a})
+    put_b = query_put("getWorkspaceById", {"workspaceId": ws_b})
+    put_foreign = query_put("getWorkspaceById", {"workspaceId": ws_a})
+    s_a = await ctx.open(rand_id(), rand_id(), ident_i=0, puts=[put_a])
+    s_b = await ctx.open(rand_id(), rand_id(), ident_i=1, puts=[put_b])
+    s_foreign = await ctx.open(
+        rand_id(), rand_id(), ident_i=1, puts=[put_foreign])
     try:
         await asyncio.gather(
-            s_a.pump_until(lambda x: x.got_hashes or x.errors, 30),
-            s_b.pump_until(lambda x: x.got_hashes or x.errors, 30),
+            s_a.pump_until(lambda x: put_a["hash"] in x.got_hashes or x.errors, 30),
+            s_b.pump_until(lambda x: put_b["hash"] in x.got_hashes or x.errors, 30),
+            s_foreign.pump_until(
+                lambda x: put_foreign["hash"] in x.got_hashes or x.errors, 30),
         )
     finally:
         await close(s_a)
         await close(s_b)
-    # Both should have hydrated (got_hashes non-empty)
-    if not s_a.got_hashes:
-        return result(name, "SKIP", expect,
-                      f"user A (ws={ws_a}) never hydrated: tags={s_a.tags} errors={s_a.error_kinds()}")
-    if not s_b.got_hashes:
-        return result(name, "SKIP", expect,
-                      f"user B (ws={ws_b}) never hydrated: tags={s_b.tags} errors={s_b.error_kinds()}")
-    # The got_hashes should be the same query hash (same query), but the
-    # ROWS should differ (workspace-scoped). We can't directly compare rows
-    # here (that's the diff oracle's job), but we can verify both got
-    # data for the same query without seeing each other's workspace errors.
-    # The real assertion: neither user gets an Unauthorized or cross-workspace
-    # data error. If the server leaks workspace data, the diff oracle (G8)
-    # would catch row-level divergence — this test catches the protocol
-    # level failure (one user getting another's workspace scoped queries).
-    cross_errs = [e for s in (s_a, s_b) for e in s.errors
+        await close(s_foreign)
+    sessions = (s_a, s_b, s_foreign)
+    cross_errs = [e for s in sessions for e in s.errors
                   if e.get("kind") in ("Unauthorized", "Internal")]
     if cross_errs:
         return result(name, "FAIL", expect,
                       f"cross-workspace errors: {cross_errs[:2]}")
+
+    def workspace_ids(s: Session) -> set[str]:
+        return {str(row.get("id")) for row in s.put_rows.get("workspaces", [])
+                if row.get("id") is not None}
+
+    rows_a = workspace_ids(s_a)
+    rows_b = workspace_ids(s_b)
+    foreign_rows = workspace_ids(s_foreign)
+    if put_a["hash"] not in s_a.got_hashes or ws_a not in rows_a:
+        return result(name, "FAIL", expect,
+                      f"user A did not materialize own workspace: rows={sorted(rows_a)} "
+                      f"tags={s_a.tags} errors={s_a.error_kinds()}")
+    if put_b["hash"] not in s_b.got_hashes or ws_b not in rows_b:
+        return result(name, "FAIL", expect,
+                      f"user B did not materialize own workspace: rows={sorted(rows_b)} "
+                      f"tags={s_b.tags} errors={s_b.error_kinds()}")
+    if ws_b in rows_a or ws_a in rows_b or ws_a in foreign_rows:
+        return result(name, "FAIL", expect,
+                      f"workspace leak: A={sorted(rows_a)} B={sorted(rows_b)} "
+                      f"B-request-A={sorted(foreign_rows)}")
     return result(name, "PASS", expect,
-                  f"user A (ws={ws_a[:8]}...) and user B (ws={ws_b[:8]}...) "
-                  f"both hydrated {len(s_a.got_hashes)}/{len(s_b.got_hashes)} "
-                  f"queries independently — no cross-workspace leakage")
+                  f"A={ws_a[:8]}... B={ws_b[:8]}...; own rows materialized, "
+                  "B-request-A returned no workspace row")
 
 
 async def close(s: Session) -> None:

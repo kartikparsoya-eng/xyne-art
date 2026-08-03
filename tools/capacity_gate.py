@@ -42,6 +42,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harness"))
+from protocol import DEFAULT_PROTOCOL_VERSION  # noqa: E402
+
 
 def _run_point(path: str) -> dict | None:
     """Extract (connections, p95, errors, failed_open) from one run report."""
@@ -58,31 +61,36 @@ def _run_point(path: str) -> dict | None:
         return None
     return {"path": os.path.basename(path), "connections": int(conns),
             "p95": p95, "errors": int(c.get("errors", 0)),
-            "failed_open": int(c.get("failed_open", 0))}
+            "failed_open": int(c.get("failed_open", 0)),
+            "opened": int(c.get("opened", 0))}
 
 
 def drive_rung(target: str, auth_token: str | None, id_pool: str,
                conns: int, duration: int, extra: list[str], protocol: int,
-               tag: str) -> str:
+               tag: str, client_schema: str | None = None) -> str:
     """Run replay.py at one rung; return the report path."""
-    out = f"reports/capacity-{tag}-{conns}c.json"
+    out_dir = f"reports/capacity-{tag}-{conns}c"
     cmd = [sys.executable, "harness/replay.py",
            "--target", target, "--id-pool", id_pool,
            "--connections", str(conns), "--working-set", "12",
            "--churn-ms", "750", "--duration", str(duration),
-           "--protocol-version", str(protocol), "--out", out]
+           "--protocol-version", str(protocol), "--out-dir", out_dir]
     if auth_token:
         cmd += ["--auth-token", auth_token]
+    if client_schema:
+        cmd += ["--client-schema", client_schema]
     cmd += extra
     subprocess.run(cmd, check=False, timeout=duration + 120)
-    return out
+    runs = sorted(glob.glob(os.path.join(out_dir, "run-*.json")))
+    return runs[-1] if runs else out_dir
 
 
 def find_cliff(points: list[dict], p95_threshold: float) -> dict:
     """Highest rung where p95 <= threshold AND errors==0 AND failed_open==0."""
     healthy = [p for p in points
-               if (p["p95"] is None or p["p95"] <= p95_threshold)
-               and p["errors"] == 0 and p["failed_open"] == 0]
+               if p["p95"] is not None and p["p95"] <= p95_threshold
+               and p["errors"] == 0 and p["failed_open"] == 0
+               and p["opened"] == p["connections"]]
     if not healthy:
         return {"cliff_conns": 0, "healthy_rungs": []}
     cliff = max(healthy, key=lambda p: p["connections"])
@@ -97,10 +105,11 @@ def main() -> int:
     ap.add_argument("--target", default=None)
     ap.add_argument("--auth-token", default=None)
     ap.add_argument("--id-pool", default="harness/id-pool.json")
+    ap.add_argument("--client-schema", default=None)
     ap.add_argument("--extra-param", action="append", default=[])
     ap.add_argument("--ladder", default="10,25,50,100,200", help="comma-sep conn counts")
     ap.add_argument("--duration", type=int, default=120, help="per-rung duration (drive mode)")
-    ap.add_argument("--protocol-version", type=int, default=49)
+    ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
     ap.add_argument("--p95-threshold", type=float, default=5000.0,
                     help="p95 ms above which a rung is 'unhealthy'")
     ap.add_argument("--blessed-conns", type=int, default=0,
@@ -128,7 +137,8 @@ def main() -> int:
             extra += ["--extra-param", p]
         for conns in [int(x) for x in a.ladder.split(",")]:
             paths.append(drive_rung(a.target, a.auth_token, a.id_pool, conns,
-                                    a.duration, extra, a.protocol_version, tag))
+                                    a.duration, extra, a.protocol_version, tag,
+                                    a.client_schema))
 
     points = [rp for rp in (_run_point(p) for p in paths) if rp is not None]
     points.sort(key=lambda p: p["connections"])
@@ -143,7 +153,7 @@ def main() -> int:
         healthy = p in cliff["healthy_rungs"]
         checks.append({"connections": p["connections"], "p95": p["p95"],
                        "errors": p["errors"], "failed_open": p["failed_open"],
-                       "healthy": healthy})
+                       "opened": p["opened"], "healthy": healthy})
     verdict = "PASS" if cliff_conns >= a.blessed_conns else "FAIL"
     summary = (f"capacity cliff = {cliff_conns} conns "
                f"(blessed {a.blessed_conns}, p95 threshold {a.p95_threshold}ms) "
@@ -158,7 +168,8 @@ def main() -> int:
     for c in checks:
         tag_s = "healthy" if c["healthy"] else "UNHEALTHY"
         print(f"  {c['connections']:>4} conns  p95={c['p95']}  "
-              f"errors={c['errors']}  failed_open={c['failed_open']}  {tag_s}")
+              f"opened={c['opened']} errors={c['errors']}  "
+              f"failed_open={c['failed_open']}  {tag_s}")
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
         with open(a.out, "w") as f:

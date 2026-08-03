@@ -38,10 +38,18 @@ TARGET = "ws://localhost:4848/zero"
 
 
 def build_override(cpus, sync_workers):
-    return f"""# TEMPORARY: capacity-ladder.py — {cpus} CPU budget, read_lanes=2, sync_workers={sync_workers}
+    # A/B knobs (env): LADDER_IMAGE overrides the image; LADDER_EXTRA_ENV adds
+    # comma-separated `KEY=VAL` env lines for explicit experiments.
+    image = os.environ.get("LADDER_IMAGE", "zero-cache-rust-ivm:latest")
+    extra = ""
+    for line in os.environ.get("LADDER_EXTRA_ENV", "").split(","):
+        line = line.strip()
+        if line:
+            extra += f"\n      - {line}"
+    return f"""# TEMPORARY: capacity-ladder.py — {cpus} CPU budget, serial hydration, sync_workers={sync_workers}
 services:
   zero-cache:
-    image: zero-cache-rust-ivm:latest
+    image: {image}
     platform: linux/arm64
     pull_policy: never
     healthcheck:
@@ -56,8 +64,10 @@ services:
     environment:
       - USE_RUST_IVM=true
       - RUST_IVM_ADDON_PATH=/app/mono/packages/rust-ivm/napi/rust-ivm.node
-      - RUST_IVM_READ_LANES=2
+      - RUST_IVM_READ_LANES=0
       - RUST_IVM_PLANNER=1
+      - RUST_IVM_TSFN_BATCH=64
+      - RUST_IVM_TSFN_QUEUE=64
       - ZERO_APP_ID=sandbox_rust_test
       - ZERO_NUM_SYNC_WORKERS={sync_workers}
       - UV_THREADPOOL_SIZE=64
@@ -67,7 +77,7 @@ services:
       - ZERO_SYNCER_CONTROLLED_REHOME=1
       - ZERO_LEAST_LOADED_ROUTING=1
       - ZERO_LOG_LEVEL=info
-      - NODE_OPTIONS=--max-old-space-size=8192 --max-http-header-size=262144
+      - NODE_OPTIONS=--max-old-space-size=8192 --max-http-header-size=262144{extra}
 """
 
 
@@ -126,27 +136,27 @@ def setup_ladder_override(cpus, sync_workers):
     if OVERRIDE.exists():
         content = OVERRIDE.read_text()
         if "capacity-ladder.py" in content:
-            print(f"  WARNING: current override is already a ladder override — "
-                  f"no original to back up")
+            print("  WARNING: current override is already a ladder override — "
+                  "no original to back up")
         else:
             shutil.copy2(OVERRIDE, BACKUP)
             print(f"  Backed up {OVERRIDE.name} -> {BACKUP.name}")
     OVERRIDE.write_text(build_override(cpus, sync_workers))
-    print(f"  Wrote ladder override (cpus={cpus}, read_lanes=2, sync_workers={sync_workers})")
+    print(f"  Wrote ladder override (cpus={cpus}, serial hydration, sync_workers={sync_workers})")
 
 
 def restore_override():
     """Restore the original override."""
     if not BACKUP.exists():
-        print(f"  No backup found — left ladder override in place")
+        print("  No backup found — left ladder override in place")
         return
     content = BACKUP.read_text()
     if "capacity-ladder.py" in content:
-        print(f"  WARNING: backup is also a ladder override — "
-              f"original override was lost. Leaving ladder override in place.")
+        print("  WARNING: backup is also a ladder override — "
+              "original override was lost. Leaving ladder override in place.")
         return
     shutil.move(str(BACKUP), str(OVERRIDE))
-    print(f"  Restored original override")
+    print("  Restored original override")
 
 
 def restart_container():
@@ -266,7 +276,7 @@ def find_knee(results):
 def print_table(results, cpus, sync_workers):
     """Print the summary table."""
     print(f"\n{'='*90}")
-    print(f"  CAPACITY LADDER RESULTS — {cpus} CPU(s), read_lanes=2, sync_workers={sync_workers}")
+    print(f"  CAPACITY LADDER RESULTS — {cpus} CPU(s), serial hydration, sync_workers={sync_workers}")
     print(f"{'='*90}")
     print(f"{'CGs':>5} {'p50(ms)':>8} {'p95(ms)':>8} {'p99(ms)':>8} "
           f"{'errors':>7} {'reconn':>7} {'RSS(GB)':>8} {'CPU_max%':>9} "
@@ -326,7 +336,7 @@ def main():
         steps = list(range(args.start, args.max + 1, args.step))
 
     print(f"Capacity ladder: {steps} CGs, {args.duration}s each")
-    print(f"Config: cpus={args.cpus}, sync_workers={args.sync_workers}, read_lanes=2")
+    print(f"Config: cpus={args.cpus}, sync_workers={args.sync_workers}, serial hydration")
     print(f"Container: {CONTAINER}")
     print(f"Target: {TARGET}")
 
@@ -380,7 +390,7 @@ def main():
         Path(out_file).write_text(json.dumps({
             "config": {
                 "cpus": args.cpus,
-                "read_lanes": 2,
+                "hydration_mode": "serial",
                 "sync_workers": args.sync_workers,
                 "duration_s": args.duration,
             },

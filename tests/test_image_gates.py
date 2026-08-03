@@ -92,7 +92,8 @@ from capacity_gate import _run_point, find_cliff  # noqa: E402
 
 def _write_run(tmp_path, conns, p95, errors=0, failed_open=0, name=None):
     d = {"config": {"connections": conns},
-         "counters": {"errors": errors, "failed_open": failed_open},
+         "counters": {"errors": errors, "failed_open": failed_open,
+                      "opened": conns - failed_open},
          "client_latency_ms": {"p50": 50, "p95": p95}}
     p = tmp_path / (name or f"run-{conns}.json")
     p.write_text(json.dumps(d))
@@ -143,11 +144,20 @@ def test_find_cliff_zero_when_all_unhealthy(tmp_path):
     assert find_cliff(pts, p95_threshold=5000)["cliff_conns"] == 0
 
 
-def test_find_cliff_treats_none_p95_as_unknown_not_unhealthy(tmp_path):
-    # a run with no latency samples (p95=None) is not auto-failed
-    d = {"config": {"connections": 100}, "counters": {"errors": 0, "failed_open": 0},
+def test_find_cliff_does_not_certify_a_rung_without_latency_samples(tmp_path):
+    d = {"config": {"connections": 100},
+         "counters": {"opened": 100, "errors": 0, "failed_open": 0},
          "client_latency_ms": {}}
     p = tmp_path / "nolat.json"
     p.write_text(json.dumps(d))
     pts = [_run_point(_write_run(tmp_path, 10, 100)), _run_point(str(p))]
-    assert find_cliff(pts, p95_threshold=5000)["cliff_conns"] == 100
+    assert find_cliff(pts, p95_threshold=5000)["cliff_conns"] == 10
+
+
+def test_find_cliff_requires_every_requested_connection_to_open(tmp_path):
+    p = _write_run(tmp_path, 100, 100)
+    path = Path(p)
+    doc = json.loads(path.read_text())
+    doc["counters"]["opened"] = 99
+    path.write_text(json.dumps(doc))
+    assert find_cliff([_run_point(p)], p95_threshold=5000)["cliff_conns"] == 0

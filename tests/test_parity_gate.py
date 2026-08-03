@@ -6,6 +6,7 @@ userAllChannels class of failure this gate exists to catch).
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -13,8 +14,45 @@ TOOLS = str(Path(__file__).resolve().parent.parent / "tools")
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
-from parity_gate import compute_ratios, find_undersampled, compute_cascade_multiplier  # noqa: E402
+from parity_gate import (  # noqa: E402
+    compute_cascade_multiplier,
+    compute_ratios,
+    find_undersampled,
+    validate_run,
+)
 from parity_gate import compute_prod_budget_violations, compute_write_parity  # noqa: E402
+
+
+def _write_run(tmp_path, *, requested=4, opened=4, failed=0, errors=0):
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({
+        "config": {"connections": requested},
+        "counters": {
+            "opened": opened,
+            "failed_open": failed,
+            "errors": errors,
+        },
+        "latency_by_query": {},
+    }))
+    return str(path)
+
+
+def test_validate_run_accepts_complete_arm(tmp_path):
+    doc, error = validate_run(_write_run(tmp_path))
+    assert error is None
+    assert doc is not None
+
+
+def test_validate_run_rejects_partial_arm(tmp_path):
+    doc, error = validate_run(_write_run(tmp_path, opened=2, failed=2))
+    assert doc is None
+    assert "opened=2/4" in error
+
+
+def test_validate_run_rejects_protocol_errors(tmp_path):
+    doc, error = validate_run(_write_run(tmp_path, errors=1))
+    assert doc is None
+    assert "protocol error" in error
 
 
 def _pq(name, samples, p50, p95=None, p99=None):
@@ -48,13 +86,14 @@ def test_compute_ratios_fails_on_large_ratio():
     assert off["direction"] == "primary-slower"
 
 
-def test_compute_ratios_bidirectional_catches_ts_slower():
-    # parity is bidirectional — TS slower than Go is also a finding
+def test_compute_ratios_passes_when_ts_is_slower():
+    # TS is the performance floor; a faster Rust implementation is acceptable.
     go = _pq("q1", 50, 100, 200)
     ts = _pq("q1", 50, 500, 1000)
     r = compute_ratios(go, ts, factor=2.0, min_delta_ms=100)
-    assert r["verdict"] == "FAIL"
-    assert r["offenders"][0]["direction"] == "mirror-slower"
+    assert r["verdict"] == "PASS"
+    assert r["offenders"] == []
+    assert r["ratios"][0]["direction"] == "mirror-slower"
 
 
 def test_compute_ratios_noise_floor_skips_small_delta():
@@ -223,12 +262,13 @@ def test_write_parity_fails_when_primary_slower():
     assert r["offenders"][0]["ratio"] == 5.0
 
 
-def test_write_parity_fails_when_mirror_slower():
+def test_write_parity_passes_when_mirror_slower():
     p = [100.0] * 20
     m = [500.0] * 20
     r = compute_write_parity(p, m, factor=2.0, min_delta_ms=100, min_samples=10)
-    assert r["verdict"] == "FAIL"
-    assert r["offenders"][0]["direction"] == "mirror-slower"
+    assert r["verdict"] == "PASS"
+    assert r["offenders"] == []
+    assert r["detail"]["direction"] == "mirror-slower"
 
 
 def test_write_parity_skips_insufficient_samples():

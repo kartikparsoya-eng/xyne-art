@@ -36,16 +36,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import random
 import sys
 import time
 import urllib.parse
+import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harness"))
 from protocol import DEFAULT_PROTOCOL_VERSION, encode_sec_protocols  # noqa: E402
-from workload import ArgResolver, WeightedSampler, load_baseline, query_put, init_connection_message  # noqa: E402
+from workload import (  # noqa: E402
+    ArgResolver, SchemaSynthesizer, WeightedSampler, init_connection_message,
+    load_baseline, query_put,
+)
 from diff_oracle import Materializer, diff_states  # noqa: E402
 
 
@@ -56,21 +61,25 @@ def rid(rng: random.Random) -> str:
 async def _connect_and_drive(target: str, version: int, auth_token: str | None,
                               extra_params: list[tuple[str, str]], puts: list[dict],
                               client_schema: dict | None, base_cookie: str,
-                              duration_s: float, pks: dict, seed: int
+                              duration_s: float, pks: dict, seed: int,
+                              client_group_id: str,
+                              initial_state: Materializer | None = None,
                               ) -> tuple[Materializer, str | None, str | None]:
     """Connect, drive, materialize. Returns (materializer, error_kind, new_base_cookie)."""
     import websockets
     rng = random.Random(seed)
-    cgid, cid = rid(rng), rid(rng)
+    cgid, cid = client_group_id, rid(rng)
     params = {"clientGroupID": cgid, "clientID": cid, "baseCookie": base_cookie,
               "ts": str(time.time() * 1000), "lmid": "0"}
     params.update(extra_params)
     url = (target.rstrip("/") + f"/sync/v{version}/connect?"
            + urllib.parse.urlencode(params))
     sec = encode_sec_protocols(None, auth_token)
-    mat = Materializer(pks)
+    mat = copy.deepcopy(initial_state) if initial_state is not None else Materializer(pks)
+    starting_rows = mat.rows_applied
     error_kind = None
     new_cookie = None
+    completed_poke = False
     try:
         async with websockets.connect(url, subprotocols=[sec], open_timeout=20,
                                        max_size=None, ping_interval=None) as ws:
@@ -90,45 +99,115 @@ async def _connect_and_drive(target: str, version: int, auth_token: str | None,
                     continue
                 if not isinstance(msg, list) or not msg:
                     continue
-                if msg[0] == "error":
-                    body = msg[1] if len(msg) > 1 else {}
+                tag = msg[0]
+                body = msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
+                if tag == "error":
                     error_kind = body.get("kind") or str(body)
                     break
-                if msg[0] == "poke":
-                    body = msg[1] if len(msg) > 1 else {}
+                if tag == "transformError":
+                    query_name = body.get("queryName") or body.get("name") or "unknown"
+                    error_kind = f"transformError:{query_name}"
+                    break
+                if tag == "pokePart":
+                    mat.apply_rows_patch(body.get("rowsPatch"))
+                elif tag == "pokeEnd":
+                    if not body.get("cancel"):
+                        new_cookie = body.get("cookie") or new_cookie
+                        completed_poke = True
+                        if initial_state is not None or mat.rows_applied > starting_rows:
+                            break
+                elif tag == "poke":
+                    # Older protocol compatibility for historical reference images.
                     new_cookie = body.get("baseCookie") or new_cookie
                     for part in (body.get("pokeParts") or []):
                         mat.apply_rows_patch(part.get("rowsPatch"))
+                    completed_poke = True
+                    if initial_state is not None or mat.rows_applied > starting_rows:
+                        break
     except Exception as e:
         error_kind = f"connect:{type(e).__name__}"
+    if error_kind is None and not completed_poke:
+        error_kind = "incomplete:no-poke-end"
     return mat, error_kind, new_cookie
 
 
 async def probe(a: argparse.Namespace) -> dict:
     checks: list[dict] = []
     rng = random.Random(a.seed)
-    resolver = ArgResolver.from_pool_file(a.id_pool, rng)
     baseline = load_baseline(a.baseline)
+    schema_doc = None
+    if a.current_query_schema and os.path.exists(a.current_query_schema):
+        with open(a.current_query_schema) as f:
+            schema_doc = json.load(f)
+        current = schema_doc.get("queries") or {}
+        baseline.queries = [op for op in baseline.queries if op.name in current]
+        baseline.oneshots = [op for op in baseline.oneshots if op.name in current]
     sampler = WeightedSampler(baseline.all_read_ops, rng)
-    puts = [query_put(sampler.sample().name, resolver.resolve(sampler.sample())[0])
-            for _ in range(a.queries)]
-    # re-roll deterministically for a stable set
-    rng = random.Random(a.seed)
-    sampler2 = WeightedSampler(baseline.all_read_ops, rng)
-    resolver2 = ArgResolver.from_pool_file(a.id_pool, rng)
-    puts = [query_put(sampler2.sample().name, resolver2.resolve(sampler2.sample())[0])
-            for _ in range(a.queries)]
+    resolver = ArgResolver.from_pool_file(a.id_pool, rng)
+    query_synth = None
+    if schema_doc is not None:
+        minimal_queries = {}
+        for name, entry in (schema_doc.get("queries") or {}).items():
+            args_schema = entry.get("args")
+            if args_schema is None:
+                minimal_queries[name] = {**entry, "args": {}}
+                continue
+            minimal_queries[name] = {
+                **entry,
+                "args": {key: schema for key, schema in args_schema.items()
+                         if not schema.get("optional") and not schema.get("hasDefault")},
+            }
+        query_synth = SchemaSynthesizer(
+            {"mutators": minimal_queries,
+             "enums": schema_doc.get("enums") or {}},
+            resolver.ids, resolver.scalars, {}, rng,
+        )
+    puts = []
+    query_names = []
+    seen_hashes = set()
+    attempts = 0
+    while len(puts) < a.queries and attempts < a.queries * 100:
+        attempts += 1
+        op = sampler.sample()
+        if query_synth is not None:
+            args, _ = query_synth.synth(op.name, int(time.time() * 1000))
+            ok = args is not None
+        else:
+            args, ok = resolver.resolve(op)
+        if not ok:
+            continue
+        put = query_put(op.name, args)
+        if put["hash"] in seen_hashes:
+            continue
+        seen_hashes.add(put["hash"])
+        puts.append(put)
+        query_names.append(op.name)
+    if len(puts) != a.queries:
+        return {"verdict": "ERROR", "checks": [{
+            "name": "setup", "verdict": "ERROR",
+            "detail": f"resolved only {len(puts)}/{a.queries} distinct queries",
+        }], "summary": "upgrade setup could not build a complete query set"}
     client_schema = json.load(open(a.client_schema)) if a.client_schema else None
     pks = {}
-    if client_schema and isinstance(client_schema.get("tables"), list):
-        for t in client_schema["tables"]:
-            if t.get("tableName") and t.get("primaryKey"):
-                pks[t["tableName"]] = t["primaryKey"]
+    if client_schema:
+        tables = client_schema.get("tables")
+        if isinstance(tables, dict):
+            pks = {name: spec.get("primaryKey", [])
+                   for name, spec in tables.items() if spec.get("primaryKey")}
+        elif isinstance(tables, list):
+            for table in tables:
+                name = table.get("tableName")
+                pk = table.get("primaryKey")
+                if name and pk:
+                    pks[name] = pk
+
+    shared_cgid = "art-upg-" + uuid.uuid4().hex[:16]
+    fresh_cgid = "art-upg-" + uuid.uuid4().hex[:16]
 
     # 1. baseline image: drive + capture baseCookie (CVR state from OLD image)
     mat_old, err_old, cookie = await _connect_and_drive(
         a.baseline_target, a.protocol_version, a.auth_token, a.extra_param,
-        puts, client_schema, "", a.duration_s, pks, a.seed)
+        puts, client_schema, "", a.duration, pks, a.seed, shared_cgid)
     if err_old:
         checks.append({"name": "baseline-connect", "verdict": "ERROR",
                        "detail": f"baseline target errored: {err_old}"})
@@ -139,13 +218,20 @@ async def probe(a: argparse.Namespace) -> dict:
                        "detail": "baseline never returned a baseCookie (no CVR state captured)"})
         return {"verdict": "ERROR", "checks": checks,
                 "summary": "no baseCookie from baseline — cannot test resume"}
+    if mat_old.rows_applied == 0:
+        checks.append({"name": "baseline-cvr", "verdict": "FAIL",
+                       "detail": "baseline completed but materialized zero rows"})
+        return {"verdict": "FAIL", "checks": checks,
+                "summary": "upgrade run produced no usable baseline row corpus",
+                "queries": query_names}
     checks.append({"name": "baseline-cvr", "verdict": "PASS",
                    "detail": f"captured baseCookie from baseline image ({cookie[:16]}...)"})
 
     # 2. candidate image: RESUME with the old-image baseCookie
     mat_resumed, err_resume, _ = await _connect_and_drive(
         a.candidate_target, a.protocol_version, a.auth_token, a.extra_param,
-        puts, client_schema, cookie, a.duration_s, pks, a.seed + 1)
+        puts, client_schema, cookie, a.duration, pks, a.seed, shared_cgid,
+        initial_state=mat_old)
     if err_resume:
         checks.append({"name": "resume-compat", "verdict": "FAIL",
                        "detail": f"candidate REJECTED old-image CVR: {err_resume} "
@@ -158,12 +244,18 @@ async def probe(a: argparse.Namespace) -> dict:
     # 3. candidate image: FRESH client (no cookie) — what a new client sees
     mat_fresh, err_fresh, _ = await _connect_and_drive(
         a.candidate_target, a.protocol_version, a.auth_token, a.extra_param,
-        puts, client_schema, "", a.duration_s, pks, a.seed + 2)
+        puts, client_schema, "", a.duration, pks, a.seed + 2, fresh_cgid)
     if err_fresh:
         checks.append({"name": "fresh-connect", "verdict": "ERROR",
                        "detail": f"candidate fresh connect errored: {err_fresh}"})
         return {"verdict": "ERROR", "checks": checks,
                 "summary": f"candidate fresh connect failed: {err_fresh}"}
+    if mat_fresh.rows_applied == 0:
+        checks.append({"name": "fresh-connect", "verdict": "FAIL",
+                       "detail": "candidate completed but materialized zero rows"})
+        return {"verdict": "FAIL", "checks": checks,
+                "summary": "upgrade run produced no usable candidate row corpus",
+                "queries": query_names}
     checks.append({"name": "fresh-connect", "verdict": "PASS",
                    "detail": f"fresh client hydrated {mat_fresh.rows_applied} rows"})
 
@@ -183,7 +275,8 @@ async def probe(a: argparse.Namespace) -> dict:
         verdict = "FAIL"
     return {"verdict": verdict, "checks": checks, "summary": summary,
             "mismatches": total, "diff": d,
-            "resumed_rows": mat_resumed.rows_applied, "fresh_rows": mat_fresh.rows_applied}
+            "resumed_rows": mat_resumed.rows_applied, "fresh_rows": mat_fresh.rows_applied,
+            "queries": query_names}
 
 
 def main() -> int:
@@ -194,6 +287,7 @@ def main() -> int:
     ap.add_argument("--extra-param", action="append", default=[])
     ap.add_argument("--id-pool", default=None)
     ap.add_argument("--client-schema", default=None)
+    ap.add_argument("--current-query-schema", default="raw/arg-schemas.source.json")
     ap.add_argument("--baseline", default="art-baseline.json")
     ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
     ap.add_argument("--seed", type=int, default=42)

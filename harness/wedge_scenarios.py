@@ -36,25 +36,24 @@ import argparse
 import asyncio
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from protocol import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
+from protocol import DEFAULT_PROTOCOL_VERSION  # noqa: E402
 from workload import (  # noqa: E402
-    ArgResolver, WeightedSampler, load_baseline,
-    query_put, query_del, init_connection_message, change_desired_queries_message,
+    query_put, query_del, change_desired_queries_message,
 )
 
 # Reuse negative.py's infrastructure
 from negative import (  # noqa: E402
     Ctx, Session, close, result, is_infra_error,
-    connect_url, rand_id,
+    rand_id,
 )
 
 
@@ -70,6 +69,33 @@ def pprof_goroutine_count(pprof_url: str) -> int:
             return int(m.group(1)) if m else -1
     except Exception:
         return -1
+
+
+def server_execution_count(ctx: Ctx) -> tuple[int, str] | None:
+    """Return a leak-sensitive server execution count for either driver.
+
+    Go exposes goroutines through pprof. The Rust/Node image does not, so use
+    Docker's PIDs metric, which includes processes and kernel-scheduled threads.
+    A missing metric is untestable and must never be treated as a stable count.
+    """
+    if getattr(ctx, "pprof", ""):
+        count = pprof_goroutine_count(ctx.pprof)
+        if count >= 0:
+            return count, "goroutines"
+    container = getattr(ctx, "container", "")
+    if not container:
+        return None
+    try:
+        proc = subprocess.run(
+            ["docker", "stats", "--no-stream", "--format", "{{.PIDs}}", container],
+            capture_output=True, text=True, timeout=15,
+        )
+        match = re.search(r"\d+", proc.stdout)
+        if proc.returncode == 0 and match:
+            return int(match.group(0)), "container PIDs/threads"
+    except Exception:
+        pass
+    return None
 
 
 def check_wedge_in_logs(container: str, since_s: int = 60) -> dict:
@@ -191,13 +217,11 @@ async def sc_churn_leak(ctx: Ctx) -> dict:
     increase. Assert: goroutine count after churn is within +20 of the
     baseline."""
     name = "churn-leak"
-    expect = "goroutine count after churn within +20 of baseline"
-    if not hasattr(ctx, 'pprof') or not ctx.pprof:
-        return result(name, "SKIP", expect, "no pprof URL — cannot check goroutine count")
-
-    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
-    if baseline_goroutines < 0:
-        return result(name, "SKIP", expect, "pprof unreachable")
+    expect = "server execution count after churn within +20 of baseline"
+    baseline_metric = server_execution_count(ctx)
+    if baseline_metric is None:
+        return result(name, "SKIP", expect, "no pprof or Docker process metric")
+    baseline_goroutines, metric_name = baseline_metric
 
     # Create 20 client groups, each with a query, then close them all
     sessions = []
@@ -224,18 +248,19 @@ async def sc_churn_leak(ctx: Ctx) -> dict:
         await asyncio.sleep(5)
 
     # Check goroutine count after churn
-    after_goroutines = pprof_goroutine_count(ctx.pprof)
-    if after_goroutines < 0:
-        return result(name, "SKIP", expect, "pprof unreachable after churn")
+    after_metric = server_execution_count(ctx)
+    if after_metric is None:
+        return result(name, "SKIP", expect, "server execution metric unavailable after churn")
+    after_goroutines, _ = after_metric
 
     delta = after_goroutines - baseline_goroutines
     if delta > 20:
         return result(name, "FAIL", expect,
-                      f"goroutine leak: {baseline_goroutines} -> {after_goroutines} "
+                      f"{metric_name} leak: {baseline_goroutines} -> {after_goroutines} "
                       f"(+{delta} > +20 threshold — pool readers or cancel flags "
                       f"not being freed)")
     return result(name, "PASS", expect,
-                  f"goroutines: {baseline_goroutines} -> {after_goroutines} "
+                  f"{metric_name}: {baseline_goroutines} -> {after_goroutines} "
                   f"(+{delta} <= +20)")
 
 
@@ -356,11 +381,11 @@ async def sc_concurrent_cold_start_storm(ctx: Ctx) -> dict:
     Assert: all N hydrations complete within 30s (no wedge), no WEDGE markers
     in logs, goroutine count returns to baseline after all disconnect."""
     name = "concurrent-cold-start-storm"
-    expect = f"25 concurrent cold-starts in <60s; no WEDGE; goroutines return to baseline"
-    if not hasattr(ctx, 'pprof') or not ctx.pprof:
-        return result(name, "SKIP", expect, "no pprof URL — cannot check goroutine count")
-
-    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+    expect = "25 concurrent cold-starts in <60s; no WEDGE; execution count returns to baseline"
+    baseline_metric = server_execution_count(ctx)
+    if baseline_metric is None:
+        return result(name, "SKIP", expect, "no pprof or Docker process metric")
+    baseline_goroutines, metric_name = baseline_metric
 
     # 25 CGs connecting within 60s — the prod deploy-reconnect shape.
     # Prod: ~230 clients/pod reconnect over 2-3 min; scaled to the 2-core
@@ -407,8 +432,11 @@ async def sc_concurrent_cold_start_storm(ctx: Ctx) -> dict:
     await asyncio.sleep(5)
 
     # Check goroutine count returned to baseline
-    after_goroutines = pprof_goroutine_count(ctx.pprof)
-    delta = after_goroutines - baseline_goroutines if after_goroutines > 0 and baseline_goroutines > 0 else -1
+    after_metric = server_execution_count(ctx)
+    if after_metric is None:
+        return result(name, "SKIP", expect, "server execution metric unavailable after storm")
+    after_goroutines, _ = after_metric
+    delta = after_goroutines - baseline_goroutines
 
     # Check logs for WEDGE markers
     markers = {}
@@ -424,11 +452,11 @@ async def sc_concurrent_cold_start_storm(ctx: Ctx) -> dict:
                      f"(goroutines: {baseline_goroutines} -> {after_goroutines})")
     if delta > 30:
         return result(name, "FAIL", expect,
-                     f"goroutine leak after storm: {baseline_goroutines} -> {after_goroutines} "
+                     f"{metric_name} leak after storm: {baseline_goroutines} -> {after_goroutines} "
                      f"(+{delta} > +30 — pool readers not freed after concurrent cold-start)")
     return result(name, "PASS", expect,
                   f"25 concurrent cold-starts completed, no WEDGE markers, "
-                  f"goroutines: {baseline_goroutines} -> {after_goroutines} (+{delta})")
+                  f"{metric_name}: {baseline_goroutines} -> {after_goroutines} (+{delta})")
 
 
 # --------------------------------------------------------------------------- #
@@ -445,10 +473,10 @@ async def sc_deep_exists_stress(ctx: Ctx) -> dict:
     logs, goroutine count stable across subscribe/unsubscribe cycles."""
     name = "deep-exists-stress"
     expect = "5 subscribe/unsubscribe cycles of deep-EXISTS query; no WEDGE; <10s each"
-    if not hasattr(ctx, 'pprof') or not ctx.pprof:
-        return result(name, "SKIP", expect, "no pprof URL")
-
-    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+    baseline_metric = server_execution_count(ctx)
+    if baseline_metric is None:
+        return result(name, "SKIP", expect, "no pprof or Docker process metric")
+    baseline_goroutines, metric_name = baseline_metric
 
     # Find getCanvas in the sampler (it's the deep-EXISTS query that wedged)
     canvas_put = None
@@ -508,8 +536,11 @@ async def sc_deep_exists_stress(ctx: Ctx) -> dict:
         await close(s)
 
     await asyncio.sleep(2)
-    after_goroutines = pprof_goroutine_count(ctx.pprof)
-    delta = after_goroutines - baseline_goroutines if after_goroutines > 0 and baseline_goroutines > 0 else -1
+    after_metric = server_execution_count(ctx)
+    if after_metric is None:
+        return result(name, "SKIP", expect, "server execution metric unavailable after EXISTS stress")
+    after_goroutines, _ = after_metric
+    delta = after_goroutines - baseline_goroutines
 
     markers = {}
     if hasattr(ctx, 'container') and ctx.container:
@@ -520,16 +551,16 @@ async def sc_deep_exists_stress(ctx: Ctx) -> dict:
                      "WEDGE-FATAL — progress handler failed under deep-EXISTS stress")
     if markers.get("escalate"):
         return result(name, "WATCH", expect,
-                     f"WEDGE-ESCALATE — progress handler was needed (deep EXISTS may be slow)")
+                     "WEDGE-ESCALATE — progress handler was needed (deep EXISTS may be slow)")
     if max_hydrate_ms > 30000:
         return result(name, "FAIL", expect,
                      f"hydration took {max_hydrate_ms:.0f}ms > 30s — possible wedge")
     if delta > 15:
         return result(name, "WATCH", expect,
-                     f"goroutine delta +{delta} after EXISTS stress — check for pool reader leak")
+                     f"{metric_name} delta +{delta} after EXISTS stress — check for reader leak")
     return result(name, "PASS", expect,
                  f"5 cycles, max hydrate {max_hydrate_ms:.0f}ms, no WEDGE, "
-                 f"goroutines {baseline_goroutines} -> {after_goroutines} (+{delta})")
+                 f"{metric_name} {baseline_goroutines} -> {after_goroutines} (+{delta})")
 
 
 # --------------------------------------------------------------------------- #
@@ -555,7 +586,7 @@ async def sc_stall_then_resume(ctx: Ctx) -> dict:
             return result(name, "FAIL", expect,
                           f"socket closed during 45s stall — idle-timeout fired too early: {s.closed_reason[:80]}")
         # Resume: pump to drain any buffered data
-        got = await s.pump_until(lambda x: x.got_hashes, 15)
+        await s.pump_until(lambda x: x.got_hashes, 15)
         if s.errors:
             return result(name, "FAIL", expect,
                           f"errors after resume: {s.errors[:3]}")
@@ -572,8 +603,11 @@ async def sc_mid_hydrate_kill_loop(ctx: Ctx) -> dict:
     """Connect → start hydrate → kill socket at ~50% → reconnect same CG, ×20.
     Assert: goroutine count flat after all cycles (no leak from killed sockets)."""
     name = "mid-hydrate-kill-loop"
-    expect = "20 kill/reconnect cycles; goroutine count flat"
-    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+    expect = "20 kill/reconnect cycles; server execution count flat"
+    baseline_metric = server_execution_count(ctx)
+    if baseline_metric is None:
+        return result(name, "SKIP", expect, "no pprof or Docker process metric")
+    baseline_goroutines, metric_name = baseline_metric
     cgid = rand_id()
     for i in range(20):
         cid = rand_id()
@@ -588,13 +622,16 @@ async def sc_mid_hydrate_kill_loop(ctx: Ctx) -> dict:
         await asyncio.sleep(0.5)  # brief reconnect delay
     # Wait for server to clean up
     await asyncio.sleep(5)
-    after_goroutines = pprof_goroutine_count(ctx.pprof)
+    after_metric = server_execution_count(ctx)
+    if after_metric is None:
+        return result(name, "SKIP", expect, "server execution metric unavailable after kill loop")
+    after_goroutines, _ = after_metric
     delta = after_goroutines - baseline_goroutines
     if abs(delta) > 15:
         return result(name, "FAIL", expect,
-                      f"goroutine leak: {baseline_goroutines} -> {after_goroutines} (+{delta})")
+                      f"{metric_name} leak: {baseline_goroutines} -> {after_goroutines} (+{delta})")
     return result(name, "PASS", expect,
-                  f"goroutines {baseline_goroutines} -> {after_goroutines} (+{delta})")
+                  f"{metric_name} {baseline_goroutines} -> {after_goroutines} (+{delta})")
 
 
 # --------------------------------------------------------------------------- #
@@ -604,8 +641,11 @@ async def sc_half_open_socket(ctx: Ctx) -> dict:
     """Connect, start a query, then kill the client without FIN (simulate
     network drop). Wait 30s. Assert: server goroutine count didn't grow."""
     name = "half-open-socket"
-    expect = "server reclaims dead socket; goroutine delta < 10 after 30s"
-    baseline_goroutines = pprof_goroutine_count(ctx.pprof)
+    expect = "server reclaims dead socket; execution delta < 10 after 30s"
+    baseline_metric = server_execution_count(ctx)
+    if baseline_metric is None:
+        return result(name, "SKIP", expect, "no pprof or Docker process metric")
+    baseline_goroutines, metric_name = baseline_metric
     cgid, cid = rand_id(), rand_id()
     put = ctx.benign_put()
     s = await ctx.open(cgid, cid, puts=[put])
@@ -625,13 +665,16 @@ async def sc_half_open_socket(ctx: Ctx) -> dict:
             pass
     # Wait for server keepalive to detect the dead socket
     await asyncio.sleep(30)
-    after_goroutines = pprof_goroutine_count(ctx.pprof)
+    after_metric = server_execution_count(ctx)
+    if after_metric is None:
+        return result(name, "SKIP", expect, "server execution metric unavailable after half-open test")
+    after_goroutines, _ = after_metric
     delta = after_goroutines - baseline_goroutines
     if delta > 10:
         return result(name, "FAIL", expect,
-                      f"goroutine leak from half-open socket: {baseline_goroutines} -> {after_goroutines} (+{delta})")
+                      f"{metric_name} leak from half-open socket: {baseline_goroutines} -> {after_goroutines} (+{delta})")
     return result(name, "PASS", expect,
-                  f"goroutines {baseline_goroutines} -> {after_goroutines} (+{delta})")
+                  f"{metric_name} {baseline_goroutines} -> {after_goroutines} (+{delta})")
 
 
 # --------------------------------------------------------------------------- #
@@ -660,7 +703,7 @@ async def sc_auth_invalidation(ctx: Ctx) -> dict:
     cid2 = rand_id()
     s2 = await ctx.open(cgid, cid2, puts=[put])
     try:
-        got = await s2.pump_until(lambda x: x.got_hashes or x.errors, 30)
+        await s2.pump_until(lambda x: x.got_hashes or x.errors, 30)
         if not s2.got_hashes:
             return result(name, "FAIL", expect,
                           f"reconnect failed to hydrate: tags={s2.tags}")

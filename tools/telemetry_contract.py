@@ -152,7 +152,9 @@ def main() -> int:
 
     has_error = any(c["verdict"] == "ERROR" for c in checks)
     has_fail = bool(missing_metrics or missing_events)
-    if has_error and not has_fail and not any(c["verdict"] == "PASS" for c in checks):
+    if checks and all(c["verdict"] == "SKIP" for c in checks):
+        verdict = "SKIP"
+    elif has_error and not has_fail and not any(c["verdict"] == "PASS" for c in checks):
         verdict = "ERROR"
     elif has_fail:
         verdict = "FAIL"
@@ -174,7 +176,7 @@ def main() -> int:
         with open(a.out, "w") as f:
             json.dump(report, f, indent=2)
         print(f"  report -> {a.out}")
-    return {"PASS": 0, "FAIL": 1, "ERROR": 2}[verdict]
+    return {"PASS": 0, "SKIP": 0, "FAIL": 1, "ERROR": 2}[verdict]
 
 
 def grafana_log_event_exists(key: str, event: str) -> bool:

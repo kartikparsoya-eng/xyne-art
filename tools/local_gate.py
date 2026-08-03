@@ -16,7 +16,9 @@ resource sampler summary (reports/<tag>.summary.json), and applies:
                         blips ("Internal:" timeouts, "InvalidConnectionRequest:")
   G3  protocol       : 0 invariant violations (poke framing, lmid monotonic,
                        gotQueries only for desired hashes)
-  G4  mutations      : ack ratio >= 90% of sent (when mutations were driven)
+  G4  mutations      : >=90% outcome ratio among non-abandoned attempts and
+                       zero mutation errors. Lifecycle attempts discarded by
+                       abrupt client teardown are reported but excluded.
   G5  latency        : p50/p95 within 1.5x of the blessed baseline FOR THE
                        RUN'S SHAPE (connections + lifecycle + zipf). Prefers
                        steady-state latency (churn puts) over combined when
@@ -252,10 +254,17 @@ def main() -> int:
     if sent == 0:
         results.append(("G4 mutations", "SKIP", "no mutations driven"))
     else:
-        ratio = c.get("mutation_ok", 0) / sent
+        ok = c.get("mutation_ok", 0)
+        errors = c.get("mutation_err", 0)
+        abandoned = c.get("mutation_abandoned", 0)
+        accountable = max(0, sent - abandoned)
+        outcomes = ok + errors
+        ratio = outcomes / accountable if accountable else 0.0
+        passed = accountable > 0 and 0.90 <= ratio <= 1.0 and errors == 0
         results.append(("G4 mutations",
-                        "PASS" if ratio >= 0.90 else "FAIL",
-                        f"acked {c.get('mutation_ok', 0)}/{sent} ({ratio:.0%})"))
+                        "PASS" if passed else "FAIL",
+                        f"outcomes {outcomes}/{accountable} ({ratio:.0%}), "
+                        f"ok={ok} errors={errors} abandoned={abandoned}"))
 
     # G5 latency vs the blessed baseline for this run's shape
     g5_entry = None
@@ -433,6 +442,7 @@ def main() -> int:
             od = json.load(f)
         mism = od.get("total_mismatches", 0)
         cerr = od.get("connect_errors", 0)
+        perr = od.get("protocol_errors", 0)
         mode = "self-diff" if od.get("self_diff") else "vs mirror"
         muts = (f" muts={od.get('mutations_sent', 0)}"
                 if od.get("mutations") else "")
@@ -443,7 +453,7 @@ def main() -> int:
             # whenever the backend is recreated) and the oracle degraded.
             v8 = "ERROR"
             mode += " (INVALID: self-diff with writes — restart the TS mirror)"
-        elif mism > 0:
+        elif od.get("verdict") == "FAIL" or mism > 0:
             v8 = "FAIL"
         elif cerr > 0:
             v8 = "ERROR"
@@ -451,8 +461,10 @@ def main() -> int:
             v8 = "PASS"
         results.append(("G8 diff-oracle", v8,
                         f"{mode}: mismatches={mism} "
-                        f"connect_errors={cerr}"
-                        f" pairs={od.get('pairs')}{muts}"))
+                        f"connect_errors={cerr} protocol_errors={perr}"
+                        + (f" catalog={od.get('catalog_driven')}/{od.get('catalog_expected')}"
+                           if od.get("full_catalog") else "")
+                        + f" pairs={od.get('pairs')}{muts}"))
     else:
         results.append(("G8 diff-oracle", "SKIP",
                         "no oracle report (run with --oracle)"))

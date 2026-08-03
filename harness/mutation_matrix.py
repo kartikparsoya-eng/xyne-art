@@ -624,8 +624,11 @@ async def amain(a: argparse.Namespace) -> int:
 
     # ---- MAP: subscribe resolvable catalog on both sides ----
     resolver = ArgResolver.from_pool_file(a.id_pool, rng, zipf_s=0.0)
+    current_query_names = set((schemas_doc.get("queries") or {}).keys())
     puts = []
     for op in baseline.queries:
+        if op.name not in current_query_names:
+            continue
         args, ok = resolver.resolve(op)
         if ok:
             puts.append(query_put(op.name, args, ttl_ms=3_600_000))

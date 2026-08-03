@@ -112,6 +112,7 @@ class Stats:
     mutations_sent: int = 0
     mutation_ok: int = 0
     mutation_err: int = 0
+    mutation_abandoned: int = 0
     sessions: int = 0
     zombies: int = 0
     aborts: int = 0
@@ -142,6 +143,12 @@ class Stats:
     impact_targeted: int = 0
     impact_fallback: int = 0
 
+    def reconciled_mutation_abandoned(self) -> int:
+        """Return intentional discards not superseded by a late server ack."""
+        outcomes = self.mutation_ok + self.mutation_err
+        unobserved = max(0, self.mutations_sent - outcomes)
+        return min(self.mutation_abandoned, unobserved)
+
     def merge(self, o: "Stats") -> None:
         self.opened += o.opened
         self.failed_open += o.failed_open
@@ -155,6 +162,7 @@ class Stats:
         self.mutations_sent += o.mutations_sent
         self.mutation_ok += o.mutation_ok
         self.mutation_err += o.mutation_err
+        self.mutation_abandoned += o.mutation_abandoned
         self.sessions += o.sessions
         self.zombies += o.zombies
         self.aborts += o.aborts
@@ -554,6 +562,12 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                 return
             # connection dropped mid-run: back off briefly and reconnect
 
+        # Every session starts by rewinding mid to acked. Account for those
+        # discarded attempts explicitly so lifecycle teardown is not reported
+        # as a server mutation failure. A later resend of the same mutation ID
+        # is a new attempt and remains in mutations_sent.
+        stats.mutation_abandoned += max(0, mid - acked)
+
         if is_zombie:
             # Zombie clients never come back; their client group + CVR rows
             # are the server's problem now (GC gate checks it gets cleaned).
@@ -702,7 +716,9 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
                      "clients_retired": stats.retired,
                      "delete_client_acks": stats.delete_acks,
                      "mutations_sent": stats.mutations_sent,
-                     "mutation_ok": stats.mutation_ok, "mutation_err": stats.mutation_err},
+                     "mutation_ok": stats.mutation_ok,
+                     "mutation_err": stats.mutation_err,
+                     "mutation_abandoned": stats.reconciled_mutation_abandoned()},
         "per_error": dict(sorted(stats.per_error.items(), key=lambda kv: -kv[1])),
         "per_tag": dict(sorted(stats.per_tag.items(), key=lambda kv: -kv[1])),
         # client_latency_ms keeps the legacy meaning (ALL samples) so existing
@@ -775,6 +791,11 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
 def main() -> int:
     ap = argparse.ArgumentParser(description="ART Mode-A replay load driver.")
     ap.add_argument("--baseline", default=os.path.join(os.path.dirname(__file__), "..", "art-baseline.json"))
+    ap.add_argument(
+        "--current-query-schema",
+        default=os.path.join(os.path.dirname(__file__), "..", "raw", "arg-schemas.source.json"),
+        help="source-derived current query catalog; stale baseline names are excluded",
+    )
     ap.add_argument("--id-pool", default=None, help="harness/id-pool.json from gen_id_pool.py")
     ap.add_argument("--zipf-s", type=float, default=0.0,
                     help="Zipf exponent for id-pool sampling (0=uniform; ~1.1 approximates "
@@ -905,11 +926,20 @@ def main() -> int:
 
     rng = random.Random(a.seed)
     bl = load_baseline(a.baseline)
+    stale_queries: list[str] = []
+    if a.current_query_schema and os.path.exists(a.current_query_schema):
+        with open(a.current_query_schema) as f:
+            current_names = set((json.load(f).get("queries") or {}).keys())
+        stale_queries = [op.name for op in bl.queries if op.name not in current_names]
+        bl.queries = [op for op in bl.queries if op.name in current_names]
     resolver = ArgResolver.from_pool_file(a.id_pool, rng, zipf_s=a.zipf_s)
     sampler = WeightedSampler(bl.queries, rng)
     print(f"baseline v{bl.version}: {len(bl.queries)} queries | "
           f"id-pool {'none' if not a.id_pool else a.id_pool} "
           f"({sum(len(v) for v in resolver.ids.values())} ids)")
+    if stale_queries:
+        print("CURRENT SOURCE FILTER: excluded stale baseline queries: "
+              + ", ".join(sorted(stale_queries)))
 
     if a.enable_mutations:
         if not a.i_know_this_writes:
