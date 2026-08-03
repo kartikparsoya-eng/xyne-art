@@ -75,6 +75,36 @@ def main() -> int:
             by_gate.setdefault(r["gate"], []).append(
                 (label, r.get("verdict", "SKIP"), r.get("detail", "")))
 
+    # Evidence from different image/addon digests cannot be merged into one
+    # release verdict. Each constituent run must identify the immutable engine
+    # it exercised, and all runs must agree.
+    provenance = []
+    for (_, doc), label in zip(runs, labels):
+        p = doc.get("provenance") or {}
+        provenance.append((label, p.get("image_digest"), p.get("addon_sha256")))
+    missing = [label for label, digest, _ in provenance if not digest]
+    image_digests = {digest for _, digest, _ in provenance if digest}
+    addon_digests = {digest for _, _, digest in provenance if digest}
+    mismatch = len(image_digests) > 1 or len(addon_digests) > 1
+    if missing:
+        provenance_verdict = "FAIL"
+        provenance_detail = "missing immutable image provenance: " + ", ".join(missing)
+    elif mismatch:
+        provenance_verdict = "FAIL"
+        provenance_detail = (
+            f"mixed evidence: images={sorted(image_digests)} "
+            f"addons={sorted(addon_digests)}"
+        )
+    else:
+        provenance_verdict = "PASS"
+        provenance_detail = (
+            f"image={next(iter(image_digests))} "
+            f"addon={next(iter(addon_digests), 'not-recorded')}"
+        )
+    by_gate["G0 provenance"] = [
+        (label, provenance_verdict, provenance_detail) for label in labels
+    ]
+
     rows = []          # (gate, final, per-run-verdicts, deciding detail)
     not_covered = []
     for gate in sorted(by_gate, key=gate_sort_key):

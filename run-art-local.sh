@@ -52,7 +52,7 @@ cd "$DIR"
 SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
 MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
 PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0; WRITE_PARITY=0; PROD_BUDGET=0
-IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=0; DRAIN_BUDGET=30
+IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=50; DRAIN_BUDGET=30
 CHAOS_MEAN_GAP=45
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
@@ -161,7 +161,8 @@ if [ "$RELEASE" = "1" ]; then
   [ "$DUR_SET" = "0" ] && DURATION="900"
   [ -z "$PROFILE" ] && PROFILE="profiles/prod-7d.json"
   LIFECYCLE=1; ORACLE=1; MUTATIONS=1; NEGATIVE=1; MUTMATRIX=1
-  PROTOCOL=1; TELEMETRY=1; DETERMINISM=1; PARITY=1; IMAGEAUDIT=1; FULLCATALOG=1
+  PROTOCOL=1; TELEMETRY=1; COLDSTART=1; READINESS=1; DRAIN=1
+  DETERMINISM=1; CAPACITY=1; IMAGEAUDIT=1; UPGRADE=1; PARITY=1; FULLCATALOG=1
   echo "[ART] --release: cpus=$CPUS memory=$MEMORY duration=${DURATION}s all-gates"
 fi
 
@@ -536,6 +537,8 @@ if [ "$N_IDENT" -gt 1 ]; then AUTHFLAGS=(--auth-pool "$AUTH_POOL"); fi
 
 TAG="$(date +%Y%m%d-%H%M%S)"
 SAMPLES="reports/resources-$TAG.ndjson"
+PROVENANCE_REPORT="reports/provenance-$TAG.json"
+"$PY" tools/image_provenance.py --container "$ZCACHE" --out "$PROVENANCE_REPORT"
 # Trace mode: run length is the trace's own span / compression (+ tail), not
 # --duration. Compute it so the resource sampler covers the whole run.
 if [ -n "$TRACE" ]; then
@@ -859,7 +862,8 @@ fi
 if [ "$TELEMETRY" = "1" ]; then
   TELEMETRY_REPORT="reports/telemetry-$TAG.json"
   echo "== telemetry-contract test (G17) =="
-  set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json --out "$TELEMETRY_REPORT"; set -e
+  set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json \
+    --container "$ZCACHE" --since "$RUN_START_ISO" --out "$TELEMETRY_REPORT"; set -e
 fi
 if [ "$READINESS" = "1" ]; then
   READINESS_REPORT="reports/readiness-$TAG.json"
@@ -983,6 +987,7 @@ echo ""
 set +e
 "$PY" tools/local_gate.py --resources "reports/resources-$TAG.summary.json" \
   --out "reports/gate-$TAG.json" \
+  --provenance "$PROVENANCE_REPORT" \
   --logs "$LOG_REPORT" \
   ${ORACLE_REPORT:+--oracle "$ORACLE_REPORT"} \
   ${CHAOS_REPORT:+--chaos "$CHAOS_REPORT"} \

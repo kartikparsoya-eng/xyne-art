@@ -461,10 +461,12 @@ async def amain(a) -> int:
         "coverage": {
             "queries_driven": len(stats.per_query),
             "queries_hydrated": len(stats.hydrated),
+            "query_names_hydrated": sorted(stats.hydrated),
             "never_hydrated": sorted(set(stats.per_query) - stats.hydrated),
         },
         "per_error": dict(stats.per_error.most_common(20)),
         "top_queries_driven": stats.per_query.most_common(15),
+        "queries_driven": dict(sorted(stats.per_query.items())),
         "mutations_skipped_by_type": dict(stats.muts_skipped.most_common(15)),
         "id_mapping": mapper.report(),
         "trace_header": {k: header[k] for k in

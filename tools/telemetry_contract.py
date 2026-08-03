@@ -73,6 +73,16 @@ def scrape_docker_logs(container: str, since: str) -> str:
     return (r.stdout or "") + (r.stderr or "")
 
 
+def scrape_docker_metrics(container: str) -> str:
+    r = subprocess.run(
+        ["docker", "exec", container, "curl", "-sf", "http://localhost:4849/metrics"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "metrics curl failed").strip())
+    return r.stdout
+
+
 def grafana_metric_exists(key: str, metric: str) -> bool:
     """Query Prometheus (via evaluate_gates endpoint) for one metric name."""
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
@@ -107,6 +117,13 @@ def main() -> int:
         except Exception as e:
             checks.append({"name": "metrics-scrape", "verdict": "ERROR",
                            "detail": f"could not fetch {a.metrics_url}: {type(e).__name__}: {e}"})
+    elif a.container:
+        try:
+            prom_text = scrape_docker_metrics(a.container)
+        except Exception as e:
+            checks.append({"name": "metrics-scrape", "verdict": "ERROR",
+                           "detail": f"could not scrape metrics in {a.container}: "
+                                     f"{type(e).__name__}: {e}"})
     if a.container:
         try:
             log_text = scrape_docker_logs(a.container, a.since)
@@ -152,16 +169,20 @@ def main() -> int:
 
     has_error = any(c["verdict"] == "ERROR" for c in checks)
     has_fail = bool(missing_metrics or missing_events)
-    if checks and all(c["verdict"] == "SKIP" for c in checks):
-        verdict = "SKIP"
-    elif has_error and not has_fail and not any(c["verdict"] == "PASS" for c in checks):
-        verdict = "ERROR"
-    elif has_fail:
+    has_skip = any(c["verdict"] == "SKIP" for c in checks)
+    if has_fail:
         verdict = "FAIL"
+    elif has_error or has_skip:
+        verdict = "ERROR"
     else:
         verdict = "PASS"
 
-    summary = (f"{len(metrics)} metrics + {len(events)} events checked; "
+    checked_metrics = sum(c["name"].startswith("metric:") and c["verdict"] != "SKIP"
+                          for c in checks)
+    checked_events = sum(c["name"].startswith("event:") and c["verdict"] != "SKIP"
+                         for c in checks)
+    summary = (f"{checked_metrics}/{len(metrics)} metrics + "
+               f"{checked_events}/{len(events)} events checked; "
                f"missing={len(missing_metrics)} metrics, {len(missing_events)} events")
     report = {"schema": 1, "gate": "G17", "name": "telemetry-contract",
               "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -176,7 +197,7 @@ def main() -> int:
         with open(a.out, "w") as f:
             json.dump(report, f, indent=2)
         print(f"  report -> {a.out}")
-    return {"PASS": 0, "SKIP": 0, "FAIL": 1, "ERROR": 2}[verdict]
+    return {"PASS": 0, "FAIL": 1, "ERROR": 2}[verdict]
 
 
 def grafana_log_event_exists(key: str, event: str) -> bool:

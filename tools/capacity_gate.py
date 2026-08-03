@@ -117,6 +117,10 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
+    if a.blessed_conns <= 0:
+        print("ERROR: --blessed-conns must be greater than zero", file=sys.stderr)
+        return 2
+
     tag = time.strftime("%Y%m%d-%H%M%S")
     paths: list[str] = list(a.runs)
     # expand globs

@@ -166,10 +166,18 @@ async def probe(a: argparse.Namespace) -> dict:
 
     t0 = time.perf_counter()
     # send SIGTERM
-    subprocess.run(["docker", "kill", "-s", "TERM", a.container],
-                   check=False, timeout=30, capture_output=True)
+    kill = subprocess.run(["docker", "kill", "-s", "TERM", a.container],
+                          check=False, timeout=30, capture_output=True, text=True)
+    if kill.returncode != 0:
+        stop.set()
+        await asyncio.gather(*clients, return_exceptions=True)
+        detail = (kill.stderr or kill.stdout or "docker kill failed").strip()
+        checks.append({"name": "sigterm", "verdict": "ERROR",
+                       "detail": f"docker kill rc={kill.returncode}: {detail}"})
+        return {"verdict": "ERROR", "checks": checks,
+                "summary": "SIGTERM was not delivered to the target container"}
     checks.append({"name": "sigterm", "verdict": "PASS",
-                   "detail": f"sent SIGTERM to {a.container}"})
+                   "detail": f"docker kill rc=0 for {a.container}"})
 
     status, exit_code, oom = "?", "?", "?"
     exit_deadline = t0 + a.drain_budget_s

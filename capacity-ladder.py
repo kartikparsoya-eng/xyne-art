@@ -64,13 +64,13 @@ services:
     environment:
       - USE_RUST_IVM=true
       - RUST_IVM_ADDON_PATH=/app/mono/packages/rust-ivm/napi/rust-ivm.node
-      - RUST_IVM_READ_LANES=0
-      - RUST_IVM_PLANNER=1
-      - RUST_IVM_TSFN_BATCH=64
       - RUST_IVM_TSFN_QUEUE=64
+      - RUST_IVM_STREAM_CREDIT=64
       - ZERO_APP_ID=sandbox_rust_test
       - ZERO_NUM_SYNC_WORKERS={sync_workers}
-      - UV_THREADPOOL_SIZE=64
+      - ZERO_ROUND_ROBIN_ROUTING=1
+      - ZERO_CURSOR_PAGE_SIZE=100
+      - UV_THREADPOOL_SIZE=16
       - ZERO_CVR_MAX_CONNS=8
       - ZERO_UPSTREAM_MAX_CONNS=16
       - ZERO_SYNCER_LOAD_AWARE_ROUTING=1

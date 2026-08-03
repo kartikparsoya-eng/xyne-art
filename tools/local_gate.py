@@ -73,7 +73,7 @@ import time
 
 DRIFT_RE = re.compile(r"^transformError: .*Query not found")
 VALIDATION_RE = re.compile(r"^transformError: .*Validation failed")
-INFRA_PREFIXES = ("Internal:", "InvalidConnectionRequest:", "ClientNotFound:")
+INFRA_PREFIXES = ("InvalidConnectionRequest:", "ClientNotFound:")
 # pulls the query name out of a drift/validation transformError key
 DRIFT_NAME_RE = re.compile(r"^transformError: ([\w$.-]+): (?:Query not found|Validation failed)")
 BASELINE_DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports",
@@ -167,6 +167,8 @@ def main() -> int:
                          "sides; default 3.0)")
     ap.add_argument("--out", default=None,
                     help="write verdicts as JSON (consumed by tools/consolidate_gates.py)")
+    ap.add_argument("--provenance", default=None,
+                    help="image_provenance.py report for the engine under test")
     a = ap.parse_args()
 
     reports = os.path.join(os.path.dirname(__file__), "..", "reports")
@@ -402,9 +404,14 @@ def main() -> int:
             if s is not None and s > lim:
                 entry = f"{m} +{s:.0f}/h (limit {lim})"
                 if m == "rss_bytes":
-                    heap_s = (resources.get("heapinuse") or {}).get("slope_per_hour", 0)
-                    gor_s = (resources.get("goroutines") or {}).get("slope_per_hour", 0)
-                    if heap_s <= 0 and gor_s <= 0:
+                    heap_s = (resources.get("heapinuse") or {}).get("slope_per_hour")
+                    gor_s = (resources.get("goroutines") or {}).get("slope_per_hour")
+                    # Only a Go build with both supporting measurements may
+                    # classify RSS growth as allocator page caching. Missing
+                    # pprof fields on Rust/Node are absence of evidence, not a
+                    # waiver for an otherwise failing RSS slope.
+                    if (heap_s is not None and gor_s is not None
+                            and heap_s <= 0 and gor_s <= 0):
                         watch.append(entry + " — Go runtime page caching, not a leak")
                         continue
                 bad.append(entry)
@@ -664,6 +671,9 @@ def main() -> int:
             p95 = r.get("primary", 0)
             if p95 > LIVENESS_CEILING_MS:
                 offenders.append(f"{r.get('query','?')}={p95:.0f}ms")
+        never_completed = ((pdoc.get("primary_coverage") or {})
+                           .get("never_hydrated_no_error") or [])
+        offenders.extend(f"{query}=never-completed" for query in never_completed)
         if offenders:
             results.append(("G28 liveness-ceiling", "FAIL",
                            f"{len(offenders)} query(ies) exceeded {LIVENESS_CEILING_MS}ms: " + ", ".join(offenders[:5])))
@@ -685,8 +695,10 @@ def main() -> int:
             prod_shapes = {q["name"] for q in bl.get("query_workload", {}).get("queries", [])}
         except Exception:
             prod_shapes = set()
-        # shapes the replay actually hydrated (from run report's per_query keys)
-        hydrated = set((run.get("per_query") or {}).keys())
+        # Exact hydrated-name evidence emitted by replay.py. Desired query
+        # names are not sufficient: a transform/delivery failure may drive a
+        # shape without ever hydrating it.
+        hydrated = set((run.get("coverage") or {}).get("query_names_hydrated") or [])
         if prod_shapes and hydrated:
             missing = prod_shapes - hydrated
             if missing:
@@ -699,11 +711,23 @@ def main() -> int:
                                f"all {len(prod_shapes)} prod shapes exercised"))
         elif prod_shapes:
             results.append(("G29 shape-coverage", "SKIP",
-                           "run report has no per_query data"))
+                           "run report has no query_names_hydrated data"))
         else:
             results.append(("G29 shape-coverage", "SKIP", "no art-baseline.json"))
     else:
         results.append(("G29 shape-coverage", "SKIP", "no art-baseline.json"))
+
+    provenance = None
+    if a.provenance and os.path.exists(a.provenance):
+        try:
+            provenance = json.load(open(a.provenance))
+        except Exception:
+            provenance = None
+    digest = (provenance or {}).get("image_digest")
+    revision = (provenance or {}).get("revision")
+    results.append(("G30 provenance", "PASS" if digest else "FAIL",
+                    (f"image={digest} revision={revision or 'unknown'}"
+                     if digest else "missing immutable engine image digest")))
 
     print(f"run: {os.path.basename(run_path)}"
           + (f" | resources: {os.path.basename(res_path)}" if resources else ""))
@@ -745,6 +769,7 @@ def main() -> int:
                    "parity": os.path.basename(a.parity) if a.parity and os.path.exists(a.parity) else None},
                "results": [{"gate": g, "verdict": v, "detail": d}
                            for g, v, d in results],
+               "provenance": provenance,
                "overall": overall}
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
         with open(a.out, "w") as f:

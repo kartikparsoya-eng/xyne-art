@@ -511,6 +511,7 @@ async def amain(a: argparse.Namespace) -> dict:
 
     primary_pq: dict = {}
     mirror_pq: dict = {}
+    primary_coverage: dict = {}
 
     # --- consume mode ---
     if a.primary_run and a.mirror_run:
@@ -523,6 +524,7 @@ async def amain(a: argparse.Namespace) -> dict:
                     "summary": "invalid parity replay arm"}
         primary_pq = p_doc.get("latency_by_query") or {}
         mirror_pq = m_doc.get("latency_by_query") or {}
+        primary_coverage = p_doc.get("coverage") or {}
         checks.append({"name": "consume", "verdict": "PASS",
                        "detail": f"loaded {len(primary_pq)} + {len(mirror_pq)} per-query latencies"})
     # --- drive mode ---
@@ -557,6 +559,7 @@ async def amain(a: argparse.Namespace) -> dict:
                     "summary": "invalid parity replay arm"}
         primary_pq = p_doc.get("latency_by_query") or {}
         mirror_pq = m_doc.get("latency_by_query") or {}
+        primary_coverage = p_doc.get("coverage") or {}
         checks.append({"name": "drive", "verdict": "PASS",
                        "detail": f"replay vs primary ({len(primary_pq)} q) + mirror ({len(mirror_pq)} q)"})
     else:
@@ -657,7 +660,8 @@ async def amain(a: argparse.Namespace) -> dict:
                f"(factor {a.factor}x, floor {a.min_delta_ms}ms)")
     return {"verdict": verdict, "checks": checks, "summary": summary,
             "ratios": result["ratios"], "offenders": result["offenders"],
-            "compared": result["compared"]}
+            "compared": result["compared"],
+            "primary_coverage": primary_coverage}
 
 
 def main() -> int:

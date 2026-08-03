@@ -728,6 +728,10 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
         "client_latency_steady_ms": dist(stats.latencies_ms),
         "client_latency_initial_ms": dist(stats.latencies_initial_ms),
         "top_queries_driven": sorted(stats.per_query.items(), key=lambda kv: -kv[1])[:15],
+        # Complete query-name map for coverage gates. top_queries_driven is a
+        # presentation sample and must not be used as evidence of full shape
+        # coverage.
+        "queries_driven": dict(sorted(stats.per_query.items())),
         # steady-phase latency dist per query name (>=5 samples) — diff two
         # runs' maps to attribute an aggregate regression to specific queries.
         "latency_by_query": {
@@ -742,6 +746,7 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
             # blind-spot list: desired but never delivered (build drift or bug).
             "queries_driven": len(stats.per_query),
             "queries_hydrated": len(stats.hydrated_queries),
+            "query_names_hydrated": sorted(stats.hydrated_queries),
             "never_hydrated": sorted(set(stats.per_query) - stats.hydrated_queries),
             # blind spot root cause (#4): for each never_hydrated query, show
             # the error kind if we have one (transformError:queryName:msg),
