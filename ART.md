@@ -223,7 +223,8 @@ xyne-art/
 │   ├── mint_local_jwt.py      # HS256 JWT for the LOCAL sandbox only
 │   ├── evaluate_gates.py      # THE GATE: scrape zero_sync_* + health → PASS/FAIL report
 │   ├── local_gate.py          # local-sandbox gate G1–G11 (no Grafana); consumes run/resource/oracle/chaos/negative reports
-│   ├── resource_sampler.py    # docker stats + pprof + CVR-row sampler → slopes for the leak gates
+│   ├── resource_sampler.py    # docker stats + pprof + CVR-row + WAL sampler → slopes for the leak gates (G6) + wal2 reclaim verdict (G6-WAL)
+│   ├── wal_reclaim_gate.py    # G6-WAL: wal2 zombie-pin gate — WAL grew large & never reclaimed (invisible to ckpt_busy on wal2)
 │   ├── chaos.py               # fault injector: docker-pause zero-cache/postgres mid-run (G10)
 │   ├── heap_diff.py           # go tool pprof -diff_base wrapper over a run's heap snapshots
 │   ├── shadow_compare.py      # Mode B: canary vs control fleet over the same window
@@ -240,7 +241,7 @@ export GR_KEY='<service-account-token>'   # must be on Juspay VPN
 ./run-art.sh --target wss://<zero-cache>/zero --auth-token "$JWT"   # Mode A: replay → gate
 ./run-art-local.sh --mutations              # Mode A vs the local docker sandbox (auto JWT/pool/schema)
 ./run-art-local.sh --lifecycle --mutations  # + session churn: resume-from-cookie, abrupt closes, zombies
-./run-art-local.sh --soak --mutations       # 1h leak hunt: resource sampler + slope gates (G6)
+./run-art-local.sh --soak --mutations       # 1h leak hunt: resource sampler + slope gates (G6) + wal2 WAL-reclaim gate (G6-WAL, zombie-pin)
 ./run-art-local.sh --users 3 --mutations    # multi-identity write contention
 ./run-art-local.sh --oracle                 # + G8: differential oracle vs the TS reference build
 ./run-art-local.sh --chaos                  # + G10: fault injection (docker-pause zero-cache/postgres mid-run)

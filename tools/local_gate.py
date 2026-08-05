@@ -419,6 +419,19 @@ def main() -> int:
         verdict = "FAIL" if bad else ("WATCH" if watch else "PASS")
         results.append(("G6 leaks", verdict, detail))
 
+    # G6-WAL reclaim (wal2 zombie-pin / lagging-snapshot): the sampler's
+    # wal_reclaim_gate verdict — the WAL grew large and never reclaimed, the
+    # connection-leaked-with-open-read-txn class that grew a prod pod's WAL to
+    # 5.2GB linearly and is INVISIBLE to ckpt_busy on wal2 (a pin blocks the
+    # file switch, not the pragma). Only present when the WAL got large enough
+    # to require a reclaim (else the sampler emits nothing → no false-positive
+    # on smoke runs). See resource_sampler.wal_reclaim_verdict.
+    if resources and resources.get("wal_reclaim_gate"):
+        wr = resources["wal_reclaim_gate"]
+        wv = wr.get("verdict")
+        if wv in ("PASS", "FAIL", "WATCH"):
+            results.append(("G6-WAL reclaim", wv, wr.get("note", "")))
+
     # G7 CVR GC (WATCH) — enhanced with GC timing (#6)
     if resources and "cvr_art_instances" in resources:
         v = resources["cvr_art_instances"]
