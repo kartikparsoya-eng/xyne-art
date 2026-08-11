@@ -263,6 +263,14 @@ MIRROR_URL="ws://${SANDBOX}.localhost/zero-ts"
 [ -n "$OVERRIDE_CVR_SCHEMA" ] && CVR_SCHEMA="$OVERRIDE_CVR_SCHEMA"
 [ -n "$OVERRIDE_MIRROR" ] && MIRROR_URL="$OVERRIDE_MIRROR"
 PPROF_FLAGS=()
+PROM_FLAGS=()
+# OTel Prometheus endpoint: scrape if the collector sidecar is running
+PROM_URL="http://localhost:9464/metrics"
+PROM_AVAILABLE=0
+if curl -sf --connect-timeout 2 "$PROM_URL" >/dev/null 2>&1; then
+  PROM_FLAGS=(--prom "$PROM_URL")
+  PROM_AVAILABLE=1
+fi
 if [ -n "$OVERRIDE_PPROF_PORT" ]; then
   PPROF_FLAGS=(--pprof "http://localhost:$OVERRIDE_PPROF_PORT")
 elif [ "$SWAP" = "1" ]; then
@@ -559,6 +567,7 @@ fi
 "$PY" tools/resource_sampler.py --container "$ZCACHE" --pg-container "$PG" \
   --db "$DB" --cvr-schema "$CVR_SCHEMA" --out "$SAMPLES" \
   ${PPROF_FLAGS[@]+"${PPROF_FLAGS[@]}"} \
+  ${PROM_FLAGS[@]+"${PROM_FLAGS[@]}"} \
   --interval 10 --duration $((DURATION + 60)) &
 SAMPLER_PID=$!
 CHAOS_PID=""
@@ -803,6 +812,7 @@ if [ "$NEGATIVE" = "1" ]; then
     --id-pool "$POOL" --client-schema "$CSCHEMA" \
     --auth-pool "$AUTH_POOL" \
     $PPROF_ARG --container "$ZCACHE" \
+    --pg-container "$PG" --pg-user xyne --pg-db "$DB" --cvr-schema "$CVR_SCHEMA" \
     --out "$WEDGE_SCENARIO_REPORT"
   set -e
 fi
@@ -842,9 +852,20 @@ LOG_CONTAINERS="$ZCACHE"
 if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
   LOG_CONTAINERS="$ZCACHE,$MIRROR_POD"
 fi
+# Fold resource-watcher alerts (WAL growth, WAL/DB ratio, PG slot lag,
+# orphaned slots) into G13 when a sampler summary exists for this run.
+RES_SUMMARY_FOR_LOG=""
+if [ -f "reports/resources-$TAG.summary.json" ]; then
+  RES_SUMMARY_FOR_LOG="reports/resources-$TAG.summary.json"
+fi
 set +e
-"$PY" tools/log_gate.py --containers "$LOG_CONTAINERS" \
-  --since "$RUN_START_ISO" --out "$LOG_REPORT"
+if [ -n "$RES_SUMMARY_FOR_LOG" ]; then
+  "$PY" tools/log_gate.py --containers "$LOG_CONTAINERS" \
+    --since "$RUN_START_ISO" --resources "$RES_SUMMARY_FOR_LOG" --out "$LOG_REPORT"
+else
+  "$PY" tools/log_gate.py --containers "$LOG_CONTAINERS" \
+    --since "$RUN_START_ISO" --out "$LOG_REPORT"
+fi
 set -e
 
 # --- 6e) image/lifecycle probes (G16-G24) ---------------------------------------

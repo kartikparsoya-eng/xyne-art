@@ -408,6 +408,31 @@ def slope_per_hour(samples: list[tuple[float, float]]) -> float | None:
     return sum((t - mt) * (v - mv) for t, v in pts) / denom * 3600.0
 
 
+def steady_slope_per_hour(
+    samples: list[tuple[float, float]],
+    warmup_s: float = 600.0,
+    warmup_frac: float = 0.2,
+) -> float | None:
+    """Leak-oriented slope: fit only the STEADY-STATE window, excluding the
+    cold-start ramp. A full-window linear fit is dominated by warmup — on a
+    flat 1h 20-conn soak (2026-08-11) RSS ramped 1.07→3.3GB in the first
+    3 min of hydration then plateaued: full-window fit read +495MB/h while
+    the steady-state fit read -32MB/h. A leak gate fed the full-window
+    number fails every cold-started soak regardless of leak reality.
+    Warmup = the larger of `warmup_s` or `warmup_frac` of the window; falls
+    back to the full-window fit when the steady window is too thin.
+    """
+    pts = [(t, v) for t, v in samples if v is not None]
+    if len(pts) < 3:
+        return None
+    t0, t1 = pts[0][0], pts[-1][0]
+    cut = t0 + max(warmup_s, (t1 - t0) * warmup_frac)
+    steady = [p for p in pts if p[0] >= cut]
+    if len(steady) < 3:
+        return slope_per_hour(pts)
+    return slope_per_hour(steady)
+
+
 # --------------------------------------------------------------------------- #
 # WAL reclaim verdict — the wal2 zombie-pin / lagging-snapshot detector.
 #
@@ -628,10 +653,16 @@ def main() -> int:
         present = [v for _, v in vals if v is not None]
         if not present:
             continue
+        full_slope = slope_per_hour(vals)
+        steady_slope = steady_slope_per_hour(vals)
         summary[m] = {
             "first": present[0], "last": present[-1], "max": max(present),
-            "slope_per_hour": (round(slope_per_hour(vals), 1)
-                               if slope_per_hour(vals) is not None else None),
+            "slope_per_hour": (round(full_slope, 1)
+                               if full_slope is not None else None),
+            # Warmup-excluded fit — what the G6 leak gate should read (the
+            # full-window slope is kept for reference / ramp diagnosis).
+            "steady_slope_per_hour": (round(steady_slope, 1)
+                                      if steady_slope is not None else None),
         }
     spath = heap_prefix + ".summary.json"
 

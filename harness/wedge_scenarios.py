@@ -716,6 +716,199 @@ async def sc_auth_invalidation(ctx: Ctx) -> dict:
         await close(s2)
 
 
+
+# --------------------------------------------------------------------------- #
+# Scenario 12: Stalled poke consumer — THE 2026-08-11 prod WAL wedge
+# --------------------------------------------------------------------------- #
+def _wal_bytes(container: str) -> int:
+    """Total replica WAL bytes (wal + wal2) inside the zero-cache container."""
+    try:
+        out = subprocess.run(
+            ["docker", "exec", container, "sh", "-c",
+             "wc -c < /var/zero/replica.db-wal 2>/dev/null; "
+             "wc -c < /var/zero/replica.db-wal2 2>/dev/null"],
+            capture_output=True, text=True, timeout=15)
+        vals = [int(x) for x in out.stdout.split() if x.strip().isdigit()]
+        return sum(vals) if vals else -1
+    except Exception:
+        return -1
+
+
+def _count_in_logs(container: str, pattern: str, since_s: int) -> int:
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--since", f"{since_s}s", container],
+            capture_output=True, text=True, timeout=20)
+        return len(re.findall(pattern, out.stdout + out.stderr))
+    except Exception:
+        return -1
+
+
+async def _open_tiny_rcvbuf(ctx: Ctx, cgid: str, cid: str, puts: list) -> Session:
+    """Ctx.open, but on a hand-made TCP socket whose SO_RCVBUF is shrunk
+    BEFORE connect() — the TCP window is tiny from the SYN, so a few KB of
+    unread pokes stall the server's writes (the zero-window condition). A
+    post-connect setsockopt cannot do this: the window scale is negotiated at
+    the handshake."""
+    import socket as _socket
+    import websockets
+    from negative import init_connection_message, connect_url
+    from protocol import encode_sec_protocols
+
+    ident = ctx.ident(0)
+    init_msg = init_connection_message([p for p in puts],
+                                       client_schema=ctx.client_schema,
+                                       active_clients=None)
+    sec = encode_sec_protocols(None, ident["token"])
+    base = getattr(ctx, "stall_target", None) or ctx.target
+    url = connect_url(base, cgid, cid, lmid=0, base_cookie="",
+                      user_id=ident.get("userID"), pv=ctx.pv)
+    u = urllib.parse.urlparse(url)
+    raw = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    raw.setsockopt(_socket.SOL_SOCKET, _socket.SO_RCVBUF, 2048)
+    raw.connect((u.hostname, u.port or 80))
+    ws = await websockets.connect(
+        url, sock=raw, subprotocols=[sec], open_timeout=20,
+        max_size=None, ping_interval=None)
+    await ws.send(json.dumps(init_msg))
+    return Session(ws=ws)
+
+
+async def sc_stalled_poke_consumer(ctx: Ctx) -> dict:
+    """THE 2026-08-11 prod WAL wedge, reproduced at the TCP level.
+
+    One client of a client group stays CONNECTED but stops READING its socket
+    (a suspended/backgrounded tab -> TCP zero-window, or a silently dead peer
+    before the kernel timeout). Its pokes stop being consumed. Before the
+    ZERO_PUSH_CONSUME_TIMEOUT_MS fix, the poke await wedged the view-syncer
+    lock: the WHOLE client group stopped advancing, the snapshotter read-marks
+    froze, and wal2 checkpointing starved -> unbounded replica WAL growth from
+    a healthy-looking pod (prod: 8.5 GiB wal, shm byte-124 holder).
+
+    Poke source: the HEALTHY sibling drives changeDesiredQueries churn — each
+    new got-query (and its hydrated rows) is poked to EVERY client of the
+    group at the CVR version, including the stalled one. A pre-stall probe
+    asserts this reaches both clients; if it doesn't, the scenario SKIPs
+    (poke source ineffective) rather than mis-reporting a wedge.
+
+    Post-fix assertions:
+      1. the server evicts the stalled connection ("not consuming pokes")
+         within the scenario budget of its buffers filling;
+      2. the sibling keeps receiving pokes after the eviction (pre-fix: the
+         whole group starves forever);
+      3. the stale-pin guard does NOT need to fire (the 60s bound acts first);
+      4. the replica WAL is not left monotonically grown.
+    """
+    name = "stalled-poke-consumer"
+    expect = ("stalled conn evicted; sibling pokes continue; "
+              "no stale-pin guard; WAL bounded")
+    container = getattr(ctx, "container", "") or ""
+    if not container:
+        return result(name, "SKIP", expect, "needs --container for log/WAL probes")
+
+    cgid = rand_id()
+    put = ctx.benign_put()
+    stalled = await _open_tiny_rcvbuf(ctx, cgid, rand_id(), [put])
+    sibling = await ctx.open(cgid, rand_id(), puts=[put])
+    wal_start = _wal_bytes(container)
+
+    async def churn_wave(n: int = 8) -> None:
+        """Sibling adds n fresh catalog queries -> group-wide pokes."""
+        patch = [ctx.benign_put() for _ in range(n)]
+        await sibling.ws.send(json.dumps(change_desired_queries_message(patch)))
+
+    try:
+        ok_a = await stalled.pump_until(lambda x: x.got_hashes or x.errors, 45)
+        ok_b = await sibling.pump_until(lambda x: x.got_hashes or x.errors, 45)
+        if not (ok_a and stalled.got_hashes and ok_b and sibling.got_hashes):
+            return result(name, "SKIP", expect,
+                          f"hydration incomplete: A={stalled.tags} B={sibling.tags}")
+
+        # Pre-stall probe: one churn wave must poke BOTH clients, proving the
+        # poke source reaches the client we are about to stall.
+        a0 = stalled.tags.get("pokeStart", 0)
+        b0 = sibling.tags.get("pokeStart", 0)
+        await churn_wave()
+        await sibling.pump(8)
+        await stalled.pump(8)
+        if stalled.tags.get("pokeStart", 0) <= a0 or sibling.tags.get("pokeStart", 0) <= b0:
+            return result(name, "SKIP", expect,
+                          f"poke source ineffective pre-stall: "
+                          f"A pokes {a0}->{stalled.tags.get('pokeStart', 0)}, "
+                          f"B pokes {b0}->{sibling.tags.get('pokeStart', 0)}")
+
+        # STALL the first client at the transport level: shrink its receive
+        # buffer then stop reading -> kernel recv buffer fills -> TCP window
+        # closes -> server-side sends stop draining. This is the suspended-tab
+        # zero-window, not an application-level credit stall.
+        try:
+            tr = getattr(stalled.ws, "transport", None)
+            tr.pause_reading()
+        except Exception as e:
+            return result(name, "SKIP", expect, f"cannot stall transport: {e!r}")
+
+        t_stall = time.time()
+        evicted_at = None
+        b_pokes_during = 0
+        for _wave in range(60):
+            await churn_wave()
+            before = sibling.tags.get("pokeEnd", 0)
+            await sibling.pump(4)
+            b_pokes_during += sibling.tags.get("pokeEnd", 0) - before
+            n = _count_in_logs(container, r"not consuming pokes",
+                               int(time.time() - t_stall) + 5)
+            if n > 0:
+                evicted_at = time.time() - t_stall
+                break
+            if time.time() - t_stall > 240:
+                break
+
+        if evicted_at is None:
+            if b_pokes_during == 0:
+                return result(name, "FAIL", expect,
+                              "WEDGE REPRODUCED: sibling received 0 pokes during the "
+                              "stall and the stalled connection was never evicted — "
+                              "the push-consume timeout fix is not active")
+            return result(name, "SKIP", expect,
+                          f"could not fill the stalled socket's buffers within 240s "
+                          f"(sibling pokes kept flowing: {b_pokes_during}) — stall not achieved")
+
+        # Post-eviction: the group must continue advancing for the sibling.
+        before = sibling.tags.get("pokeEnd", 0)
+        await churn_wave()
+        await sibling.pump(10)
+        after = sibling.tags.get("pokeEnd", 0)
+        if after <= before:
+            return result(name, "FAIL", expect,
+                          f"stalled conn evicted at {evicted_at:.0f}s but the sibling "
+                          f"got no pokes afterwards — group did not recover")
+
+        guard = _count_in_logs(container, r"stale-pin guard",
+                               int(time.time() - t_stall) + 30)
+        wal_end = _wal_bytes(container)
+        wal_note = f"wal {wal_start} -> {wal_end}"
+        if wal_start >= 0 and wal_end >= 0 and wal_end - wal_start > 256 * 1024 * 1024:
+            return result(name, "WATCH", expect,
+                          f"evicted at {evicted_at:.0f}s, sibling recovered, but WAL grew "
+                          f"{(wal_end - wal_start) // (1024 * 1024)}MiB ({wal_note})")
+        if guard > 0:
+            return result(name, "WATCH", expect,
+                          f"evicted at {evicted_at:.0f}s and sibling recovered, but the "
+                          f"stale-pin guard fired {guard}x — the 60s bound should act first")
+        return result(name, "PASS", expect,
+                      f"stalled conn evicted at {evicted_at:.0f}s; sibling pokes flowed "
+                      f"(during={b_pokes_during}, after=+{after - before}); guard quiet; {wal_note}")
+    finally:
+        try:
+            tr = getattr(stalled.ws, "transport", None)
+            if tr is not None:
+                tr.resume_reading()
+        except Exception:
+            pass
+        await close(stalled)
+        await close(sibling)
+
+
 # --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
@@ -723,6 +916,7 @@ async def run(a: argparse.Namespace) -> int:
     ctx = Ctx(a)
     ctx.pprof = a.pprof
     ctx.container = a.container
+    ctx.stall_target = getattr(a, 'stall_target', None)
     print(f"=== wedge scenarios vs {a.target} ===")
     scenarios = [
         sc_cancel_mid_hydrate,
@@ -736,6 +930,7 @@ async def run(a: argparse.Namespace) -> int:
         sc_mid_hydrate_kill_loop,
         sc_half_open_socket,
         sc_auth_invalidation,
+        sc_stalled_poke_consumer,
     ]
     if a.only:
         wanted = set(a.only.split(","))
@@ -805,6 +1000,11 @@ def main() -> int:
     ap.add_argument("--auth-token", default=None)
     ap.add_argument("--user-id", default=None)
     ap.add_argument("--pprof", default="", help="Go pprof base URL")
+    ap.add_argument("--stall-target", default=None,
+                    help="Direct (proxy-free) ws URL for the STALLED client in "
+                         "stalled-poke-consumer — bypasses ingress buffering so "
+                         "a clamped-sndbuf server + tiny-rcvbuf client stall "
+                         "deterministically (e.g. ws://127.0.0.1:14848)")
     ap.add_argument("--container", default=None,
                     help="zero-cache container name (for log checks)")
     ap.add_argument("--pg-container", default=None)

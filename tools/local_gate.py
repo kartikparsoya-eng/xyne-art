@@ -400,9 +400,16 @@ def main() -> int:
         limits = {"rss_bytes": 200 * 2**20, "goroutines": 300,
                   "heapinuse": 100 * 2**20}
         for m, lim in limits.items():
-            s = (resources.get(m) or {}).get("slope_per_hour")
+            met = resources.get(m) or {}
+            # Prefer the warmup-excluded steady-state slope: the full-window
+            # fit is dominated by the cold-start hydration ramp (measured
+            # +495MB/h full vs -32MB/h steady on a flat 1h soak) and would
+            # fail every cold-started soak regardless of leak reality.
+            s = met.get("steady_slope_per_hour", met.get("slope_per_hour"))
+            if s is None:
+                s = met.get("slope_per_hour")
             if s is not None and s > lim:
-                entry = f"{m} +{s:.0f}/h (limit {lim})"
+                entry = f"{m} +{s:.0f}/h steady (limit {lim})"
                 if m == "rss_bytes":
                     heap_s = (resources.get("heapinuse") or {}).get("slope_per_hour")
                     gor_s = (resources.get("goroutines") or {}).get("slope_per_hour")

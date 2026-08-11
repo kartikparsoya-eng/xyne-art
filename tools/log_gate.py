@@ -500,6 +500,10 @@ def main() -> int:
     ap.add_argument("--unknown-include-warn", action="store_true",
                     help="G13b: also scan WARN-level lines for unknowns "
                          "(default: ERROR-level only)")
+    ap.add_argument("--resources", default=None,
+                    help="path to a resource_sampler .summary.json — "
+                         "folds WAL growth, WAL/DB ratio, and PG slot lag "
+                         "alerts into this gate")
     a = ap.parse_args()
 
     since = a.since
@@ -619,6 +623,39 @@ def main() -> int:
                        for sig, e in sorted(unknown_errors.items(),
                                             key=lambda kv: -kv[1]["count"])],
     }
+
+    # --- WAL / slot-lag alerts from the resource sampler ---
+    if a.resources and os.path.exists(a.resources):
+        try:
+            rs = json.load(open(a.resources))
+            report["resource_alerts"] = {}
+            if rs.get("wal_growth_alert"):
+                a_info = rs["wal_growth_alert"]
+                raise_to("WATCH")
+                report["details"].append(f"wal-growth: {a_info['note']}")
+                report["resource_alerts"]["wal_growth"] = a_info
+            if rs.get("wal_ratio_alert"):
+                a_info = rs["wal_ratio_alert"]
+                raise_to("WATCH")
+                report["details"].append(f"wal-ratio: {a_info['note']}")
+                report["resource_alerts"]["wal_ratio"] = a_info
+            if rs.get("pg_lag_alert"):
+                a_info = rs["pg_lag_alert"]
+                raise_to("WATCH")
+                report["details"].append(f"pg-slot-lag: {a_info['note']}")
+                report["resource_alerts"]["pg_slot_lag"] = a_info
+            if rs.get("orphaned_slots"):
+                o_info = rs["orphaned_slots"]
+                raise_to("FAIL")
+                report["details"].append(f"orphaned-slots: {o_info['note']}")
+                report["resource_alerts"]["orphaned_slots"] = o_info
+            if rs.get("ckpt_starvation_alert"):
+                c_info = rs["ckpt_starvation_alert"]
+                raise_to("FAIL")
+                report["details"].append(f"ckpt-starvation: {c_info['note']}")
+                report["resource_alerts"]["ckpt_starvation"] = c_info
+        except Exception as e:
+            print(f"WARN: cannot load resource summary {a.resources}: {e}", file=sys.stderr)
 
     if a.out:
         with open(a.out, "w") as f:
