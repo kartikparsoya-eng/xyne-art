@@ -204,6 +204,7 @@ if [ "$BOOTSTRAP" = "1" ]; then
     -v zero_cache_art_rust_test:/var/zero \
     -l "traefik.enable=true" \
     -l "traefik.http.routers.zero-art.rule=Host(\`rust-test.localhost\`) && PathPrefix(\`/zero-art\`)" \
+    -l "traefik.http.routers.zero-art.priority=100" \
     -l "traefik.http.routers.zero-art.entrypoints=web" \
     -l "traefik.http.routers.zero-art.middlewares=zero-art-stripprefix" \
     -l "traefik.http.middlewares.zero-art-stripprefix.stripprefix.prefixes=/zero-art" \
@@ -731,7 +732,17 @@ if [ "$ORACLE" = "1" ]; then
     fi
   fi
   if docker ps --format '{{.Names}}' | grep -qx "$ZCACHETS"; then
-    MIRRORFLAGS=(--mirror "$MIRROR_URL")
+    # G8 compares ENGINES — route around traefik so a router flap / priority
+    # fallthrough can never silently substitute another zero-cache for either
+    # side (2026-08-11: the main router's PathPrefix(/zero) prio 20 swallowed
+    # /zero-art AND /zero-ts; diff CGs split across two servers -> 12k false
+    # mismatches + quiesce timeouts).
+    MIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ZCACHETS" 2>/dev/null || true)
+    if [ -n "$MIP" ]; then
+      MIRRORFLAGS=(--mirror "ws://$MIP:4848")
+    else
+      MIRRORFLAGS=(--mirror "$MIRROR_URL")
+    fi
   elif [ "$MUTATIONS" = "1" ]; then
     echo "NOTE: $ZCACHETS unavailable and mutations are ON — SKIPPING oracle" >&2
     echo "  (self-diff with writes is not a valid oracle; G8 will read SKIP)" >&2
@@ -762,7 +773,10 @@ if [ "$ORACLE" = "1" ]; then
   [ "$FULLCATALOG" = "1" ] && ORACLE_LABEL=" [full-catalog]"
   echo "== differential oracle (G8)$ORACLE_LABEL =="
   set +e
-  "$PY" harness/diff_oracle.py --primary "$TARGET" \
+  ORACLE_PRIMARY="$TARGET"
+  APRIM=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ZCACHE" 2>/dev/null || true)
+  [ -n "$APRIM" ] && ORACLE_PRIMARY="ws://$APRIM:4848"
+  "$PY" harness/diff_oracle.py --primary "$ORACLE_PRIMARY" \
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
     --id-pool "$POOL" --client-schema "$CSCHEMA" \
     --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
