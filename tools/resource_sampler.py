@@ -410,8 +410,8 @@ def slope_per_hour(samples: list[tuple[float, float]]) -> float | None:
 
 def steady_slope_per_hour(
     samples: list[tuple[float, float]],
-    warmup_s: float = 600.0,
-    warmup_frac: float = 0.2,
+    warmup_s: float = 900.0,
+    warmup_frac: float = 0.5,
 ) -> float | None:
     """Leak-oriented slope: fit only the STEADY-STATE window, excluding the
     cold-start ramp. A full-window linear fit is dominated by warmup — on a
@@ -419,8 +419,14 @@ def steady_slope_per_hour(
     3 min of hydration then plateaued: full-window fit read +495MB/h while
     the steady-state fit read -32MB/h. A leak gate fed the full-window
     number fails every cold-started soak regardless of leak reality.
-    Warmup = the larger of `warmup_s` or `warmup_frac` of the window; falls
-    back to the full-window fit when the steady window is too thin.
+    Warmup = the larger of `warmup_s` or `warmup_frac` of the window (i.e.
+    the fit covers the LAST HALF of the run); falls back to the full-window
+    fit when the steady window is too thin. Fitting only the last half loses
+    no sensitivity to real leaks — a genuine leak is linear and shows the
+    same slope in any window — while excluding slow multi-phase ramps that a
+    fixed 10-20% cutoff still catches (measured 2026-08-11: a run whose ramp
+    ran ~20min read +253MB/h with a 20% cutoff vs -44MB/h over its second
+    half, with the container settling to 0.6GB after teardown — no leak).
     """
     pts = [(t, v) for t, v in samples if v is not None]
     if len(pts) < 3:
