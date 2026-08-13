@@ -62,6 +62,40 @@ def canon(v: Any) -> str:
     return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
 
 
+_LEXI_SEG = __import__("re").compile(r"[0-9a-z]+")
+
+
+def _valid_lexi_segment(seg: str) -> bool:
+    """One LexiVersion segment: <lengthChar><base36> where
+    len(base36) == parseInt(lengthChar, 36) + 1. Exact mirror of TS
+    fromLexiVersion() (zero-cache/src/types/lexi-version.ts)."""
+    if not seg or not _LEXI_SEG.fullmatch(seg):
+        return False
+    length_char, base36 = seg[0], seg[1:]
+    try:
+        return len(base36) == int(length_char, 36) + 1
+    except ValueError:
+        return False
+
+
+def valid_cookie(cookie: Any) -> bool:
+    """A CVR cookie is version_string() = stateVersion[:lexi(configVersion)] —
+    one or more ':'-joined LexiVersion segments. The empty string (initial CVR)
+    and null (Replicache's pre-first-request baseCookie) are both legal."""
+    if cookie is None or cookie == "":
+        return True
+    if not isinstance(cookie, str):
+        return False
+    return all(_valid_lexi_segment(s) for s in cookie.split(":"))
+
+
+def _cookie_lt(a: str, b: str) -> bool:
+    """Strict lexi ordering. LexiVersions are designed so plain lexicographic
+    string comparison yields numeric order; multi-segment cookies compare
+    segment-by-segment (shorter/absent segment sorts first)."""
+    return (a or "").split(":") < (b or "").split(":")
+
+
 def _diff_columns(primary_row: dict, mirror_row: dict) -> list[dict]:
     """Column-level diff between two rows. Returns list of {column, primary, mirror}."""
     cols = sorted(set(primary_row) | set(mirror_row))
@@ -97,6 +131,20 @@ class Materializer:
         self.zero_result_tables: set[str] = set()         # tables that got 0 rows
         self.streaming_queries: set[str] = set()         # queries still streaming at quiesce
         self.row_query: dict[tuple, set] = {}            # (table, key) -> {query_name} that emitted it
+        # --- poke-cookie invariants (①): the version strings clients persist and
+        # round-trip on reconnect. End-state materialization discards these, so a
+        # port that mis-formats or mis-advances the CVR version is invisible to
+        # the row diff. These are SINGLE-SIDE protocol invariants (the mirror is a
+        # live control): cross-side cookie *values* legally differ (independent
+        # CVRs, watermark/config-bump timing), but every side must chain, advance
+        # monotonically, and emit well-formed lexi. See check_cookie_invariants().
+        self.cookie_chain: list[str] = []        # ordered non-cancel pokeEnd cookies
+        self.base_cookies: list[Any] = []        # ordered pokeStart baseCookies (may be None)
+        self.chain_violations: list[dict] = []   # baseCookie[N] != cookie[N-1]
+        self.format_violations: list[dict] = []  # cookie not valid lexi grammar
+        self.monotonic_warnings: list[dict] = [] # cookie did not strictly advance
+        self._last_good_cookie: Any = None       # last applied (non-cancelled) cookie
+        self._pending_base: Any = "\0unset"      # baseCookie of the open poke
 
     def _key(self, table: str, obj: dict) -> str:
         pk = self.pks.get(table)
@@ -155,6 +203,56 @@ class Materializer:
                         if poke_start_time is not None:
                             elapsed = round((time.perf_counter() - poke_start_time) * 1000, 1)
                             self.query_latency.setdefault(qname, []).append(elapsed)
+
+    def on_poke_start(self, base_cookie: Any) -> None:
+        self.base_cookies.append(base_cookie)
+        self._pending_base = base_cookie
+        if not valid_cookie(base_cookie):
+            self.format_violations.append({"where": "pokeStart.baseCookie",
+                                           "value": base_cookie})
+
+    def on_poke_end(self, cookie: Any, cancel: bool) -> None:
+        idx = len(self.cookie_chain)
+        if cancel:
+            # Cancelled poke: client discards it; it must NOT advance the chain.
+            # The next poke's baseCookie should still equal the last good cookie.
+            self._pending_base = "\0unset"
+            return
+        if not valid_cookie(cookie):
+            self.format_violations.append({"where": "pokeEnd.cookie", "value": cookie})
+        # Chain invariant: this poke's baseCookie must equal the previous
+        # (non-cancelled) poke's cookie. The very first poke chains off the
+        # initial CVR (null or ""), which we accept as the empty base.
+        base = self._pending_base
+        if base != "\0unset":
+            expected = self._last_good_cookie
+            first = self._last_good_cookie is None
+            base_is_initial = base is None or base == ""
+            if not (first and base_is_initial) and base != expected:
+                self.chain_violations.append(
+                    {"poke": idx, "baseCookie": base, "expected_prev_cookie": expected})
+        # Monotonicity: cookies must strictly advance (WATCH, not gated —
+        # guards against lexi-compare subtleties in multi-segment cookies).
+        if (self._last_good_cookie not in (None, "") and isinstance(cookie, str)
+                and not _cookie_lt(self._last_good_cookie, cookie)):
+            self.monotonic_warnings.append(
+                {"poke": idx, "prev": self._last_good_cookie, "cookie": cookie})
+        self.cookie_chain.append(cookie)
+        self._last_good_cookie = cookie
+        self._pending_base = "\0unset"
+
+
+def cookie_invariants(mat: Materializer) -> dict:
+    """Summarize the poke-cookie invariants for one side (①). chain/format
+    violations are hard bugs (gated); monotonic warnings are advisory."""
+    return {
+        "pokes": len(mat.cookie_chain),
+        "terminal_cookie": mat.cookie_chain[-1] if mat.cookie_chain else None,
+        "chain_violations": mat.chain_violations,
+        "format_violations": mat.format_violations,
+        "monotonic_warnings": mat.monotonic_warnings,
+        "hard_violations": len(mat.chain_violations) + len(mat.format_violations),
+    }
 
 
 def diff_states(a: Materializer, b: Materializer, max_examples: int = 3) -> dict:
@@ -271,6 +369,7 @@ async def reader(side: Side, stop: asyncio.Event) -> None:
             side.last_activity = time.perf_counter()
         if tag == "pokeStart":
             poke_start_time = time.perf_counter()
+            side.mat.on_poke_start(body.get("baseCookie"))
         if tag == "pokePart":
             got = body.get("gotQueriesPatch", []) or []
             side.mat.apply_rows_patch(body.get("rowsPatch"), got_hashes=got,
@@ -283,6 +382,7 @@ async def reader(side: Side, stop: asyncio.Event) -> None:
                 side.lmid_acked = max(side.lmid_acked, int(lm[side.cid]))
         elif tag == "pokeEnd":
             side.pokes += 1
+            side.mat.on_poke_end(body.get("cookie"), bool(body.get("cancel")))
         elif tag == "error":
             kind = body.get("kind", "unknown")
             side.mat.error_kinds[kind] = side.mat.error_kinds.get(kind, 0) + 1
@@ -578,6 +678,8 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         "mutations_sent": muts["sent"],
         "mutations_acked": sides[0].lmid_acked,
         "quiesced": quiesced,
+        "cookie_primary": cookie_invariants(sides[0].mat),
+        "cookie_mirror": cookie_invariants(sides[1].mat),
         "query_attribution": query_attribution,
         "streaming_at_quiesce": sorted(sides[0].mat.streaming_queries |
                                         sides[1].mat.streaming_queries),
@@ -678,9 +780,30 @@ async def amain(a: argparse.Namespace) -> int:
         side: sum(r.get(side, {}).get("rows", 0) for r in results)
         for side in ("primary", "mirror")
     }
+    # ① poke-cookie invariant violations (chain + format) across both sides,
+    # all pairs. Single-side protocol invariants — a version-arithmetic or
+    # -formatting port bug trips these even when the converged rows match.
+    cookie_hard = sum(
+        r.get(side, {}).get("hard_violations", 0)
+        for r in results for side in ("cookie_primary", "cookie_mirror"))
+    cookie_mono = sum(
+        len(r.get(side, {}).get("monotonic_warnings", []))
+        for r in results for side in ("cookie_primary", "cookie_mirror"))
+    # Cross-side terminal-cookie comparison — WATCH only (not gated). In a
+    # quiesced steady state both sides caught up to the same watermark AND saw
+    # identical desired-query traffic, so terminal cookies normally match
+    # exactly; a config-version arithmetic regression shows as a suffix
+    # divergence here. Left ungated because watermark skew can legally differ.
+    cookie_terminal_mismatch = [] if self_diff else [
+        {"pair": r["pair"],
+         "primary": r.get("cookie_primary", {}).get("terminal_cookie"),
+         "mirror": r.get("cookie_mirror", {}).get("terminal_cookie")}
+        for r in results
+        if (r.get("cookie_primary", {}).get("terminal_cookie")
+            != r.get("cookie_mirror", {}).get("terminal_cookie"))]
     oracle_failed = (
         total_mismatch > 0 or bool(conn_errors) or total_hydration_gap > 0
-        or protocol_errors > 0
+        or protocol_errors > 0 or cookie_hard > 0
         or (a.full_catalog and (bool(catalog_missing)
                                or not catalog_expected
                                or len(catalog_accounted) != catalog_total
@@ -707,6 +830,9 @@ async def amain(a: argparse.Namespace) -> int:
         "catalog_rows": catalog_rows,
         "protocol_errors": protocol_errors,
         "connect_errors": len(conn_errors),
+        "cookie_violations": cookie_hard,
+        "cookie_monotonic_warnings": cookie_mono,
+        "cookie_terminal_mismatch": cookie_terminal_mismatch,
         "verdict": "FAIL" if oracle_failed else "PASS",
         "results": results,
     }
@@ -771,10 +897,32 @@ async def amain(a: argparse.Namespace) -> int:
             print(f"  HYDRATION PARITY: {len(only_mirror_hydrated)} quer(ies) "
                   f"hydrated on MIRROR(ts) but NOT PRIMARY(rust) — possible "
                   f"rust delivery bug: {only_mirror_hydrated[:12]}")
+    # ① cookie-invariant failures: print the offending side + sample so a
+    # version-format/arithmetic regression can be chased to a specific poke.
+    if cookie_hard or cookie_mono:
+        for r in results:
+            for side, lbl in (("cookie_primary", "PRIMARY(rust)"),
+                              ("cookie_mirror", "MIRROR(ts)")):
+                ci = r.get(side, {})
+                for cv in ci.get("chain_violations", [])[:4]:
+                    print(f"  COOKIE CHAIN [{lbl} pair {r['pair']}]: poke {cv['poke']} "
+                          f"baseCookie={cv['baseCookie']!r} != prev cookie "
+                          f"{cv['expected_prev_cookie']!r}")
+                for fv in ci.get("format_violations", [])[:4]:
+                    print(f"  COOKIE FORMAT [{lbl} pair {r['pair']}]: "
+                          f"{fv['where']}={fv['value']!r} is not valid lexi")
+                for mw in ci.get("monotonic_warnings", [])[:2]:
+                    print(f"  COOKIE MONO(warn) [{lbl} pair {r['pair']}]: poke "
+                          f"{mw['poke']} {mw['prev']!r} -> {mw['cookie']!r} not advancing")
+    for tm in cookie_terminal_mismatch:
+        print(f"  COOKIE TERMINAL(watch) pair {tm['pair']}: primary={tm['primary']!r} "
+              f"!= mirror={tm['mirror']!r} (config/state-version drift — verify)")
     verdict = out["verdict"]
     print(f"{mode} ORACLE: {verdict} ({total_mismatch} mismatches, "
           f"{total_hydration_gap} hydration-parity gap, "
-          f"{len(conn_errors)} connect errors, {protocol_errors} protocol errors"
+          f"{len(conn_errors)} connect errors, {protocol_errors} protocol errors, "
+          f"{cookie_hard} cookie-invariant violations"
+          + (f" ({cookie_mono} mono-warn)" if cookie_mono else "")
           + (f", catalog_driven={out['catalog_driven']}/{out['catalog_expected']}"
              if out.get('full_catalog') else "")
           + f") -> {a.out}")
