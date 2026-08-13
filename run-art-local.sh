@@ -56,12 +56,13 @@ IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=50;
 CHAOS_MEAN_GAP=45
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
-OVERRIDE_TARGET=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""; OVERRIDE_MIRROR=""
+OVERRIDE_TARGET=""; OVERRIDE_MUTATE_URL=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""; OVERRIDE_MIRROR=""
 CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0; FULLCATALOG=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
     --target) OVERRIDE_TARGET="$2"; shift 2;;
+    --mutate-url) OVERRIDE_MUTATE_URL="$2"; shift 2;;
     --container) OVERRIDE_CONTAINER="$2"; shift 2;;
     --pprof-port) OVERRIDE_PPROF_PORT="$2"; shift 2;;
     --cvr-schema) OVERRIDE_CVR_SCHEMA="$2"; shift 2;;
@@ -181,7 +182,7 @@ if [ "$BOOTSTRAP" = "1" ]; then
   ZERO_SECRET=$(docker exec "$TS_CONTAINER" printenv ZERO_SECRET 2>/dev/null || true)
   # ZERO_SECRET not always set — fall back to ZERO_AUTH_SECRET (same value in sandbox)
   [ -z "$ZERO_SECRET" ] && ZERO_SECRET="$AUTH_SECRET"
-  BOOTSTRAP_IMAGE="${IMAGE:-zero-cache-rust-ivm:latest}"
+  BOOTSTRAP_IMAGE="${IMAGE:-zero-cache-rust-syncer:local}"
   PPROF_PORT="${OVERRIDE_PPROF_PORT:-6061}"
   docker run -d \
     --name "$ART_NAME" \
@@ -195,11 +196,11 @@ if [ "$BOOTSTRAP" = "1" ]; then
     -e ZERO_UPSTREAM_DB="postgresql://xyne:xyne123@xyne-sandbox-postgres:5432/sandbox_rust_test_db" \
     -e ZERO_CHANGE_DB="postgresql://xyne:xyne123@xyne-sandbox-postgres:5432/sandbox_rust_test_db" \
     -e ZERO_CVR_DB="postgresql://xyne:xyne123@xyne-sandbox-postgres:5432/sandbox_rust_test_db" \
+    -e ZERO_REPLICA_FILE=/var/zero/replica.db \
     -e ZERO_QUERY_URL="http://xyne-sandbox-rust-test-backend:3001/api/zero/query" \
     -e ZERO_MUTATE_URL="http://xyne-sandbox-rust-test-backend:3001/api/zero/push" \
-    -e USE_RUST_IVM=true \
-    -e RUST_IVM_ADDON_PATH=/app/mono/packages/rust-ivm/napi/rust-ivm.node \
-    -e RUST_IVM_TSFN_QUEUE=64 \
+    -e ZERO_SYNCER=rust \
+    -e ZERO_RUST_SYNCER_PATH=/usr/local/bin/rust-syncer \
     -e ZERO_NUM_SYNC_WORKERS=4 \
     -v zero_cache_art_rust_test:/var/zero \
     -l "traefik.enable=true" \
@@ -211,14 +212,39 @@ if [ "$BOOTSTRAP" = "1" ]; then
     -l "traefik.http.services.zero-art.loadbalancer.server.port=4848" \
     "$BOOTSTRAP_IMAGE"
   echo "[ART] waiting for container to be ready..."
+  BOOTSTRAP_READY=0
   for i in $(seq 1 30); do
     sleep 5
-    if docker logs "$ART_NAME" 2>&1 | grep -q "zero-cache ready"; then
+    # Do not use grep -q here under pipefail: its early exit SIGPIPEs
+    # `docker logs`, making a successful match look like a failed pipeline.
+    if docker logs "$ART_NAME" 2>&1 | grep "zero-cache ready" >/dev/null; then
       echo "[ART] container ready after $((i*5))s"
+      BOOTSTRAP_READY=1
       break
     fi
     echo "  $((i*5))s..."
   done
+  [ "$BOOTSTRAP_READY" = "1" ] || {
+    echo "ERROR: $ART_NAME did not become ready" >&2
+    docker logs --tail 100 "$ART_NAME" >&2 || true
+    exit 1
+  }
+  [ "$(docker exec "$ART_NAME" printenv ZERO_SYNCER 2>/dev/null || true)" = "rust" ] || {
+    echo "ERROR: bootstrapped candidate is not running ZERO_SYNCER=rust" >&2
+    exit 1
+  }
+  [ -z "$(docker exec "$ART_NAME" printenv USE_RUST_IVM 2>/dev/null || true)" ] || {
+    echo "ERROR: bootstrapped candidate still enables the hybrid NAPI path" >&2
+    exit 1
+  }
+  docker exec "$ART_NAME" test -x /usr/local/bin/rust-syncer || {
+    echo "ERROR: rust-syncer binary is missing from bootstrapped candidate" >&2
+    exit 1
+  }
+  docker logs "$ART_NAME" 2>&1 | grep 'Starting rust-syncer' >/dev/null || {
+    echo "ERROR: candidate logs do not prove rust-syncer started" >&2
+    exit 1
+  }
 fi
 
 # Trace mode replays REAL prod sessions — every statistical-shape knob would
@@ -286,6 +312,13 @@ elif [ "$SWAP" = "1" ]; then
   MIRROR_POD="xyne-sandbox-${SANDBOX}-zero-cache"
   MIRROR_URL="ws://${SANDBOX}.localhost/zero"
   PPROF_FLAGS=(--pprof '')   # TS pod is Node — no Go pprof endpoint
+fi
+MUTATE_URL="$OVERRIDE_MUTATE_URL"
+if [ -z "$MUTATE_URL" ]; then
+  MUTATE_BASE="${TARGET%%/zero*}"
+  MUTATE_BASE="${MUTATE_BASE/ws:\/\//http://}"
+  MUTATE_BASE="${MUTATE_BASE/wss:\/\//https://}"
+  MUTATE_URL="$MUTATE_BASE/api/zero/push"
 fi
 POOL="harness/id-pool.sandbox.json"
 if [ -n "$TRACE" ]; then POOL="harness/id-pool.trace.json"; fi
@@ -525,7 +558,7 @@ fi
 # --- 6) drive the replay (resource sampler runs alongside) ---------------------
 MUTFLAGS=()
 if [ "$MUTATIONS" = "1" ]; then
-  MUTFLAGS=(--enable-mutations --i-know-this-writes)
+  MUTFLAGS=(--enable-mutations --i-know-this-writes --mutate-url "$MUTATE_URL")
   # under a behavior profile the mutation rate comes from the profile unless
   # the user explicitly set one (explicit CLI wins over profile in replay.py)
   if [ -z "$PROFILE" ] || [ "$MUT_SET" = "1" ]; then
@@ -756,7 +789,7 @@ fi
 if [ "$ORACLE" = "1" ]; then
   ORACLE_MUTFLAGS=()
   if [ "$MUTATIONS" = "1" ]; then
-    ORACLE_MUTFLAGS=(--enable-mutations --i-know-this-writes)
+    ORACLE_MUTFLAGS=(--enable-mutations --i-know-this-writes --mutate-url "$MUTATE_URL")
   fi
   ORACLE_REPORT="reports/diff-$TAG.json"
   # full-catalog mode subscribes EVERY resolvable query once (no churn) so all
@@ -937,6 +970,7 @@ if [ "$IMAGEAUDIT" = "1" ]; then
       --size-budget-mb 600 --size-hard-mb 700 \
       --expected-base sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 \
       --require-label org.opencontainers.image.base.name \
+      --require-label org.opencontainers.image.revision \
       --out "$IMAGEAUDIT_REPORT"; set -e
   else
     echo "NOTE: could not determine image ref for $ZCACHE — pass --image" >&2

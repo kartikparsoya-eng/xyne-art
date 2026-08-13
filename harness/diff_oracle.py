@@ -55,6 +55,7 @@ from workload import (  # noqa: E402
     custom_mutation, push_message,
 )
 from protocol import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
+from replay import post_direct_mutation  # noqa: E402
 
 
 def canon(v: Any) -> str:
@@ -441,10 +442,21 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
                     sides[0].cgid,
                     [custom_mutation(mid, sides[0].cid, name, args, now_ms)],
                     request_id=f"{sides[0].cid}-{mid}", now_ms=now_ms)
-                try:
-                    await sides[0].ws.send(json.dumps(msg))
-                except Exception:
-                    return
+                if a.mutate_url:
+                    ok = await asyncio.to_thread(
+                        post_direct_mutation,
+                        a.mutate_url,
+                        msg[1],
+                        a.auth_token,
+                        None,
+                    )
+                    if not ok:
+                        muts["errors"] = muts.get("errors", 0) + 1
+                else:
+                    try:
+                        await sides[0].ws.send(json.dumps(msg))
+                    except Exception:
+                        return
                 muts["sent"] += 1
             await asyncio.sleep(interval)
 
@@ -803,8 +815,11 @@ def main() -> int:
                     help="source-derived current query catalog; baseline-only names are "
                          "reported as stale instead of sent to the app transformer")
     ap.add_argument("--enable-mutations", action="store_true",
-                    help="drive read-tracking writes on the primary socket "
+                    help="drive read-tracking writes through the primary app "
                          "(replicates to both sides via the shared DB)")
+    ap.add_argument("--mutate-url", default=None,
+                    help="app direct-mutation endpoint; when set, POST mutations "
+                         "instead of sending unsupported sync-socket pushes")
     ap.add_argument("--i-know-this-writes", action="store_true",
                     help="required confirmation for --enable-mutations")
     ap.add_argument("--mutations-per-min", type=float, default=6.0,

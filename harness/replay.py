@@ -43,6 +43,7 @@ import random
 import sys
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -78,6 +79,7 @@ class Config:
     user_query_url: Optional[str]
     seed: int
     enable_mutations: bool = False
+    mutate_url: Optional[str] = None
     mutations_per_min: float = 4.0
     client_schema: Optional[dict] = None
     # --- lifecycle realism (all off unless --lifecycle) ---
@@ -96,6 +98,34 @@ class Config:
     # --- impact-aware mutation targeting (G14; see workload.ImpactIndex) ---
     impact_path: Optional[str] = None
     impact_bias: float = 0.75         # P(aim at a subscribed query's entity)
+
+
+def post_direct_mutation(url: str, body: dict[str, Any], auth_token: Optional[str],
+                         cookie: Optional[str]) -> bool:
+    """POST one Zero push body to the app's direct-mutation endpoint."""
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read() or b"{}")
+    except Exception:
+        return False
+    mutations = payload.get("mutations", []) if isinstance(payload, dict) else []
+    return not any(
+        isinstance(item, dict)
+        and isinstance(item.get("result"), dict)
+        and "error" in item["result"]
+        for item in mutations
+    )
 
 
 @dataclass
@@ -384,7 +414,7 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                 async def mutator() -> None:
                     """Read-tracking custom mutations at --mutations-per-min per
                     client; ids increase monotonically across reconnects."""
-                    nonlocal mid
+                    nonlocal mid, acked
                     if msampler is None or cfg.mutations_per_min <= 0:
                         return
                     interval = 60.0 / cfg.mutations_per_min
@@ -413,12 +443,26 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
                             msg = push_message(
                                 cgid, [custom_mutation(mid, cid, name, args, now_ms)],
                                 request_id=f"{cid}-{mid}", now_ms=now_ms)
-                            try:
-                                await ws.send(json.dumps(msg))
-                            except Exception:
-                                return
                             stats.mutations_sent += 1
                             stats.per_mutation[name] = stats.per_mutation.get(name, 0) + 1
+                            if cfg.mutate_url:
+                                ok = await asyncio.to_thread(
+                                    post_direct_mutation,
+                                    cfg.mutate_url,
+                                    msg[1],
+                                    auth_token,
+                                    cfg.cookie,
+                                )
+                                if ok:
+                                    stats.mutation_ok += 1
+                                    acked = max(acked, mid)
+                                else:
+                                    stats.mutation_err += 1
+                            else:
+                                try:
+                                    await ws.send(json.dumps(msg))
+                                except Exception:
+                                    return
                         if not await sleep_or_stop(interval):
                             return
 
@@ -829,6 +873,9 @@ def main() -> int:
     ap.add_argument("--enable-mutations", action="store_true",
                     help="drive read-tracking custom mutations too (WRITES data; "
                          "requires --i-know-this-writes)")
+    ap.add_argument("--mutate-url", default=None,
+                    help="app direct-mutation endpoint; when set, POST mutations "
+                         "instead of sending unsupported sync-socket pushes")
     ap.add_argument("--i-know-this-writes", action="store_true",
                     help="confirm you understand --enable-mutations writes to the target DB")
     ap.add_argument("--impact", default=None,
@@ -917,7 +964,8 @@ def main() -> int:
         duration_s=a.duration, ttl_ms=a.ttl_ms, auth_token=a.auth_token, cookie=a.cookie,
         extra_params=extra, post_handshake=not a.no_post_handshake,
         user_query_url=a.user_query_url, seed=a.seed,
-        enable_mutations=a.enable_mutations, mutations_per_min=a.mutations_per_min,
+        enable_mutations=a.enable_mutations, mutate_url=a.mutate_url,
+        mutations_per_min=a.mutations_per_min,
         client_schema=client_schema,
         lifecycle=a.lifecycle, session_mean_s=a.session_mean_s,
         zombie_pct=a.zombie_pct, abrupt_pct=a.abrupt_pct, resume_pct=a.resume_pct,

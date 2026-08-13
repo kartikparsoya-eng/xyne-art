@@ -48,6 +48,13 @@ For the local sandbox (docker compose, no Grafana), the full harness lives in
 ./run-art-local.sh --negative --users 2   # + G11 adversarial negative suite
 ```
 
+For the **full Rust syncer** candidate in `xyne-spaces-test`, use
+[`run-rust-syncer-release.sh`](./run-rust-syncer-release.sh). It runs the Rust
+and real-Postgres code gates, verifies the candidate actually has
+`ZERO_SYNCER=rust`, and then drives the existing TS differential, lifecycle,
+permissions, advance, and soak gates. See the
+[`full release flow`](./docs/rust-syncer-release-gate.md).
+
 ## Layout
 
 ```
