@@ -64,6 +64,10 @@ esac
 if [ "$SKIP_CODE" = "0" ]; then
   : "${TEST_CVR_PG_URI:?set TEST_CVR_PG_URI to a disposable Postgres database}"
   echo "== Rust code and real-Postgres lifecycle gate =="
+  # Parity-fixture freshness: fail if the committed TS-golden fixtures no longer
+  # match current TS output (i.e. TS drifted and the Rust parity tests would be
+  # validating against stale captured behavior).
+  bash "$MONO_ROOT/packages/rust-cvr/agentic/parity/check-parity-fixtures.sh" "$MONO_ROOT"
   cargo test --manifest-path "$MONO_ROOT/packages/rust-cvr/Cargo.toml" --all-targets
   cargo test --manifest-path "$MONO_ROOT/packages/rust-ivm/Cargo.toml" --all-targets
   cargo test --manifest-path "$MONO_ROOT/packages/rust-syncer/Cargo.toml" --all-targets
