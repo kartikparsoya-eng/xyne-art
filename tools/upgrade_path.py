@@ -204,28 +204,59 @@ async def probe(a: argparse.Namespace) -> dict:
     shared_cgid = "art-upg-" + uuid.uuid4().hex[:16]
     fresh_cgid = "art-upg-" + uuid.uuid4().hex[:16]
 
-    # 1. baseline image: drive + capture baseCookie (CVR state from OLD image)
-    mat_old, err_old, cookie = await _connect_and_drive(
-        a.baseline_target, a.protocol_version, a.auth_token, a.extra_param,
-        puts, client_schema, "", a.duration, pks, a.seed, shared_cgid)
-    if err_old:
-        checks.append({"name": "baseline-connect", "verdict": "ERROR",
-                       "detail": f"baseline target errored: {err_old}"})
-        return {"verdict": "ERROR", "checks": checks,
-                "summary": f"baseline target unreachable: {err_old}"}
-    if not cookie:
-        checks.append({"name": "baseline-cvr", "verdict": "ERROR",
-                       "detail": "baseline never returned a baseCookie (no CVR state captured)"})
-        return {"verdict": "ERROR", "checks": checks,
-                "summary": "no baseCookie from baseline — cannot test resume"}
-    if mat_old.rows_applied == 0:
-        checks.append({"name": "baseline-cvr", "verdict": "FAIL",
-                       "detail": "baseline completed but materialized zero rows"})
-        return {"verdict": "FAIL", "checks": checks,
-                "summary": "upgrade run produced no usable baseline row corpus",
+    if a.phase == "resume":
+        # Two-phase mode: CVR state was captured by an earlier `--phase capture`
+        # run against the OLD image on the SAME container/CVR schema; the
+        # container has since been swapped to the candidate image. This is the
+        # only honest upgrade simulation in the sandbox — a cookie captured on
+        # the MIRROR pod belongs to a different app-id/CVR schema, so a
+        # cross-pod resume is rejected by design, not by an upgrade bug.
+        st = json.load(open(a.state_file))
+        puts = st["puts"]
+        query_names = st["query_names"]
+        cookie = st["cookie"]
+        shared_cgid = st["cgid"]
+        mat_old = Materializer(pks)
+        mat_old.state = {t: dict(rows) for t, rows in st["state"].items()}
+        mat_old.rows_applied = st["rows_applied"]
+        checks.append({"name": "baseline-cvr", "verdict": "PASS",
+                       "detail": f"old-image CVR loaded from {a.state_file} "
+                                 f"({mat_old.rows_applied} rows, cookie {cookie[:16]}...)"})
+    else:
+        # 1. baseline image: drive + capture baseCookie (CVR state from OLD image)
+        mat_old, err_old, cookie = await _connect_and_drive(
+            a.baseline_target, a.protocol_version, a.auth_token, a.extra_param,
+            puts, client_schema, "", a.duration, pks, a.seed, shared_cgid)
+        if err_old:
+            checks.append({"name": "baseline-connect", "verdict": "ERROR",
+                           "detail": f"baseline target errored: {err_old}"})
+            return {"verdict": "ERROR", "checks": checks,
+                    "summary": f"baseline target unreachable: {err_old}"}
+        if not cookie:
+            checks.append({"name": "baseline-cvr", "verdict": "ERROR",
+                           "detail": "baseline never returned a baseCookie (no CVR state captured)"})
+            return {"verdict": "ERROR", "checks": checks,
+                    "summary": "no baseCookie from baseline — cannot test resume"}
+        if mat_old.rows_applied == 0:
+            checks.append({"name": "baseline-cvr", "verdict": "FAIL",
+                           "detail": "baseline completed but materialized zero rows"})
+            return {"verdict": "FAIL", "checks": checks,
+                    "summary": "upgrade run produced no usable baseline row corpus",
+                    "queries": query_names}
+        checks.append({"name": "baseline-cvr", "verdict": "PASS",
+                       "detail": f"captured baseCookie from baseline image ({cookie[:16]}...)"})
+
+    if a.phase == "capture":
+        with open(a.state_file, "w") as f:
+            json.dump({"puts": puts, "query_names": query_names,
+                       "cookie": cookie, "cgid": shared_cgid,
+                       "state": mat_old.state,
+                       "rows_applied": mat_old.rows_applied}, f)
+        return {"verdict": "PASS", "checks": checks,
+                "summary": f"old-image CVR captured -> {a.state_file} "
+                           f"({mat_old.rows_applied} rows); swap the image and "
+                           f"run --phase resume",
                 "queries": query_names}
-    checks.append({"name": "baseline-cvr", "verdict": "PASS",
-                   "detail": f"captured baseCookie from baseline image ({cookie[:16]}...)"})
 
     # 2. candidate image: RESUME with the old-image baseCookie
     mat_resumed, err_resume, _ = await _connect_and_drive(
@@ -281,8 +312,15 @@ async def probe(a: argparse.Namespace) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="G24: image upgrade-path / CVR-compat test.")
-    ap.add_argument("--baseline-target", required=True, help="reference image ws target")
-    ap.add_argument("--candidate-target", required=True, help="new image ws target under test")
+    ap.add_argument("--baseline-target", default=None, help="reference image ws target")
+    ap.add_argument("--candidate-target", default=None, help="new image ws target under test")
+    ap.add_argument("--phase", choices=("capture", "resume"), default=None,
+                    help="two-phase mode for a REAL image swap on one container: "
+                         "'capture' drives --baseline-target (old image) and saves "
+                         "the CVR cookie+state to --state-file; after the container "
+                         "is recreated on the candidate image, 'resume' replays "
+                         "that state against --candidate-target")
+    ap.add_argument("--state-file", default="/tmp/art-upgrade-state.json")
     ap.add_argument("--auth-token", default=None)
     ap.add_argument("--extra-param", action="append", default=[])
     ap.add_argument("--id-pool", default=None)
@@ -296,6 +334,10 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     a.extra_param = [tuple(p.split("=", 1)) for p in a.extra_param]
+    if a.phase != "resume" and not a.baseline_target:
+        ap.error("--baseline-target is required unless --phase resume")
+    if a.phase != "capture" and not a.candidate_target:
+        ap.error("--candidate-target is required unless --phase capture")
     report = asyncio.run(probe(a))
     report.update({"schema": 1, "gate": "G24", "name": "upgrade-path",
                    "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})

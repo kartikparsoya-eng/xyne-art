@@ -131,7 +131,7 @@ case "$MODE" in
       --container "xyne-sandbox-${SANDBOX}-zero-cache-art" \
       --cvr-schema "sandbox_${SANDBOX//-/_}_art_0/cvr" \
       --connections 25 --duration 300 --users 2 --lifecycle \
-      --mutations --oracle --negative
+      --mutations --oracle --negative --port-probes
     ;;
   soak)
     run_art --sandbox "$SANDBOX" --bootstrap --clean \

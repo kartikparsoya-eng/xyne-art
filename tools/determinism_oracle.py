@@ -47,8 +47,15 @@ from workload import (  # noqa: E402
 from diff_oracle import Materializer, diff_states  # noqa: E402
 
 
-def rid(seed: random.Random) -> str:
-    return "art-det-" + "".join(seed.choice("abcdefghijklmnop0123456789") for _ in range(10))
+def rid(_seed: random.Random) -> str:
+    # Client identities must be UNIQUE PER RUN, not seeded: a seeded rid gives
+    # every run since seed=42 the same clientGroupID, and once any past run's
+    # CG is TTL-purged (instances.deleted=true) every later connect is
+    # (correctly) rejected with ClientNotFound and the oracle reads 0 rows
+    # forever. Determinism applies to the WORKLOAD (query set + args), which
+    # stays on the seeded rng — not to the connecting identity.
+    r = random.SystemRandom()
+    return "art-det-" + "".join(r.choice("abcdefghijklmnop0123456789") for _ in range(10))
 
 
 async def _pass(target: str, version: int, auth_token: str | None,

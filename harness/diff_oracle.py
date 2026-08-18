@@ -334,19 +334,68 @@ class Side:
     open_ok: bool = False
     pokes: int = 0
     lmid_acked: int = 0
+    last_cookie: str = ""    # last completed pokeEnd cookie — THIS side's resume point
     last_activity: float = field(default_factory=time.perf_counter)
 
 
 def connect_url(target: str, cgid: str, cid: str, extra: list[tuple[str, str]],
-                pv: int) -> str:
+                pv: int, base_cookie: str = "", lmid: int = 0) -> str:
     import urllib.parse
-    params = {"clientGroupID": cgid, "clientID": cid, "baseCookie": "",
-              "ts": str(time.time() * 1000), "lmid": "0",
+    # base_cookie="" + lmid=0 = fresh connect (full hydrate). A non-empty
+    # base_cookie = resume: the server replays the catch-up delta from that CVR
+    # version. Each side resumes from ITS OWN issued cookie (own lineage).
+    params = {"clientGroupID": cgid, "clientID": cid, "baseCookie": base_cookie,
+              "ts": str(time.time() * 1000), "lmid": str(lmid),
               "wsid": uuid.uuid4().hex[:12]}
     for k, v in extra:
         params[k] = v
     return (target.rstrip("/") + f"/sync/v{pv}/connect?"
             + urllib.parse.urlencode(params))
+
+
+async def open_socket(s: Side, sec: str, extra: list[tuple[str, str]], pv: int,
+                      init_msg: dict, base_cookie: str = "", lmid: int = 0) -> None:
+    """Open one side's socket (fresh or resume) and send its initConnection.
+    Shared by the initial connect and every resume reconnect so both paths stay
+    byte-identical except for the baseCookie/lmid resume tuple."""
+    import websockets
+    url = connect_url(s.target, s.cgid, s.cid, extra, pv,
+                      base_cookie=base_cookie, lmid=lmid)
+    s.ws = await websockets.connect(
+        url, subprotocols=[sec], open_timeout=20, max_size=None,
+        ping_interval=None)
+    await s.ws.send(json.dumps(init_msg))
+    s.open_ok = True
+    s.last_activity = time.perf_counter()
+
+
+async def wait_quiesce(sides: list[Side], a: argparse.Namespace,
+                       quiesce_s: float | None = None,
+                       quiesce_max_s: float | None = None) -> bool:
+    """Wait until BOTH sides have been poke-quiet for quiesce_s (capped at
+    quiesce_max_s). A fixed sleep is NOT a convergence check — a slow side may
+    still be hydrating. On timeout, record which queries were still streaming.
+    The resume cycle passes a SHORTER quiesce (--resume-quiesce-s): a catch-up
+    delta is tiny next to a full hydrate, so it settles far faster and reusing
+    the big first-hydrate quiesce would needlessly double the gate's wall time."""
+    quiesce_s = a.quiesce_s if quiesce_s is None else quiesce_s
+    quiesce_max_s = a.quiesce_max_s if quiesce_max_s is None else quiesce_max_s
+    quiesce_deadline = time.perf_counter() + quiesce_max_s
+    quiesced = False
+    while time.perf_counter() < quiesce_deadline:
+        await asyncio.sleep(1.0)
+        quiet = min(time.perf_counter() - s.last_activity for s in sides)
+        if quiet >= quiesce_s:
+            quiesced = True
+            break
+    if not quiesced:
+        for s in sides:
+            s.mat.streaming_queries = set(s.mat.query_latency.keys()) - {
+                q for q in s.mat.query_latency
+                if s.mat.query_latency[q]
+                and time.perf_counter() - s.last_activity > quiesce_s
+            }
+    return quiesced
 
 
 async def reader(side: Side, stop: asyncio.Event) -> None:
@@ -382,7 +431,13 @@ async def reader(side: Side, stop: asyncio.Event) -> None:
                 side.lmid_acked = max(side.lmid_acked, int(lm[side.cid]))
         elif tag == "pokeEnd":
             side.pokes += 1
-            side.mat.on_poke_end(body.get("cookie"), bool(body.get("cancel")))
+            ck = body.get("cookie")
+            # A completed poke's cookie is this side's resume point: reconnecting
+            # with it in baseCookie makes the server send a catch-up DELTA from
+            # that CVR version instead of a full rehydrate (the real resume path).
+            if not body.get("cancel") and isinstance(ck, str) and ck:
+                side.last_cookie = ck
+            side.mat.on_poke_end(ck, bool(body.get("cancel")))
         elif tag == "error":
             kind = body.get("kind", "unknown")
             side.mat.error_kinds[kind] = side.mat.error_kinds.get(kind, 0) + 1
@@ -493,15 +548,14 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
     init_msg = init_connection_message(initial_puts, client_schema=cschema)
     sec = encode_sec_protocols(None, a.auth_token)  # post-handshake init
 
+    # Live desired-query set (hash -> put), kept current through churn so a resume
+    # reconnect can re-declare exactly what the client currently wants.
+    active_puts = {p["hash"]: p for p in initial_puts}
+
     stop = asyncio.Event()
     try:
         for s in sides:
-            url = connect_url(s.target, s.cgid, s.cid, extra, a.protocol_version)
-            s.ws = await websockets.connect(
-                url, subprotocols=[sec], open_timeout=20, max_size=None,
-                ping_interval=None)
-            await s.ws.send(json.dumps(init_msg))
-            s.open_ok = True
+            await open_socket(s, sec, extra, a.protocol_version, init_msg)
     except Exception as e:
         results.append({"pair": pair_idx, "error": f"connect failed: {e}"})
         for s in sides:
@@ -567,7 +621,9 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         await asyncio.sleep(a.churn_ms / 1000.0)
         patch = []
         if len(active) >= a.working_set:
-            patch.append(query_del(active.pop(0)))
+            dead = active.pop(0)
+            patch.append(query_del(dead))
+            active_puts.pop(dead, None)
         for _ in range(10):
             op = sampler.sample()
             args, ok = resolver.resolve(op)
@@ -576,6 +632,7 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         put = query_put(op.name, args, ttl_ms=300_000)
         patch.append(put)
         active.append(put["hash"])
+        active_puts[put["hash"]] = put
         for s in sides:
             s.mat.hash_query[put["hash"]] = op.name
         msg = json.dumps(change_desired_queries_message(patch))
@@ -585,31 +642,82 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         except Exception:
             break
 
-    # Quiesce: no more desired-set changes or writes. A fixed sleep is NOT a
-    # convergence check — a slow/loaded side may still be hydrating (seen live:
-    # TS mirror mid-hydration at quiesce expiry => false "missing rows").
-    # Instead wait until BOTH sides have been poke-quiet for --quiesce-s,
-    # capped at --quiesce-max-s.
-    quiesce_deadline = time.perf_counter() + a.quiesce_max_s
-    quiesced = False
-    while time.perf_counter() < quiesce_deadline:
-        await asyncio.sleep(1.0)
-        quiet = min(time.perf_counter() - s.last_activity for s in sides)
-        if quiet >= a.quiesce_s:
-            quiesced = True
-            break
-    # quiescence diagnosis (#8): if never went quiet, capture which queries
-    # were still streaming (got hash acked but pokeEnd not received for that
-    # poke batch) — helps distinguish infinite loop from slow eval
-    if not quiesced:
-        for s in sides:
-            s.mat.streaming_queries = set(s.mat.query_latency.keys()) - {
-                q for q in s.mat.query_latency
-                if s.mat.query_latency[q]
-                and time.perf_counter() - s.last_activity > a.quiesce_s
-            }
-    stop.set()
+    # Quiesce #1: no more desired-set changes or writes. Wait until BOTH sides
+    # have been poke-quiet for --quiesce-s, capped at --quiesce-max-s (a fixed
+    # sleep is NOT a convergence check — a slow side may still be hydrating).
+    quiesced = await wait_quiesce(sides, a)
     mut_task.cancel()
+
+    # --- Resume / catch-up phase (--resume) ------------------------------------
+    # The fresh hydrate above proves Rust and TS converge from baseCookie="".
+    # This phase proves they also converge on the CATCH-UP DELTA path: each side
+    # disconnects, real writes land in the shared DB while it is away, then it
+    # reconnects from ITS OWN last cookie (valid in that syncer's lineage, same
+    # cgid/cid). The server must replay the delta since that CVR version; a Rust
+    # IVM bug in delta computation shows as a post-resume row divergence that
+    # fresh-hydrate diffing can never see. Materialized state is NOT reset — the
+    # delta is applied on top, exactly like a real reconnecting client.
+    resume_info = {"enabled": bool(a.resume), "cycles": 0, "writes": 0,
+                   "error": None,
+                   "cookies": {"primary": None, "mirror": None}}
+    if a.resume and all(s.open_ok for s in sides):
+        for _cycle in range(max(1, a.resume_cycles)):
+            # 1) drop both sockets (keep each side's materialized state + cookie)
+            stop.set()
+            for t in readers:
+                t.cancel()
+            for s in sides:
+                try:
+                    await s.ws.close()
+                except Exception:
+                    pass
+            # 2) write to the shared DB WHILE disconnected so resume must carry a
+            #    real, non-empty catch-up delta (both replicas see the same write).
+            if a.enable_mutations and a.mutate_url and msampler is not None:
+                for _ in range(max(0, a.resume_writes)):
+                    now_ms = int(time.time() * 1000)
+                    built = msampler.build(resolver, now_ms)
+                    if built is None:
+                        continue
+                    name, args = built
+                    resume_info["writes"] += 1
+                    mid_r = sides[0].lmid_acked + resume_info["writes"]
+                    body = push_message(
+                        sides[0].cgid,
+                        [custom_mutation(mid_r, sides[0].cid, name, args, now_ms)],
+                        request_id=f"{sides[0].cid}-resume-{mid_r}",
+                        now_ms=now_ms)[1]
+                    ok = await asyncio.to_thread(
+                        post_direct_mutation, a.mutate_url, body, a.auth_token, None)
+                    if not ok:
+                        muts["errors"] = muts.get("errors", 0) + 1
+                await asyncio.sleep(a.resume_settle_s)  # let the write replicate
+            # 3) reconnect BOTH sides from their OWN captured cookie + lmid, same
+            #    cgid/cid, re-declaring the current desired set.
+            resume_info["cookies"]["primary"] = sides[0].last_cookie
+            resume_info["cookies"]["mirror"] = sides[1].last_cookie
+            resume_init = init_connection_message(
+                list(active_puts.values()), client_schema=cschema)
+            stop = asyncio.Event()
+            try:
+                for s in sides:
+                    await open_socket(s, sec, extra, a.protocol_version, resume_init,
+                                      base_cookie=(s.last_cookie or ""),
+                                      lmid=s.lmid_acked)
+            except Exception as e:
+                resume_info["error"] = f"resume connect failed: {e}"
+                readers = []
+                break
+            readers = [asyncio.create_task(reader(s, stop)) for s in sides]
+            resume_info["cycles"] += 1
+            # 4) wait for the catch-up delta to converge on both sides (a short
+            #    quiesce — the delta is tiny next to the initial full hydrate).
+            quiesced = await wait_quiesce(
+                sides, a, quiesce_s=a.resume_quiesce_s,
+                quiesce_max_s=max(60.0, a.resume_quiesce_s * 3))
+
+    # Final teardown (covers both the no-resume and post-resume paths).
+    stop.set()
     for t in readers:
         t.cancel()
     for s in sides:
@@ -678,6 +786,7 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         "mutations_sent": muts["sent"],
         "mutations_acked": sides[0].lmid_acked,
         "quiesced": quiesced,
+        "resume": resume_info,
         "cookie_primary": cookie_invariants(sides[0].mat),
         "cookie_mirror": cookie_invariants(sides[1].mat),
         "query_attribution": query_attribution,
@@ -801,9 +910,16 @@ async def amain(a: argparse.Namespace) -> int:
         for r in results
         if (r.get("cookie_primary", {}).get("terminal_cookie")
             != r.get("cookie_mirror", {}).get("terminal_cookie"))]
+    # Resume/catch-up phase (--resume): a reconnect that failed to establish is a
+    # gate failure (the delta path went differentially unverified). Row/hydration
+    # divergence introduced BY the catch-up delta is already caught by
+    # total_mismatch / hydration gap above, since those diff the post-resume state.
+    resume_errors = [r for r in results if r.get("resume", {}).get("error")]
+    resume_cycles = sum(r.get("resume", {}).get("cycles", 0) for r in results)
+    resume_writes = sum(r.get("resume", {}).get("writes", 0) for r in results)
     oracle_failed = (
         total_mismatch > 0 or bool(conn_errors) or total_hydration_gap > 0
-        or protocol_errors > 0 or cookie_hard > 0
+        or protocol_errors > 0 or cookie_hard > 0 or bool(resume_errors)
         or (a.full_catalog and (bool(catalog_missing)
                                or not catalog_expected
                                or len(catalog_accounted) != catalog_total
@@ -817,6 +933,11 @@ async def amain(a: argparse.Namespace) -> int:
         "mutations": bool(a.enable_mutations),
         "mutations_sent": sum(r.get("mutations_sent", 0) for r in results),
         "mutations_acked": sum(r.get("mutations_acked", 0) for r in results),
+        "resume": bool(a.resume),
+        "resume_cycles": resume_cycles,
+        "resume_disconnect_writes": resume_writes,
+        "resume_errors": [{"pair": r["pair"], "error": r["resume"]["error"]}
+                          for r in resume_errors],
         "total_mismatches": total_mismatch,
         "hydration_parity_gap": total_hydration_gap,
         "only_primary_hydrated": only_primary_hydrated,
@@ -849,6 +970,13 @@ async def amain(a: argparse.Namespace) -> int:
         mut_note = (f" | muts={r.get('mutations_sent', 0)}"
                     f"/acked={r.get('mutations_acked', 0)}"
                     if a.enable_mutations else "")
+        ri = r.get("resume", {})
+        if ri.get("enabled"):
+            if ri.get("error"):
+                mut_note += f" | RESUME FAILED: {ri['error']}"
+            else:
+                mut_note += (f" | resume={ri.get('cycles', 0)}cyc"
+                             f"/{ri.get('writes', 0)}w")
         if not r.get("quiesced", True):
             mut_note += " | WARN: never went quiet (quiesce-max hit)"
         print(f"  pair {r['pair']}: mismatches={r['mismatches']} "
@@ -917,6 +1045,16 @@ async def amain(a: argparse.Namespace) -> int:
     for tm in cookie_terminal_mismatch:
         print(f"  COOKIE TERMINAL(watch) pair {tm['pair']}: primary={tm['primary']!r} "
               f"!= mirror={tm['mirror']!r} (config/state-version drift — verify)")
+    if a.resume:
+        for r in resume_errors:
+            print(f"  RESUME ERROR pair {r['pair']}: {r['resume']['error']} "
+                  f"(catch-up delta path went differentially UNVERIFIED)")
+        if not resume_errors:
+            wnote = (f", {resume_writes} disconnect-window writes"
+                     if resume_writes else " (reads-only — no disconnect writes; "
+                     "add --enable-mutations+--mutate-url for a real catch-up delta)")
+            print(f"  RESUME: {resume_cycles} catch-up reconnect(s) converged"
+                  f" rust-vs-TS{wnote}")
     verdict = out["verdict"]
     print(f"{mode} ORACLE: {verdict} ({total_mismatch} mismatches, "
           f"{total_hydration_gap} hydration-parity gap, "
@@ -972,6 +1110,24 @@ def main() -> int:
                     help="required confirmation for --enable-mutations")
     ap.add_argument("--mutations-per-min", type=float, default=6.0,
                     help="per-pair mutation rate (default 6)")
+    ap.add_argument("--resume", action="store_true",
+                    help="after the first quiesce, reconnect EACH side from its own "
+                         "captured pokeEnd cookie (same cgid/cid) so the catch-up/"
+                         "resume DELTA path is differentially compared rust-vs-TS, "
+                         "not just the fresh hydrate")
+    ap.add_argument("--resume-cycles", type=int, default=1,
+                    help="disconnect->reconnect resume cycles per pair (default 1)")
+    ap.add_argument("--resume-writes", type=int, default=3,
+                    help="writes to land in the shared DB WHILE disconnected each "
+                         "cycle (needs --enable-mutations + --mutate-url) so resume "
+                         "must deliver a real non-empty catch-up delta")
+    ap.add_argument("--resume-settle-s", type=float, default=8.0,
+                    help="seconds for disconnect-window writes to replicate to both "
+                         "replicas before reconnecting")
+    ap.add_argument("--resume-quiesce-s", type=float, default=20.0,
+                    help="poke-quiet time required on both sides after a resume "
+                         "reconnect before diffing (short — the catch-up delta "
+                         "settles far faster than the initial full hydrate)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--version-check", action="store_true",
                     help="probe NAPI/SQLite versions before running (fails fast on mismatch)")

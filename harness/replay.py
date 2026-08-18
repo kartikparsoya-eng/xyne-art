@@ -102,23 +102,35 @@ class Config:
 
 def post_direct_mutation(url: str, body: dict[str, Any], auth_token: Optional[str],
                          cookie: Optional[str]) -> bool:
-    """POST one Zero push body to the app's direct-mutation endpoint."""
+    """POST one Zero push body to the app's direct-mutation endpoint.
+
+    Transport-level failures (connection error / 5xx) are retried twice with
+    the SAME mutation id — this is exactly what a real zero-client does (it
+    re-pushes until its lastMutationID advances; the server dedupes by lmid),
+    so a transient backend blip is not a mutation failure. An app-LEVEL error
+    result (validation/permission rejection) is final and not retried.
+    """
     headers = {"Content-Type": "application/json"}
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     if cookie:
         headers["Cookie"] = cookie
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read() or b"{}")
-    except Exception:
-        return False
+    payload = None
+    for attempt in range(3):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read() or b"{}")
+            break
+        except Exception:
+            if attempt == 2:
+                return False
+            time.sleep(0.5 * (attempt + 1))
     mutations = payload.get("mutations", []) if isinstance(payload, dict) else []
     return not any(
         isinstance(item, dict)

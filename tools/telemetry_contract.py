@@ -103,6 +103,11 @@ def main() -> int:
     ap.add_argument("--since", default="120s", help="docker logs --since window")
     ap.add_argument("--gr-key", default=os.environ.get("GR_KEY"),
                     help="Grafana key (uses evaluate_gates endpoints; falls back to NODATA)")
+    ap.add_argument("--events-mode", choices=("check", "na"), default="check",
+                    help="'na': the event names are frontend/backend telemetry that a "
+                         "headless sandbox run can never emit — record them as NA "
+                         "instead of FAIL/SKIP. The event half of the contract is a "
+                         "prod-mode (--gr-key) check only.")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -152,6 +157,11 @@ def main() -> int:
     # --- event-name checks ---
     missing_events: list[str] = []
     for ev in events:
+        if a.events_mode == "na":
+            checks.append({"name": f"event:{ev}", "verdict": "NA",
+                           "detail": "frontend-origin event; unobservable in a headless "
+                                     "sandbox run — verified in prod mode via --gr-key"})
+            continue
         if log_text is not None:
             found = ev in log_text
         elif a.gr_key:
@@ -179,7 +189,7 @@ def main() -> int:
 
     checked_metrics = sum(c["name"].startswith("metric:") and c["verdict"] != "SKIP"
                           for c in checks)
-    checked_events = sum(c["name"].startswith("event:") and c["verdict"] != "SKIP"
+    checked_events = sum(c["name"].startswith("event:") and c["verdict"] not in ("SKIP", "NA")
                          for c in checks)
     summary = (f"{checked_metrics}/{len(metrics)} metrics + "
                f"{checked_events}/{len(events)} events checked; "

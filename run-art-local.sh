@@ -51,13 +51,21 @@ cd "$DIR"
 
 SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
 MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
-PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0; WRITE_PARITY=0; PROD_BUDGET=0
+PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0; WRITE_PARITY=0; PROD_BUDGET=0; PORTPROBES=0
 IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=50; DRAIN_BUDGET=30
 CHAOS_MEAN_GAP=45
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
 OVERRIDE_TARGET=""; OVERRIDE_MUTATE_URL=""; OVERRIDE_CONTAINER=""; OVERRIDE_PPROF_PORT=""; OVERRIDE_CVR_SCHEMA=""; OVERRIDE_MIRROR=""
-CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0; FULLCATALOG=0
+CPUS=""; MEMORY=""; BOOTSTRAP=0; RELEASE=0; LANE=""; TS_BASELINE=0
+# Full-catalog oracle is ON by default: diff ALL ~151 query shapes rust-vs-TS
+# (breadth) instead of a weighted ~10 working-set sample. --no-full-catalog
+# reverts to the working-set+churn oracle. (--release already forced this on.)
+FULLCATALOG=1
+# Resume/catch-up differential is ON by default: the oracle reconnects each side
+# from its own captured cookie so the catch-up DELTA path is diffed rust-vs-TS,
+# not just the fresh hydrate. Composes with full-catalog. --no-resume opts out.
+RESUME=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="$2"; shift 2;;
@@ -93,13 +101,16 @@ while [ $# -gt 0 ]; do
     --ceiling) LANE="ceiling"; shift;;
     --ts-baseline) TS_BASELINE=1; CLEAN=1; shift;;
     --oracle) ORACLE=1; shift;;
+    --no-resume) RESUME=0; shift;;
     --full-catalog) ORACLE=1; FULLCATALOG=1; shift;;
+    --no-full-catalog) FULLCATALOG=0; shift;;
     --chaos) CHAOS=1; LIFECYCLE=1; shift;;
     --chaos-mean-gap) CHAOS_MEAN_GAP="$2"; shift 2;;
     --negative) NEGATIVE=1; shift;;
     --mutation-matrix) MUTMATRIX=1; shift;;
     --refresh) REFRESH=1; shift;;
     --protocol) PROTOCOL=1; shift;;
+    --port-probes) PORTPROBES=1; shift;;
     --telemetry) TELEMETRY=1; shift;;
     --cold-start) COLDSTART=1; shift;;
     --readiness) READINESS=1; shift;;
@@ -164,13 +175,19 @@ if [ "$RELEASE" = "1" ]; then
   LIFECYCLE=1; ORACLE=1; MUTATIONS=1; NEGATIVE=1; MUTMATRIX=1
   PROTOCOL=1; TELEMETRY=1; COLDSTART=1; READINESS=1; DRAIN=1
   DETERMINISM=1; CAPACITY=1; IMAGEAUDIT=1; UPGRADE=1; PARITY=1; FULLCATALOG=1
+  PORTPROBES=1
   echo "[ART] --release: cpus=$CPUS memory=$MEMORY duration=${DURATION}s all-gates"
 fi
 
-# --bootstrap: start the art container with resource caps before running
-if [ "$BOOTSTRAP" = "1" ]; then
+# --bootstrap: start the art container with resource caps before running.
+# Factored into a function so the G24 upgrade gate can re-bootstrap the SAME
+# container (same CVR schema + replica volume) on a different image — the only
+# honest image-upgrade simulation (a cookie captured on the mirror pod belongs
+# to a different app-id/CVR schema and can never resume on the candidate).
+bootstrap_art_container() {  # $1 = image
+  local BOOTSTRAP_IMAGE="$1"
   ART_NAME="${OVERRIDE_CONTAINER:-xyne-sandbox-rust-test-zero-cache-art}"
-  echo "[ART] bootstrapping container: $ART_NAME"
+  echo "[ART] bootstrapping container: $ART_NAME ($BOOTSTRAP_IMAGE)"
   docker stop "$ART_NAME" 2>/dev/null || true; docker rm "$ART_NAME" 2>/dev/null || true
   CPU_FLAGS=""
   [ -n "$CPUS" ] && CPU_FLAGS="--cpus=$CPUS"
@@ -182,12 +199,12 @@ if [ "$BOOTSTRAP" = "1" ]; then
   ZERO_SECRET=$(docker exec "$TS_CONTAINER" printenv ZERO_SECRET 2>/dev/null || true)
   # ZERO_SECRET not always set — fall back to ZERO_AUTH_SECRET (same value in sandbox)
   [ -z "$ZERO_SECRET" ] && ZERO_SECRET="$AUTH_SECRET"
-  BOOTSTRAP_IMAGE="${IMAGE:-zero-cache-rust-syncer:local}"
   PPROF_PORT="${OVERRIDE_PPROF_PORT:-6061}"
   docker run -d \
     --name "$ART_NAME" \
     --network sandbox-net \
     -p ${PPROF_PORT}:6061 \
+    -p 127.0.0.1::4848 \
     $CPU_FLAGS $MEM_FLAGS \
     -e ZERO_AUTH_SECRET="$AUTH_SECRET" \
     -e ZERO_SECRET="$ZERO_SECRET" \
@@ -202,6 +219,8 @@ if [ "$BOOTSTRAP" = "1" ]; then
     -e ZERO_SYNCER=rust \
     -e ZERO_RUST_SYNCER_PATH=/usr/local/bin/rust-syncer \
     -e ZERO_NUM_SYNC_WORKERS=4 \
+    -e OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_ENDPOINT:-http://otel-collector:4318}" \
+    -e OTEL_METRIC_EXPORT_INTERVAL=5000 \
     -v zero_cache_art_rust_test:/var/zero \
     -l "traefik.enable=true" \
     -l "traefik.http.routers.zero-art.rule=Host(\`rust-test.localhost\`) && PathPrefix(\`/zero-art\`)" \
@@ -245,6 +264,10 @@ if [ "$BOOTSTRAP" = "1" ]; then
     echo "ERROR: candidate logs do not prove rust-syncer started" >&2
     exit 1
   }
+}
+
+if [ "$BOOTSTRAP" = "1" ]; then
+  bootstrap_art_container "${IMAGE:-zero-cache-rust-syncer:local}"
 fi
 
 # Trace mode replays REAL prod sessions — every statistical-shape knob would
@@ -350,6 +373,23 @@ wait_mirror_ready() {  # $1 = container, $2 = timeout seconds (default 180)
   echo "  WARNING: mirror still catching up after ${t}s — G8 may report false mismatches" >&2
   return 1
 }
+
+# Resolve the mirror DIRECTLY (container IP, then published host port). The
+# traefik route for /zero-ts DOES NOT EXIST: PathPrefix(`/zero`) string-matches
+# `/zero-ts` and lands on the APP's zero pod — so every mirror-URL consumer
+# (G15 matrix, G24 upgrade, G25 parity, ts-baseline) that went through traefik
+# was silently comparing against the WRONG (Rust) pod. Same bypass the G8
+# oracle has used since a618663, now applied to the shared MIRROR_URL.
+if [ -z "$OVERRIDE_MIRROR" ] && docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+  MIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$MIRROR_POD" 2>/dev/null || true)
+  MPORT=$(docker inspect -f '{{if index .NetworkSettings.Ports "4848/tcp"}}{{(index (index .NetworkSettings.Ports "4848/tcp") 0).HostPort}}{{end}}' "$MIRROR_POD" 2>/dev/null || true)
+  if [ -n "$MIP" ] && nc -z -w 2 "$MIP" 4848 2>/dev/null; then
+    MIRROR_URL="ws://$MIP:4848"
+  elif [ -n "$MPORT" ] && nc -z -w 2 127.0.0.1 "$MPORT" 2>/dev/null; then
+    MIRROR_URL="ws://127.0.0.1:$MPORT"
+  fi
+  echo "[ART] mirror resolved direct: $MIRROR_URL (pod $MIRROR_POD)"
+fi
 
 # --- 0) sandbox up? -----------------------------------------------------------
 for c in "$BACKEND" "$ZCACHE" "$PG"; do
@@ -770,9 +810,21 @@ if [ "$ORACLE" = "1" ]; then
     # side (2026-08-11: the main router's PathPrefix(/zero) prio 20 swallowed
     # /zero-art AND /zero-ts; diff CGs split across two servers -> 12k false
     # mismatches + quiesce timeouts).
+    #
+    # Address the engine directly, preferring the container's own pod IP when the
+    # host can actually reach it (Linux, or the oracle running in-network); on
+    # macOS Docker Desktop the host↔container-IP bridge is unreliable (works
+    # after `up`, breaks after a container is recreated with a new IP —
+    # 2026-08-13: pod-IP acquires flipped conn_err 0 -> 4 with the SAME
+    # addressing), so fall back to the PUBLISHED host port (`127.0.0.1:<hostport>`
+    # from `docker inspect`), which is reachable on both platforms and still
+    # bypasses traefik. Proxy URL is the last resort.
     MIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ZCACHETS" 2>/dev/null || true)
-    if [ -n "$MIP" ]; then
+    MPORT=$(docker inspect -f '{{if index .NetworkSettings.Ports "4848/tcp"}}{{(index (index .NetworkSettings.Ports "4848/tcp") 0).HostPort}}{{end}}' "$ZCACHETS" 2>/dev/null || true)
+    if [ -n "$MIP" ] && nc -z -w 2 "$MIP" 4848 2>/dev/null; then
       MIRRORFLAGS=(--mirror "ws://$MIP:4848")
+    elif [ -n "$MPORT" ]; then
+      MIRRORFLAGS=(--mirror "ws://127.0.0.1:$MPORT")
     else
       MIRRORFLAGS=(--mirror "$MIRROR_URL")
     fi
@@ -789,7 +841,13 @@ fi
 if [ "$ORACLE" = "1" ]; then
   ORACLE_MUTFLAGS=()
   if [ "$MUTATIONS" = "1" ]; then
-    ORACLE_MUTFLAGS=(--enable-mutations --i-know-this-writes --mutate-url "$MUTATE_URL")
+    # Oracle write rate: higher than diff_oracle's own 6/min default so the
+    # advance/invalidation poke paths get real differential coverage per run.
+    # An explicit --mutations-per-min still wins.
+    ORACLE_MUT_RATE=20
+    [ "$MUT_SET" = "1" ] && ORACLE_MUT_RATE="$MUT_RATE"
+    ORACLE_MUTFLAGS=(--enable-mutations --i-know-this-writes --mutate-url "$MUTATE_URL" \
+                    --mutations-per-min "$ORACLE_MUT_RATE")
   fi
   ORACLE_REPORT="reports/diff-$TAG.json"
   # full-catalog mode subscribes EVERY resolvable query once (no churn) so all
@@ -800,15 +858,35 @@ if [ "$ORACLE" = "1" ]; then
   ORACLE_PAIRS=3; ORACLE_DURATION=90; ORACLE_QUIESCE=180
   ORACLE_FULLCAT=()
   if [ "$FULLCATALOG" = "1" ]; then
-    ORACLE_FULLCAT=(--full-catalog --catalog-batch-size 50); ORACLE_PAIRS=4; ORACLE_DURATION=5; ORACLE_QUIESCE=45
+    # duration bounds the write window (no churn either way). 5s => the mutator
+    # barely fires; give it 30s so full-catalog also exercises advance, not just
+    # first-hydrate parity, now that writes are a default.
+    ORACLE_FULLCAT=(--full-catalog --catalog-batch-size 50); ORACLE_PAIRS=4; ORACLE_DURATION=30; ORACLE_QUIESCE=45
+  fi
+  # Resume/catch-up phase (default ON). Composes with full-catalog: after every
+  # subscribed shape hydrates, each side reconnects from its own cookie and the
+  # catch-up DELTA is diffed. Disconnect-window writes ride the oracle's own
+  # mutation flags, so a real non-empty delta only fires in the valid
+  # differential+writes context; reads-only still checks baseCookie handling.
+  ORACLE_RESUME=()
+  if [ "$RESUME" = "1" ]; then
+    ORACLE_RESUME=(--resume --resume-writes 3 --resume-settle-s 8 --resume-quiesce-s 20)
   fi
   ORACLE_LABEL=""
   [ "$FULLCATALOG" = "1" ] && ORACLE_LABEL=" [full-catalog]"
+  [ "${#ORACLE_RESUME[@]}" -gt 0 ] && ORACLE_LABEL="$ORACLE_LABEL [resume]"
   echo "== differential oracle (G8)$ORACLE_LABEL =="
   set +e
+  # Same pod-IP-if-reachable-else-published-host-port selection as the mirror
+  # above (macOS host can't route to container IPs after a recreate).
   ORACLE_PRIMARY="$TARGET"
   APRIM=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ZCACHE" 2>/dev/null || true)
-  [ -n "$APRIM" ] && ORACLE_PRIMARY="ws://$APRIM:4848"
+  APORT=$(docker inspect -f '{{if index .NetworkSettings.Ports "4848/tcp"}}{{(index (index .NetworkSettings.Ports "4848/tcp") 0).HostPort}}{{end}}' "$ZCACHE" 2>/dev/null || true)
+  if [ -n "$APRIM" ] && nc -z -w 2 "$APRIM" 4848 2>/dev/null; then
+    ORACLE_PRIMARY="ws://$APRIM:4848"
+  elif [ -n "$APORT" ]; then
+    ORACLE_PRIMARY="ws://127.0.0.1:$APORT"
+  fi
   "$PY" harness/diff_oracle.py --primary "$ORACLE_PRIMARY" \
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
     --id-pool "$POOL" --client-schema "$CSCHEMA" \
@@ -816,6 +894,7 @@ if [ "$ORACLE" = "1" ]; then
     --pairs "$ORACLE_PAIRS" --duration "$ORACLE_DURATION" \
     --quiesce-s "$ORACLE_QUIESCE" --quiesce-max-s 300 \
     ${ORACLE_FULLCAT[@]+"${ORACLE_FULLCAT[@]}"} \
+    ${ORACLE_RESUME[@]+"${ORACLE_RESUME[@]}"} \
     ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${ORACLE_MUTFLAGS[@]+"${ORACLE_MUTFLAGS[@]}"} \
     --out "$ORACLE_REPORT"
   set -e
@@ -919,7 +998,7 @@ set -e
 # Read-only probes run first; cold-start RESTARTS zero-cache; drain SIGTERMs
 # it (pod dies) so it runs LAST. capacity drives a multi-rung replay sweep.
 PROTOCOL_REPORT=""; TELEMETRY_REPORT=""; READINESS_REPORT=""; DETERMINISM_REPORT=""
-CAPACITY_REPORT=""; IMAGEAUDIT_REPORT=""; UPGRADE_REPORT=""; PARITY_REPORT=""; COLDSTART_REPORT=""; DRAIN_REPORT=""
+CAPACITY_REPORT=""; IMAGEAUDIT_REPORT=""; UPGRADE_REPORT=""; PARITY_REPORT=""; COLDSTART_REPORT=""; DRAIN_REPORT=""; PORTPROBES_REPORT=""
 AUTHFLAGS=(--auth-token "$JWT" --extra-param "userID=$FIRST_UID")
 
 if [ "$PROTOCOL" = "1" ]; then
@@ -927,10 +1006,21 @@ if [ "$PROTOCOL" = "1" ]; then
   echo "== protocol-version probe (G16) =="
   set +e; "$PY" tools/probe_protocol.py --target "$TARGET" --auth-token "$JWT" --out "$PROTOCOL_REPORT"; set -e
 fi
+if [ "$PORTPROBES" = "1" ]; then
+  PORTPROBES_REPORT="reports/portprobes-$TAG.json"
+  echo "== port-breadth probes (G31) =="
+  set +e; "$PY" tools/port_probes.py --target "$TARGET" "${AUTHFLAGS[@]}" \
+    --client-schema "$CSCHEMA" --out "$PORTPROBES_REPORT"; set -e
+fi
 if [ "$TELEMETRY" = "1" ]; then
   TELEMETRY_REPORT="reports/telemetry-$TAG.json"
   echo "== telemetry-contract test (G17) =="
+  # Metrics: the candidate exports OTLP -> otel-collector -> Prometheus text on
+  # the collector's host port (rust binary has no direct :4849 scrape endpoint).
+  # Events: frontend-origin telemetry cannot exist in a headless run -> NA local.
+  ART_METRICS_URL="${ART_METRICS_URL:-http://localhost:9464/metrics}"
   set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json \
+    --metrics-url "$ART_METRICS_URL" --events-mode na \
     --container "$ZCACHE" --since "$RUN_START_ISO" --out "$TELEMETRY_REPORT"; set -e
 fi
 if [ "$READINESS" = "1" ]; then
@@ -953,7 +1043,33 @@ fi
 if [ "$UPGRADE" = "1" ]; then
   UPGRADE_REPORT="reports/upgrade-$TAG.json"
   echo "== upgrade-path test (G24) =="
-  if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+  # A REAL image upgrade happens on ONE pod: the CVR written by the old image
+  # must resume under the new image on the SAME app-id/CVR schema. The mirror
+  # pod has a different app-id, so a cross-pod resume is rejected by design —
+  # that path can only produce false FAILs. When a previous blessed image is
+  # available (zero-cache-rust-syncer:prev or $PREV_RUST_IMAGE) and this run
+  # bootstraps its own container, simulate the actual swap: old image writes
+  # CVR state -> container recreated on the candidate -> client resumes.
+  PREV_IMAGE="${PREV_RUST_IMAGE:-zero-cache-rust-syncer:prev}"
+  if [ "$BOOTSTRAP" = "1" ] && docker image inspect "$PREV_IMAGE" >/dev/null 2>&1; then
+    UPGRADE_STATE="/tmp/art-upgrade-state-$TAG.json"
+    echo "[ART] G24: image-swap simulation ($PREV_IMAGE -> ${IMAGE:-zero-cache-rust-syncer:local})"
+    bootstrap_art_container "$PREV_IMAGE"
+    set +e; "$PY" tools/upgrade_path.py --phase capture --state-file "$UPGRADE_STATE" \
+      --baseline-target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" \
+      --client-schema "$CSCHEMA"; CAP_RC=$?; set -e
+    bootstrap_art_container "${IMAGE:-zero-cache-rust-syncer:local}"
+    if [ "$CAP_RC" = "0" ]; then
+      set +e; "$PY" tools/upgrade_path.py --phase resume --state-file "$UPGRADE_STATE" \
+        --candidate-target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" \
+        --client-schema "$CSCHEMA" --out "$UPGRADE_REPORT"; set -e
+    else
+      echo "NOTE: G24 capture phase failed on $PREV_IMAGE — no upgrade report" >&2
+      UPGRADE_REPORT=""
+    fi
+  elif docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+    echo "NOTE: no previous image ($PREV_IMAGE) — falling back to cross-syncer handover vs the mirror" >&2
+    echo "      (only meaningful if the mirror shares the candidate's CVR schema)" >&2
     set +e; "$PY" tools/upgrade_path.py --baseline-target "$MIRROR_URL" --candidate-target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --out "$UPGRADE_REPORT"; set -e
   else
     echo "NOTE: $MIRROR_POD not running — G24 needs a second image target (start zero-cache-ts)" >&2
@@ -1074,7 +1190,8 @@ set +e
   ${PARITY_REPORT:+--parity "$PARITY_REPORT"} \
   ${PARK_REPORT:+--parks "$PARK_REPORT"} \
   ${WEDGE_REPORT:+--wedge "$WEDGE_REPORT"} \
-  ${WEDGE_SCENARIO_REPORT:+--wedge-scenarios "$WEDGE_SCENARIO_REPORT"}
+  ${WEDGE_SCENARIO_REPORT:+--wedge-scenarios "$WEDGE_SCENARIO_REPORT"} \
+  ${PORTPROBES_REPORT:+--port-probes "$PORTPROBES_REPORT"}
 GATE=$?
 set -e
 echo ""

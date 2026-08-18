@@ -412,7 +412,7 @@ ALLOWLIST: list[tuple[str, str]] = [
     ("internal-timeout",    r"\bInternal:\s"),            # infra blip / timeout
     ("invalid-conn-req",    r"InvalidConnectionRequest"), # client sent a stale/rehomed connect request
     ("client-not-found",    r"ClientNotFound"),           # client GC raced a late message
-    ("rehome-reconnect",    r'Rehome:? Reconnect required|"kind":"Rehome"'), # operational reshuffle, tracked in rehomes
+    ("rehome-reconnect",    r'Rehome:? Reconnect required|"kind":"Rehome"|kind:\s*Rehome'), # operational reshuffle, tracked in rehomes — JSON `"kind":"Rehome"` (TS) + Rust-debug `kind: Rehome` (supersede/drain/restart, all benign)
     ("unauthorized-client", r"Unauthorized"),             # negative/auth suite deliberately violates ownership
     ("auth-invalidated",    r"AuthInvalidated|Failed to decode auth token"), # invalid-token negative case
     ("cancelled-init",      r"shut down before initialization completed"), # cancel-mid-hydrate teardown
@@ -424,6 +424,7 @@ ALLOWLIST: list[tuple[str, str]] = [
     ("ttl-purge",           r"(TTL|ttl).{0,20}(purge|expire|evict)|purging expired"),
     ("cvr-gc",              r"(CVR|cvr).{0,20}(garbage.?collect|evict|purg)"),
     ("context-canceled",    r"context canceled|context deadline exceeded"),  # client went away mid-request
+    ("invalid-message",     r"InvalidMessage"),  # G31 unknown-op / malformed-frame probes deliberately elicit this clean rejection
 ]
 
 
