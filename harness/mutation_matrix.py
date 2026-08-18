@@ -530,8 +530,22 @@ async def amain(a: argparse.Namespace) -> int:
         print("REFUSING: mutation matrix WRITES through the backend. Pass "
               "--i-know-this-writes (sandbox only).", file=sys.stderr)
         return 2
+    def _is_local(target: str) -> bool:
+        """localhost, loopback, or an RFC1918 private address (the sandbox
+        mirror is resolved to its docker container IP to bypass a broken
+        traefik route — that is still a local pod, not a remote fleet)."""
+        import ipaddress
+        import urllib.parse as _up
+        host = _up.urlsplit(target).hostname or ""
+        if host in ("localhost",) or host.endswith(".localhost"):
+            return True
+        try:
+            return ipaddress.ip_address(host).is_private
+        except ValueError:
+            return False
+
     for t in (a.primary, a.mirror):
-        if "localhost" not in t and "127.0.0.1" not in t and not a.allow_remote:
+        if not _is_local(t) and not a.allow_remote:
             print(f"REFUSING non-local target {t} without --allow-remote",
                   file=sys.stderr)
             return 2

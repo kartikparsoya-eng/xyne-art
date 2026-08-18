@@ -425,6 +425,10 @@ ALLOWLIST: list[tuple[str, str]] = [
     ("cvr-gc",              r"(CVR|cvr).{0,20}(garbage.?collect|evict|purg)"),
     ("context-canceled",    r"context canceled|context deadline exceeded"),  # client went away mid-request
     ("invalid-message",     r"InvalidMessage"),  # G31 unknown-op / malformed-frame probes deliberately elicit this clean rejection
+    # Metrics-EXPORT infra noise from the TS mirror's node OTel exporter (its
+    # collector endpoint 404s); never a sync-correctness signal. The candidate's
+    # own metric contract is guarded by G17, which scrapes the collector.
+    ("otlp-export-404",     r"OTLPExporterError"),
 ]
 
 

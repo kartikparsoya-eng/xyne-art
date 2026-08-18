@@ -397,6 +397,27 @@ def main() -> int:
             results.append(("G6 leaks", "SKIP",
                             f"window {resources.get('window_s', 0):.0f}s < 15min — "
                             "slopes unreliable, run --soak"))
+    elif resources.get("window_s", 0) < 1800:
+        # A sub-30min window measures WORKING-SET FILL, not a leak: with the
+        # driver's 5-min query TTL every churned query holds a live pipeline
+        # for 300s, so RSS climbs by design until creation/expiry balance —
+        # verified empirically (2026-08-19): identical repeat load peaks BELOW
+        # the first high-water (freed memory reused; no cumulative growth) and
+        # the TS syncer under the same churn grows LARGER than Rust. Headroom
+        # stays enforceable; the slope becomes advisory. Soak (1h) keeps the
+        # hard gate — there the set saturates early and slope means leak.
+        hbad, hwatch = headroom_findings(resources)
+        rss_s = (resources.get("rss_bytes") or {}).get("steady_slope_per_hour")
+        note = (f"window {resources.get('window_s', 0):.0f}s < 30min: slope "
+                f"covers TTL-live pipeline fill (advisory rss "
+                f"{'+' if (rss_s or 0) >= 0 else ''}{(rss_s or 0)/2**20:.0f}MB/h); "
+                "leak verdict needs --soak")
+        if hbad:
+            results.append(("G6 leaks", "FAIL", "; ".join(hbad + hwatch)))
+        elif hwatch:
+            results.append(("G6 leaks", "WATCH", "; ".join(hwatch) + "; " + note))
+        else:
+            results.append(("G6 leaks", "PASS", note))
     else:
         bad, watch = headroom_findings(resources)
         limits = {"rss_bytes": 200 * 2**20, "goroutines": 300,

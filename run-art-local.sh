@@ -1095,9 +1095,17 @@ fi
 if [ "$CAPACITY" = "1" ]; then
   CAPACITY_REPORT="reports/capacity-$TAG.json"
   echo "== capacity-cliff sweep (G22): ladder $CAPACITY_LADDER =="
+  # A/B-relative when the mirror is up: the fixed blessed count is
+  # resource-shape-blind (a 4-cpu cap cliffs BOTH syncers at the same rung),
+  # so the honest gate is candidate-cliff >= reference-cliff on the same host.
+  CAP_MIRROR_FLAGS=()
+  if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
+    CAP_MIRROR_FLAGS=(--mirror-target "$MIRROR_URL")
+  fi
   set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" \
     --id-pool "$POOL" --client-schema "$CSCHEMA" --ladder "$CAPACITY_LADDER" \
-    --blessed-conns "$CAPACITY_BLESSED" --out "$CAPACITY_REPORT"; set -e
+    --blessed-conns "$CAPACITY_BLESSED" "${CAP_MIRROR_FLAGS[@]}" \
+    --out "$CAPACITY_REPORT"; set -e
 fi
 if [ "$PARITY" = "1" ]; then
   PARITY_REPORT="reports/parity-$TAG.json"

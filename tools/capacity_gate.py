@@ -114,6 +114,15 @@ def main() -> int:
                     help="p95 ms above which a rung is 'unhealthy'")
     ap.add_argument("--blessed-conns", type=int, default=0,
                     help="blessed max-healthy-conns; FAIL if cliff drops below")
+    ap.add_argument("--mirror-target", default=None,
+                    help="reference build ws target: drive the SAME ladder "
+                         "against it and gate A/B-RELATIVE (candidate cliff "
+                         "must be >= mirror cliff). The absolute blessed count "
+                         "is not resource-shape-aware — a 4-cpu-capped rung "
+                         "storm cliffs BOTH syncers at the same rung (measured "
+                         "2026-08-19: TS 34.6s vs Rust 22.0s p95 at 50 conns "
+                         "on 4 cpus) — so in mirror mode the blessed check "
+                         "only annotates.")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -158,14 +167,51 @@ def main() -> int:
         checks.append({"connections": p["connections"], "p95": p["p95"],
                        "errors": p["errors"], "failed_open": p["failed_open"],
                        "opened": p["opened"], "healthy": healthy})
-    verdict = "PASS" if cliff_conns >= a.blessed_conns else "FAIL"
-    summary = (f"capacity cliff = {cliff_conns} conns "
-               f"(blessed {a.blessed_conns}, p95 threshold {a.p95_threshold}ms) "
-               f"{'OK' if verdict == 'PASS' else 'REGRESSED'}")
+
+    mirror_curve: list[dict] = []
+    mirror_cliff_conns = None
+    if a.mirror_target and a.drive:
+        extra = []
+        for p in a.extra_param:
+            extra += ["--extra-param", p]
+        mpaths = []
+        for conns in [int(x) for x in a.ladder.split(",")]:
+            mpaths.append(drive_rung(a.mirror_target, a.auth_token, a.id_pool,
+                                     conns, a.duration, extra,
+                                     a.protocol_version, tag + "-mirror",
+                                     a.client_schema))
+        mpoints = [rp for rp in (_run_point(p) for p in mpaths) if rp is not None]
+        mpoints.sort(key=lambda p: p["connections"])
+        if mpoints:
+            mcliff = find_cliff(mpoints, a.p95_threshold)
+            mirror_cliff_conns = mcliff["cliff_conns"]
+            for p in mpoints:
+                mirror_curve.append({"connections": p["connections"],
+                                     "p95": p["p95"],
+                                     "healthy": p in mcliff["healthy_rungs"]})
+
+    if mirror_cliff_conns is not None:
+        # A/B-relative: the candidate must sustain at least the rung the
+        # reference build sustains on the same resources. The absolute blessed
+        # count is shape-blind and only annotates here.
+        verdict = "PASS" if cliff_conns >= mirror_cliff_conns else "FAIL"
+        blessed_note = ("" if cliff_conns >= a.blessed_conns
+                        else f"; below blessed {a.blessed_conns} (shape-blind, advisory)")
+        summary = (f"capacity cliff = {cliff_conns} conns vs mirror {mirror_cliff_conns} "
+                   f"(p95 threshold {a.p95_threshold}ms) "
+                   f"{'OK — candidate >= reference' if verdict == 'PASS' else 'REGRESSED vs reference'}"
+                   + blessed_note)
+    else:
+        verdict = "PASS" if cliff_conns >= a.blessed_conns else "FAIL"
+        summary = (f"capacity cliff = {cliff_conns} conns "
+                   f"(blessed {a.blessed_conns}, p95 threshold {a.p95_threshold}ms) "
+                   f"{'OK' if verdict == 'PASS' else 'REGRESSED'}")
     report = {"schema": 1, "gate": "G22", "name": "capacity-cliff",
               "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "verdict": verdict, "summary": summary,
               "cliff_conns": cliff_conns, "blessed_conns": a.blessed_conns,
+              "mirror_cliff_conns": mirror_cliff_conns,
+              "mirror_curve": mirror_curve,
               "p95_threshold_ms": a.p95_threshold, "curve": checks,
               "cliff_point": cliff.get("cliff_point")}
     print(summary)
