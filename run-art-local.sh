@@ -1113,13 +1113,38 @@ if [ "$PARITY" = "1" ]; then
   if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
     if [ "$RELEASE" = "1" ]; then
       echo "  equalizing parity resources: cpus=$CPUS memory=$MEMORY"
-      docker update --cpus "$CPUS" --memory "$MEMORY" "$ZCACHE" "$MIRROR_POD" >/dev/null
-      docker restart "$ZCACHE" "$MIRROR_POD" >/dev/null
+      docker update --cpus "$CPUS" --memory "$MEMORY" "$ZCACHE" "$MIRROR_POD" >/dev/null || true
+      # Retry the restarts: the daemon intermittently errors with a stale-PID
+      # race ("Cannot restart container ...: container <id> PID ...") that
+      # aborted an entire release run under set -e. One retry after a beat
+      # recovers it; a genuinely dead pod still fails loudly below.
+      for _pod in "$ZCACHE" "$MIRROR_POD"; do
+        docker restart "$_pod" >/dev/null 2>&1 || { sleep 3; docker restart "$_pod" >/dev/null; }
+      done
       wait_mirror_ready "$ZCACHE" 180 || true
       wait_mirror_ready "$MIRROR_POD" 180 || true
     fi
+    # Drive parity at the highest MUTUALLY-HEALTHY rung, not the full release
+    # concurrency: past the measured 4-cpu capacity cliff (25 conns for BOTH
+    # syncers — see G22) each engine is in queue collapse and per-query ratios
+    # are dice (a different random query "loses" 2-3x each run with 40s+
+    # absolutes on both sides). Ratio comparisons are only meaningful at a
+    # load both engines sustain.
+    PARITY_CONNS="$CONNS"
+    if [ -n "$CAPACITY_REPORT" ] && [ -f "$CAPACITY_REPORT" ]; then
+      MUTUAL=$("$PY" -c "
+import json
+d=json.load(open('$CAPACITY_REPORT'))
+c=d.get('cliff_conns') or 0
+m=d.get('mirror_cliff_conns')
+print(min(c, m) if m else c)" 2>/dev/null || echo "$CONNS")
+      if [ -n "$MUTUAL" ] && [ "$MUTUAL" -gt 0 ] && [ "$MUTUAL" -lt "$CONNS" ]; then
+        PARITY_CONNS="$MUTUAL"
+        echo "  parity concurrency clamped to mutual-healthy rung: $PARITY_CONNS (was $CONNS)"
+      fi
+    fi
     PARITY_FLAGS=(--drive --primary-target "$TARGET" --mirror-target "$MIRROR_URL"
-      --connections "$CONNS" --working-set "$WORKING_SET" --duration 180)
+      --connections "$PARITY_CONNS" --working-set "$WORKING_SET" --duration 180)
     [ -n "$PROFILE" ] && PARITY_FLAGS+=(--profile "$PROFILE")
     [ "$CASCADE" = "1" ] && PARITY_FLAGS+=(--cascade)
     [ "$OVERSAMPLE" = "1" ] && PARITY_FLAGS+=(--oversample)
