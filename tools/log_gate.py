@@ -316,14 +316,40 @@ SIG_BASELINE_PATH = os.path.join(os.path.dirname(__file__), "..", "reports",
 SIG_SCHEMA = 2
 
 
+def _json_event(line: str) -> dict | None:
+    """Parse a log line as a JSON OBJECT, else None. The dict guard matters:
+    lines like the rust pod's `["ready", {"ready": true}]` stdout handshake
+    parse as a list, and scalar lines parse as int/str — calling `.get` on
+    those raises AttributeError and kills the whole scan."""
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def extract_message(event: dict) -> str | None:
+    """The human message of a structured log event, wherever the log format
+    puts it. Two JSON shapes coexist across the pods:
+      - TS pods:   {"level":"ERROR", ..., "message": "..."}   (top level)
+      - rust pod:  {"timestamp": ..., "level":"ERROR",
+                    "fields":{"message":"..."}, "target":"..."}
+        (tracing_subscriber's json formatter, emitted since ZERO_LOG_FORMAT=
+        json is honored — the message nests under "fields")."""
+    msg = event.get("message")
+    if isinstance(msg, str):
+        return msg
+    fields = event.get("fields")
+    if isinstance(fields, dict) and isinstance(fields.get("message"), str):
+        return fields["message"]
+    return None
+
+
 def normalize_signature(line: str) -> str:
     """Strip variable parts from a log line to produce a stable signature."""
     s = line.strip()
-    try:
-        event = json.loads(s)
-    except (json.JSONDecodeError, TypeError):
-        event = None
-    if isinstance(event, dict):
+    event = _json_event(s)
+    if event is not None:
         # Query ASTs, SQL text, IDs, and stack traces describe the context, not
         # the failure class. Keeping them made one Slow SQLite warning produce
         # thousands of distinct signatures. Retain only stable routing and
@@ -336,6 +362,22 @@ def normalize_signature(line: str) -> str:
             )
             if key in event and isinstance(event[key], (str, int, float, bool))
         }
+        # rust-pod tracing JSON nests the message under "fields" and routes by
+        # "target". Without lifting them, every rust ERROR line collapsed to
+        # the single useless generic signature {"level":"ERROR"} — distinct
+        # failure modes became indistinguishable and un-allowlistable.
+        if "message" not in semantic:
+            msg = extract_message(event)
+            if msg is not None:
+                semantic["message"] = msg
+        fields = event.get("fields")
+        if isinstance(fields, dict):
+            for key in ("errorKind", "error", "errorMsg"):
+                if (key not in semantic
+                        and isinstance(fields.get(key), (str, int, float, bool))):
+                    semantic[key] = fields[key]
+        if isinstance(event.get("target"), str):
+            semantic["target"] = event["target"]
         body = event.get("errorBody")
         if isinstance(body, dict):
             for key in ("kind", "message"):
@@ -354,13 +396,11 @@ def normalize_signature(line: str) -> str:
 
 def is_error_or_warn_level(line: str) -> bool:
     """Match the event level, not words such as "error" in an INFO message."""
-    try:
-        event = json.loads(line)
+    event = _json_event(line)
+    if event is not None:
         level = event.get("level")
         if isinstance(level, str):
             return level.upper() in {"ERROR", "WARN", "WARNING"}
-    except (json.JSONDecodeError, TypeError):
-        pass
     return bool(re.search(
         r"(?:^|\s)(?:ERROR|WARN|WARNING)(?:\s|:)|\blevel=(?:error|warn|warning)\b",
         line,
@@ -412,6 +452,13 @@ ALLOWLIST: list[tuple[str, str]] = [
     ("internal-timeout",    r"\bInternal:\s"),            # infra blip / timeout
     ("invalid-conn-req",    r"InvalidConnectionRequest"), # client sent a stale/rehomed connect request
     ("client-not-found",    r"ClientNotFound"),           # client GC raced a late message
+    # rust syncer wording of the same protocol case: the harness purges/expires
+    # CVRs between phases; the next connect's CVR load finds no client row and
+    # the server answers ClientNotFound, which resets the client — designed
+    # protocol behavior, not a fault. Surfaced as "new" only once the rust pod
+    # started emitting JSON (ZERO_LOG_FORMAT=json honored) and the old
+    # text-format signatures stopped matching.
+    ("load-cvr-client-not-found", r"load_cvr failed.{0,60}Client not found"),
     ("rehome-reconnect",    r'Rehome:? Reconnect required|"kind":"Rehome"|kind:\s*Rehome'), # operational reshuffle, tracked in rehomes — JSON `"kind":"Rehome"` (TS) + Rust-debug `kind: Rehome` (supersede/drain/restart, all benign)
     ("unauthorized-client", r"Unauthorized"),             # negative/auth suite deliberately violates ownership
     ("auth-invalidated",    r"AuthInvalidated|Failed to decode auth token"), # invalid-token negative case
@@ -435,15 +482,27 @@ ALLOWLIST: list[tuple[str, str]] = [
 def _known_labeled(line: str) -> str | None:
     """Return a label if the line matches an already-known ALLOWLIST /
     HARD_BLOCKING / SELF_HEAL signature, else None. Used to decide whether an
-    ERROR/WARN line is UNKNOWN (nothing recognizes it)."""
+    ERROR/WARN line is UNKNOWN (nothing recognizes it).
+
+    Patterns are matched against the raw line AND, for structured (JSON)
+    lines, against the extracted human message — so allowlist regexes written
+    for one format keep matching regardless of which shape carried the
+    message (text, TS top-level "message", or rust "fields.message" — where
+    JSON escaping in the raw line can defeat a raw-text regex)."""
+    texts = [line]
+    event = _json_event(line)
+    if event is not None:
+        msg = extract_message(event)
+        if msg is not None:
+            texts.append(msg)
     for label, pat in ALLOWLIST:
-        if re.search(pat, line, re.I):
+        if any(re.search(pat, t, re.I) for t in texts):
             return f"allow:{label}"
     for label, pat in HARD_BLOCKING:
-        if re.search(pat, line, re.I):
+        if any(re.search(pat, t, re.I) for t in texts):
             return f"blocking:{label}"
     for label, pat in SELF_HEAL:
-        if re.search(pat, line, re.I):
+        if any(re.search(pat, t, re.I) for t in texts):
             return f"self-heal:{label}"
     return None
 
