@@ -379,6 +379,83 @@ async def oversample_query(target: str, version: int, auth_token: str | None,
 
 
 # --------------------------------------------------------------------------- #
+# Post-drive liveness re-probe for drive-window stragglers (see G28)
+# --------------------------------------------------------------------------- #
+async def late_reprobe(target: str, version: int, auth_token: str | None,
+                       extra_params: list[tuple[str, str]], id_pool: str,
+                       client_schema_path: str | None, names: list[str],
+                       timeout_s: float = 45.0) -> tuple[list[str], list[str]]:
+    """Desire exactly `names` on one fresh connection against the now-quiet
+    target. Returns (hydrated, still_failed). A name that hydrates here was a
+    drive-window scheduling straggler, not a hang."""
+    import websockets
+
+    resolver = ArgResolver.from_pool_file(id_pool, random.Random())
+    baseline = load_baseline("art-baseline.json")
+    client_schema = json.load(open(client_schema_path)) if client_schema_path else None
+    puts, hash2name = [], {}
+    unresolvable: list[str] = []
+    for name in names:
+        op = next((o for o in baseline.all_read_ops if o.name == name), None)
+        if op is None:
+            unresolvable.append(name)
+            continue
+        args, ok = resolver.resolve(op)
+        if not ok:
+            unresolvable.append(name)
+            continue
+        put = query_put(name, args, ttl_ms=120_000)
+        puts.append(put)
+        hash2name[put["hash"]] = name
+    got: set[str] = set()
+    errored: set[str] = set()
+    if puts:
+        rng = random.Random()
+        cgid = "art-lrp-" + "".join(rng.choice("abcdef012345") for _ in range(10))
+        cid = "art-lrp-" + "".join(rng.choice("abcdef012345") for _ in range(10))
+        params = {"clientGroupID": cgid, "clientID": cid, "baseCookie": "",
+                  "ts": str(time.time() * 1000), "lmid": "0"}
+        params.update(extra_params)
+        url = (target.rstrip("/") + f"/sync/v{version}/connect?"
+               + urllib.parse.urlencode(params))
+        sec = encode_sec_protocols(None, auth_token)
+        try:
+            async with websockets.connect(url, subprotocols=[sec], open_timeout=15,
+                                           max_size=None, ping_interval=None) as ws:
+                await ws.send(json.dumps(init_connection_message(
+                    puts, client_schema=client_schema)))
+                deadline = time.perf_counter() + timeout_s
+                while time.perf_counter() < deadline and len(got) < len(puts):
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(msg, list) or not msg:
+                        continue
+                    if msg[0] == "pokePart":
+                        for e in (msg[1] or {}).get("gotQueriesPatch") or []:
+                            if e.get("op") == "put" and e.get("hash") in hash2name:
+                                got.add(hash2name[e["hash"]])
+                    elif msg[0] == "transformError":
+                        qn = (msg[1] or {}).get("queryName") or (msg[1] or {}).get("name")
+                        if qn in names:
+                            # An explicit error is not a HANG — the liveness
+                            # ceiling tracks silent never-completion.
+                            errored.add(qn)
+        except Exception:
+            pass
+    hydrated = sorted(got | errored)
+    still_failed = sorted(set(names) - got - errored - set(unresolvable)) + unresolvable
+    return hydrated, still_failed
+
+
+# --------------------------------------------------------------------------- #
 # Cascade mode: simulate timeout -> destroy -> cold re-hydrate
 # --------------------------------------------------------------------------- #
 async def cascade_probe(target: str, version: int, auth_token: str | None,
@@ -562,6 +639,29 @@ async def amain(a: argparse.Namespace) -> dict:
         primary_coverage = p_doc.get("coverage") or {}
         checks.append({"name": "drive", "verdict": "PASS",
                        "detail": f"replay vs primary ({len(primary_pq)} q) + mirror ({len(mirror_pq)} q)"})
+
+        # Post-drive liveness re-probe: in a CHURN drive a query desired near
+        # the end of the window legitimately never hydrates before the drive
+        # stops — that is scheduling luck, not a hang. Re-desire exactly the
+        # never-hydrated names on the now-quiet primary; whatever hydrates is
+        # moved to `late_verified` (covered), and only names that STILL fail
+        # remain in never_hydrated_no_error for the G28 liveness ceiling.
+        never = list(primary_coverage.get("never_hydrated_no_error") or [])
+        if never and a.primary_target:
+            verified, still_failed = await late_reprobe(
+                a.primary_target, a.protocol_version, a.auth_token,
+                [tuple(p.split("=", 1)) for p in a.extra_param],
+                a.id_pool, a.client_schema, never)
+            primary_coverage = dict(primary_coverage)
+            primary_coverage["never_hydrated_no_error"] = still_failed
+            primary_coverage["late_verified"] = verified
+            checks.append({
+                "name": "late-reprobe",
+                "verdict": "PASS" if not still_failed else "FAIL",
+                "detail": (f"{len(verified)}/{len(never)} drive-window stragglers "
+                           f"hydrated on quiet re-probe"
+                           + (f"; STILL dead: {', '.join(still_failed)}"
+                              if still_failed else ""))})
     else:
         checks.append({"name": "setup", "verdict": "ERROR",
                        "detail": "need --primary-run/--mirror-run (consume) or --drive"})

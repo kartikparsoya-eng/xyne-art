@@ -658,7 +658,11 @@ async def amain(a: argparse.Namespace) -> int:
         await asyncio.sleep(1.0)
         if min(time.perf_counter() - s.last_activity for s in sides) >= 5.0:
             break
-    ok0, _ = await converge(sides, 30)
+    # Initial convergence is a one-time COLD-HYDRATION barrier, not a wave
+    # barrier: a resource-capped TS mirror hydrating the whole catalog can
+    # legitimately need minutes (measured 4-9x slower than Rust at 4 cpus).
+    # 30s here produced false "sides never converged" INFRA aborts.
+    ok0, _ = await converge(sides, max(180.0, float(a.hydrate_max_s)))
     print(f"MAP: hydrated {sides[0].mat.rows_applied} rows "
           f"(pre-mutation states equal: {ok0})")
     if not ok0:
