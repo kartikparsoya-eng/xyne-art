@@ -145,6 +145,35 @@ class Materializer:
         self.monotonic_warnings: list[dict] = [] # cookie did not strictly advance
         self._last_good_cookie: Any = None       # last applied (non-cancelled) cookie
         self._pending_base: Any = "\0unset"      # baseCookie of the open poke
+        # --- rowKey-completeness invariant (②): every emitted rowKey MUST carry
+        # all of its table's client primary-key columns. A port that keys the CVR
+        # rowKey by the IVM keyCmp[0] (shortest replicated unique key) instead of
+        # the client PK stores a rowKey missing a client-PK column; the JS client
+        # then throws `toPrimaryKeyString: Expected string, number or boolean.
+        # Got undefined` and crash-loops. This is INVISIBLE to the row diff: `put`
+        # ops carry the full row (which has every column) so `_key` reconstructs
+        # the right key regardless; the poison only shows on `del`/`update` ops
+        # whose `id` IS the stored rowKey. This single-side invariant flags it
+        # directly on the wire (mirrors the client's `hasAllPrimaryKeyColumns`).
+        self.rowkey_pk_violations: list[dict] = []   # capped sample
+        self.rowkey_pk_violation_count: int = 0      # total
+
+    _ROWKEY_VIOLATION_SAMPLE_CAP = 100
+
+    def _check_rowkey_pk(self, table: str, kind: str, keyobj: dict) -> None:
+        """Flag an emitted rowKey missing a client-PK column (② invariant)."""
+        pk = self.pks.get(table)
+        if not pk or not isinstance(keyobj, dict):
+            return
+        missing = [c for c in pk if keyobj.get(c) is None]
+        if not missing:
+            return
+        self.rowkey_pk_violation_count += 1
+        if len(self.rowkey_pk_violations) < self._ROWKEY_VIOLATION_SAMPLE_CAP:
+            self.rowkey_pk_violations.append({
+                "table": table, "op": kind, "missing": missing,
+                "primaryKey": pk, "rowkey_cols": sorted(keyobj),
+            })
 
     def _key(self, table: str, obj: dict) -> str:
         pk = self.pks.get(table)
@@ -168,6 +197,7 @@ class Materializer:
             rows = self.state.setdefault(table, {})
             if kind == "put":
                 val = op.get("value") or {}
+                self._check_rowkey_pk(table, "put", val)
                 k = self._key(table, val)
                 rows[k] = val
                 if poke_qnames:
@@ -176,6 +206,7 @@ class Materializer:
                 self.table_row_count[table] = self.table_row_count.get(table, 0) + 1
             elif kind == "update":
                 rid = op.get("id") or {}
+                self._check_rowkey_pk(table, "update", rid)
                 k = self._key(table, rid)
                 merged = dict(rows.get(k) or rid)
                 merged.update(op.get("merge") or {})
@@ -186,6 +217,7 @@ class Materializer:
                 self.rows_applied += 1
             elif kind == "del":
                 rid = op.get("id") or {}
+                self._check_rowkey_pk(table, "del", rid)
                 rows.pop(self._key(table, rid), None)
                 self.rows_applied += 1
             elif kind == "clear":
@@ -252,6 +284,17 @@ def cookie_invariants(mat: Materializer) -> dict:
         "format_violations": mat.format_violations,
         "monotonic_warnings": mat.monotonic_warnings,
         "hard_violations": len(mat.chain_violations) + len(mat.format_violations),
+    }
+
+
+def rowkey_invariants(mat: Materializer) -> dict:
+    """Summarize the rowKey-completeness invariant (②) for one side. Any emitted
+    rowKey missing a client-PK column is a hard bug (gated): the JS client
+    crash-loops on it via toPrimaryKeyString."""
+    return {
+        "violation_count": mat.rowkey_pk_violation_count,
+        "violations": mat.rowkey_pk_violations,        # capped sample
+        "hard_violations": mat.rowkey_pk_violation_count,
     }
 
 
@@ -789,6 +832,8 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         "resume": resume_info,
         "cookie_primary": cookie_invariants(sides[0].mat),
         "cookie_mirror": cookie_invariants(sides[1].mat),
+        "rowkey_primary": rowkey_invariants(sides[0].mat),
+        "rowkey_mirror": rowkey_invariants(sides[1].mat),
         "query_attribution": query_attribution,
         "streaming_at_quiesce": sorted(sides[0].mat.streaming_queries |
                                         sides[1].mat.streaming_queries),
@@ -898,6 +943,12 @@ async def amain(a: argparse.Namespace) -> int:
     cookie_mono = sum(
         len(r.get(side, {}).get("monotonic_warnings", []))
         for r in results for side in ("cookie_primary", "cookie_mirror"))
+    # ② rowKey-completeness violations across both sides, all pairs. A port that
+    # keys the CVR rowKey by keyCmp[0] instead of the client PK trips these on
+    # del/update ops even when the converged rows match (see Materializer ②).
+    rowkey_hard = sum(
+        r.get(side, {}).get("hard_violations", 0)
+        for r in results for side in ("rowkey_primary", "rowkey_mirror"))
     # Cross-side terminal-cookie comparison — WATCH only (not gated). In a
     # quiesced steady state both sides caught up to the same watermark AND saw
     # identical desired-query traffic, so terminal cookies normally match
@@ -919,7 +970,8 @@ async def amain(a: argparse.Namespace) -> int:
     resume_writes = sum(r.get("resume", {}).get("writes", 0) for r in results)
     oracle_failed = (
         total_mismatch > 0 or bool(conn_errors) or total_hydration_gap > 0
-        or protocol_errors > 0 or cookie_hard > 0 or bool(resume_errors)
+        or protocol_errors > 0 or cookie_hard > 0 or rowkey_hard > 0
+        or bool(resume_errors)
         or (a.full_catalog and (bool(catalog_missing)
                                or not catalog_expected
                                or len(catalog_accounted) != catalog_total
@@ -954,6 +1006,11 @@ async def amain(a: argparse.Namespace) -> int:
         "cookie_violations": cookie_hard,
         "cookie_monotonic_warnings": cookie_mono,
         "cookie_terminal_mismatch": cookie_terminal_mismatch,
+        "rowkey_pk_violations": rowkey_hard,
+        "rowkey_pk_violation_samples": [
+            v for r in results for side in ("rowkey_primary", "rowkey_mirror")
+            for v in r.get(side, {}).get("violations", [])
+        ][:20],
         "verdict": "FAIL" if oracle_failed else "PASS",
         "results": results,
     }
@@ -1055,11 +1112,23 @@ async def amain(a: argparse.Namespace) -> int:
                      "add --enable-mutations+--mutate-url for a real catch-up delta)")
             print(f"  RESUME: {resume_cycles} catch-up reconnect(s) converged"
                   f" rust-vs-TS{wnote}")
+    # ② rowKey-completeness failures: an emitted rowKey missing a client-PK
+    # column (the "Got undefined" client crash class). Print the offending
+    # table(s) + which PK columns were missing so the diverging table is named.
+    if rowkey_hard:
+        for r in results:
+            for lbl, side in (("rust", "rowkey_primary"), ("ts", "rowkey_mirror")):
+                for v in r.get(side, {}).get("violations", [])[:8]:
+                    print(f"  ROWKEY PK [{lbl} pair {r['pair']}]: table={v['table']} "
+                          f"op={v['op']} missing client-PK col(s) {v['missing']} "
+                          f"(clientPK={v['primaryKey']}, rowKey cols={v['rowkey_cols']}) "
+                          f"— client toPrimaryKeyString would throw 'Got undefined'")
     verdict = out["verdict"]
     print(f"{mode} ORACLE: {verdict} ({total_mismatch} mismatches, "
           f"{total_hydration_gap} hydration-parity gap, "
           f"{len(conn_errors)} connect errors, {protocol_errors} protocol errors, "
-          f"{cookie_hard} cookie-invariant violations"
+          f"{cookie_hard} cookie-invariant violations, "
+          f"{rowkey_hard} rowKey-PK violations"
           + (f" ({cookie_mono} mono-warn)" if cookie_mono else "")
           + (f", catalog_driven={out['catalog_driven']}/{out['catalog_expected']}"
              if out.get('full_catalog') else "")

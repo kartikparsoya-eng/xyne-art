@@ -403,6 +403,16 @@ async def amain(a: argparse.Namespace) -> int:
             except Exception:
                 pass
 
+    # ② rowKey-completeness invariant across the whole churn (both sides). The
+    # mutation matrix is where del/update ops flow, so a CVR rowKey keyed by
+    # keyCmp[0] instead of the client PK trips here on the very ops that crash
+    # the JS client (toPrimaryKeyString "Got undefined") — even if the converged
+    # rows still match. Gated. See diff_oracle.Materializer ②.
+    rowkey_viol = (sides[0].mat.rowkey_pk_violation_count
+                   + sides[1].mat.rowkey_pk_violation_count)
+    rowkey_samples = (sides[0].mat.rowkey_pk_violations
+                      + sides[1].mat.rowkey_pk_violations)[:20]
+    failed = bool(mismatched) or rowkey_viol > 0
     report = {
         "primary": a.primary, "mirror": a.mirror,
         "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -410,13 +420,15 @@ async def amain(a: argparse.Namespace) -> int:
         "visible_tables": len(visible),
         "tables_fuzzed": fuzzed,
         "tables_mismatched": mismatched,
+        "rowkey_pk_violations": rowkey_viol,
+        "rowkey_pk_violation_samples": rowkey_samples,
         "tables_skipped_no_rows": skipped_norows,
         "tables_skipped_unclonable_pk": skipped_pk,
         "dark_table_attribution": dark_attr,
         "total_ops": sum(r["ops"] for r in results),
         "total_rejected": sum(r["rejected"] for r in results),
         "results": results,
-        "verdict": "FAIL" if mismatched else ("PASS" if fuzzed else "INFRA"),
+        "verdict": "FAIL" if failed else ("PASS" if fuzzed else "INFRA"),
     }
     out_path = a.out or os.path.join(
         os.path.dirname(__file__), "..", "reports",
@@ -424,10 +436,15 @@ async def amain(a: argparse.Namespace) -> int:
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
+    for v in rowkey_samples[:8]:
+        print(f"  ROWKEY PK: table={v['table']} op={v['op']} missing client-PK "
+              f"col(s) {v['missing']} (clientPK={v['primaryKey']}, "
+              f"rowKey cols={v['rowkey_cols']}) — client would throw 'Got undefined'")
     print(f"\nMATRIX ORACLE: {report['verdict']} — {fuzzed} tables, "
           f"{report['total_ops']} ops ({report['total_rejected']} rejected by PG), "
-          f"{mismatched} persistent mismatches -> {out_path}")
-    return 0 if report["verdict"] == "PASS" else (1 if mismatched else 2)
+          f"{mismatched} persistent mismatches, {rowkey_viol} rowKey-PK violations "
+          f"-> {out_path}")
+    return 0 if report["verdict"] == "PASS" else (1 if failed else 2)
 
 
 def main() -> int:
