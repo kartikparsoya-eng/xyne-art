@@ -37,14 +37,44 @@ from ab_common import (  # noqa: E402
 )
 from workload import (  # noqa: E402
     init_connection_message, change_desired_queries_message,
+    load_baseline, ArgResolver, MutationSampler, custom_mutation,
+    push_message,
 )
 from diff_surface import pick_queries  # noqa: E402
+from diff_concurrent import upstream_touch  # noqa: E402
+import random  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def make_push_builder():
+    """Best-effort push-mutation builder from the prod baseline; None when the
+    baseline carries no supported mutators (classes then report insufficient)."""
+    try:
+        rng = random.Random(1234)
+        baseline = load_baseline(os.path.join(os.path.dirname(HERE),
+                                              "art-baseline.json"))
+        resolver = ArgResolver.from_pool_file(
+            os.path.join(HERE, "id-pool.sandbox.json"), rng)
+        sampler = MutationSampler(baseline.mutations, rng)
+    except Exception:
+        return None
+
+    def build(cgid: str, cid: str, mid: int):
+        now_ms = int(time.time() * 1000)
+        built = sampler.build(resolver, now_ms)
+        if built is None:
+            return None
+        name, args = built
+        return push_message(cgid, [custom_mutation(mid, cid, name, args,
+                                                   now_ms)],
+                            request_id=f"{cid}-{mid}", now_ms=now_ms)
+    return build
+
+
 async def one_trial(tpl: Side, auth: dict, schema: dict, puts: list,
-                    inc_put: dict, quiet_s: float) -> dict:
+                    inc_put: dict, quiet_s: float,
+                    push_builder=None) -> dict:
     """One full measurement cycle on one side. Fresh clientGroupID = cold."""
     s = Side(tpl.name, tpl.target, tpl.cvr_schema, tpl.container)
     s.fresh_ids()
@@ -80,6 +110,44 @@ async def one_trial(tpl: Side, auth: dict, schema: dict, puts: list,
             break
         await asyncio.sleep(0.05)
     out["incremental"] = (time.perf_counter() - t1) * 1000.0
+
+    # serving-lag: upstream commit → next non-cancel pokeEnd on this
+    # (subscribed) client. Skipped when the touch fails or nothing pokes
+    # (query set not covering the touched table) — class then reports
+    # insufficient samples rather than failing.
+    n_ends = sum(1 for f in s.frames if f.tag == "pokeEnd"
+                 and not f.body.get("cancel"))
+    t2 = time.perf_counter()
+    if await asyncio.to_thread(upstream_touch):
+        deadline = time.perf_counter() + 15
+        while time.perf_counter() < deadline:
+            if sum(1 for f in s.frames if f.tag == "pokeEnd"
+                   and not f.body.get("cancel")) > n_ends:
+                out["serving_lag"] = (time.perf_counter() - t2) * 1000.0
+                break
+            await asyncio.sleep(0.05)
+
+    # push: custom mutation → lastMutationIDChanges ack for this client in a
+    # pokePart (write round-trip through the relay + CVR poke).
+    if push_builder is not None:
+        msg = push_builder(s.cgid, s.cid, 1)
+        if msg is not None:
+            t3 = time.perf_counter()
+            try:
+                await s.ws.send(json.dumps(msg))
+                deadline = time.perf_counter() + 20
+                while time.perf_counter() < deadline:
+                    acked = any(
+                        f.tag == "pokePart"
+                        and (f.body.get("lastMutationIDChanges") or {})
+                        .get(s.cid, 0) >= 1
+                        for f in s.frames)
+                    if acked:
+                        out["push"] = (time.perf_counter() - t3) * 1000.0
+                        break
+                    await asyncio.sleep(0.05)
+            except Exception:
+                pass
 
     cookie = s.last_cookie
     stop.set()
@@ -121,6 +189,9 @@ async def amain(a) -> int:
     rust_tpl, ts_tpl = make_sides()
     puts = pick_queries(a.queries)
     inc_put = pick_queries(a.queries + 1)[a.queries]
+    push_builder = make_push_builder()
+    if push_builder is None:
+        print("  (push class disabled: no supported baseline mutations)")
     samples: dict[str, dict[str, list[float]]] = {}
 
     for trial in range(a.trials):
@@ -129,7 +200,8 @@ async def amain(a) -> int:
             order.reverse()
         for tpl, name in order:
             try:
-                r = await one_trial(tpl, auth, schema, puts, inc_put, a.quiet_s)
+                r = await one_trial(tpl, auth, schema, puts, inc_put,
+                                    a.quiet_s, push_builder)
             except Exception as e:
                 print(f"  trial {trial} {name}: ERROR {e}", flush=True)
                 continue
@@ -141,7 +213,8 @@ async def amain(a) -> int:
           f"{'ratio':>6s}  {'rust p95':>9s} {'ts p95':>9s} {'ratio':>6s}")
     fails = []
     table = {}
-    for cls in ("connect", "cold", "incremental", "catchup"):
+    for cls in ("connect", "cold", "incremental", "serving_lag", "push",
+                "catchup"):
         cs = samples.get(cls, {})
         xr, xt = cs.get("rust", []), cs.get("ts", [])
         if len(xr) < a.min_trials or len(xt) < a.min_trials:

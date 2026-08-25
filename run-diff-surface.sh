@@ -29,4 +29,8 @@ else
   python3 harness/latency_ab.py --trials "$TRIALS"
 fi
 S2=$?
-exit $(( S1 || S2 ))
+echo
+echo "══ diff-surface: W-mode concurrent differential (G43) ══"
+python3 harness/diff_concurrent.py
+S3=$?
+exit $(( S1 || S2 || S3 ))

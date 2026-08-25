@@ -327,6 +327,21 @@ NEGATIVE_CASES = [
     ("malformed-init", {"init": ["initConnection",
                                  {"desiredQueriesPatch": "not-a-list"}]}),
     ("unknown-message", {"post": ["definitelyNotAThing", {}]}),
+    # Post-init adversarial messages (post_builder receives the auth token).
+    ("malformed-change-desired", {"post": ["changeDesiredQueries",
+                                           {"desiredQueriesPatch": "nope"}]}),
+    ("malformed-ack-mutations", {"post": ["ackMutationResponses",
+                                          {"bogus": True}]}),
+    ("pull-op", {"post": ["pull", {"clientGroupID": "x", "cookie": "",
+                                   "requestID": "r1"}]}),
+    ("updateauth-tampered", {"post_builder": lambda tok:
+                             ["updateAuth", {"auth": tok[:-2] + "xx"}]}),
+    # Both images cap ws frames (rust DEFAULT_MAX_PAYLOAD_BYTES=10MiB,
+    # TS websocketMaxPayloadBytes) — a 12MB frame must be rejected the
+    # same way on both (close code compared, no error frame expected).
+    ("oversized-payload", {"post": ["changeDesiredQueries",
+                                    {"desiredQueriesPatch": [],
+                                     "pad": "x" * (12 * 1024 * 1024)}]}),
 ]
 
 
@@ -354,6 +369,9 @@ async def observe_negative(side_tpl: Side, auth_token: str, schema: dict,
         code = getattr(e, "status_code", None) or getattr(
             getattr(e, "response", None), "status_code", None)
         return f"handshake-reject:{code or type(e).__name__}"
+    if "post_builder" in case:
+        case = dict(case)
+        case["post"] = case["post_builder"](auth_token)
     outcome = "connected"
     try:
         if "post" in case:
@@ -381,8 +399,13 @@ async def observe_negative(side_tpl: Side, auth_token: str, schema: dict,
                 break
     except asyncio.TimeoutError:
         outcome = outcome if outcome != "connected" else "accepted-silent"
-    except Exception:
-        pass
+    except Exception as e:
+        # A protocol-level rejection (e.g. oversized frame) closes the socket
+        # without an error frame — the close CODE is the comparable outcome.
+        code = getattr(e, "code", None) or getattr(
+            getattr(e, "rcvd", None), "code", None)
+        if code:
+            outcome = f"closed:{code}"
     if outcome in ("connected",):
         outcome = "accepted-silent"
     try:
