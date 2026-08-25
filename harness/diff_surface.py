@@ -164,7 +164,12 @@ def gate_cvr(art: dict, rep: Report) -> tuple[dict, dict]:
     rust, ts = art["rust"], art["ts"]
     dr = dump_cvr(rust.cvr_schema, [rust.cgid])
     dt = dump_cvr(ts.cvr_schema, [ts.cgid])
-    cr, ct = canon_cvr(dr), canon_cvr(dt)
+    # Later of the two replica initial-sync watermarks: rowVersions at or
+    # below it are provenance, not behavior (see canon_cvr docstring).
+    rvs = [i.get("replicaVersion")
+           for d in (dr, dt) for i in d["instances"] if i.get("replicaVersion")]
+    watermark = max(rvs) if rvs else None
+    cr, ct = canon_cvr(dr, watermark), canon_cvr(dt, watermark)
     diffs = diff_canon(cr, ct)
     if not dr["instances"] or not dt["instances"]:
         rep.add("G32 cvr-schema", "FAIL",
@@ -352,6 +357,16 @@ async def observe_negative(side_tpl: Side, auth_token: str, schema: dict,
     outcome = "connected"
     try:
         if "post" in case:
+            # Quiesce first: init-hydration pokes already in flight would
+            # otherwise race the post-message's error frame and read as
+            # "accepted" (both images DO answer error:InvalidMessage once
+            # drained — verified live).
+            await asyncio.sleep(1.5)
+            try:
+                while True:
+                    await asyncio.wait_for(s.ws.recv(), timeout=0.3)
+            except Exception:
+                pass
             await s.ws.send(json.dumps(case["post"]))
         deadline = time.perf_counter() + 6
         while time.perf_counter() < deadline:
@@ -360,7 +375,8 @@ async def observe_negative(side_tpl: Side, auth_token: str, schema: dict,
             if isinstance(m, list) and m and m[0] == "error":
                 outcome = f"error:{m[1].get('kind')}"
                 break
-            if isinstance(m, list) and m and m[0] == "pokeEnd":
+            if (isinstance(m, list) and m and m[0] == "pokeEnd"
+                    and "post" not in case):
                 outcome = "accepted"        # server treated input as fine
                 break
     except asyncio.TimeoutError:

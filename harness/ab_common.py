@@ -130,7 +130,15 @@ async def open_side(side: Side, auth_token: str, init_msg: Optional[list],
     side.connected_ms = (time.perf_counter() - t0) * 1000.0
     side.last_activity = time.perf_counter()
     if init_msg is not None:
-        await side.ws.send(json.dumps(init_msg))
+        try:
+            await side.ws.send(json.dumps(init_msg))
+        except Exception:
+            # The server may have already queued error+close for a connect-time
+            # rejection (rust validates e.g. baseCookie at registration, before
+            # any init arrives; TS only on init processing — registered ordering
+            # nuance D-9). The rejection frames are buffered — let the caller's
+            # recv loop observe them instead of failing the send.
+            pass
 
 
 async def reader(side: Side, stop: asyncio.Event) -> None:
@@ -295,11 +303,20 @@ def dump_cvr(schema: str, cgids: list[str]) -> dict:
     return out
 
 
-def canon_cvr(dump: dict) -> dict:
+def canon_cvr(dump: dict, pre_sync_watermark: str | None = None) -> dict:
     """Version-INSENSITIVE canonical form of a single-client-group CVR dump.
     patchVersion / transformationVersion / version strings are dropped (they
     legally differ across independent CVR lineages); everything else must
-    match. rowSetSignature is kept separately (G33)."""
+    match. rowSetSignature is kept separately (G33).
+
+    pre_sync_watermark: the LATER of the two sides' replica initial-sync
+    versions (instances.replicaVersion; LexiVersion strings compare as plain
+    strings). Initial sync stamps every pre-existing row at the sync
+    watermark, so rowVersions at-or-below the later watermark are replica
+    PROVENANCE, not engine behavior — two TS instances synced at different
+    times diverge identically. Those are normalized to a sentinel; rows
+    touched after both syncs (i.e. during the lockstep session) still
+    compare exactly."""
     inst = dump["instances"][0] if dump["instances"] else {}
     queries = {}
     for r in dump["queries"]:
@@ -320,8 +337,12 @@ def canon_cvr(dump: dict) -> dict:
         }
     rows = {}
     for r in dump["rows"]:
+        rv = r["rowVersion"]
+        if (pre_sync_watermark is not None and rv is not None
+                and rv <= pre_sync_watermark):
+            rv = "@pre-initial-sync"
         rows[(r["schema"], r["table"], canon(r["rowKey"]))] = {
-            "rowVersion": r["rowVersion"],
+            "rowVersion": rv,
             "refCounts": canon(r["refCounts"]),
             "tombstone": r["refCounts"] is None,
         }

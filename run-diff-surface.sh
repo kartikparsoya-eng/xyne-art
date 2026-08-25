@@ -17,6 +17,16 @@ python3 harness/diff_surface.py $DRAIN
 S1=$?
 echo
 echo "══ diff-surface: latency A/B (G42) ══"
-python3 harness/latency_ab.py --trials "$TRIALS"
+# Use the direct host port for rust (compose maps 4850:4848) so the `connect`
+# class doesn't carry Traefik proxy overhead the TS side (direct :4849) skips.
+# Fall back to the Traefik route if the direct port isn't published.
+RUST_DIRECT="ws://localhost:4850"
+if curl -s -o /dev/null --max-time 3 "http://localhost:4850/"; then
+  echo "(G42 rust target: $RUST_DIRECT — direct, Traefik bypassed)"
+  AB_RUST_WS="$RUST_DIRECT" python3 harness/latency_ab.py --trials "$TRIALS"
+else
+  echo "(G42 rust target: default Traefik route — :4850 not published)"
+  python3 harness/latency_ab.py --trials "$TRIALS"
+fi
 S2=$?
 exit $(( S1 || S2 ))
