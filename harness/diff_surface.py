@@ -459,9 +459,42 @@ def scrape_metrics(container: str) -> set[str]:
     return {n for n in names if n.startswith(("zero", "target_info"))}
 
 
+def scrape_collector(container: str, include_rust_sdk: bool = False) -> set[str]:
+    """Collector mode: both images export OTLP to the shared otel collector
+    (prometheus at AB_PROM_URL); series are attributed per container via the
+    host_name label (= container id/hostname). Stale series from previous
+    container generations are excluded by the hostname match."""
+    prom = os.environ.get("AB_PROM_URL", "http://localhost:9464/metrics")
+    try:
+        hostname = subprocess.run(
+            f"docker inspect -f '{{{{.Config.Hostname}}}}' {container}",
+            shell=True, capture_output=True, timeout=10,
+        ).stdout.decode().strip()
+        import urllib.request
+        body = urllib.request.urlopen(prom, timeout=10).read().decode(
+            errors="replace")
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for line in body.splitlines():
+        if line.startswith("#"):
+            continue
+        # The rust BINARY's exporter (opentelemetry-rust) sets no host.name
+        # resource — its series carry telemetry_sdk_language="rust" instead.
+        # There is exactly one rust binary in the sandbox, so that label is
+        # an unambiguous attribution for the rust side.
+        matched = f'host_name="{hostname}"' in line or (
+            include_rust_sdk and 'telemetry_sdk_language="rust"' in line)
+        if matched:
+            names.add(line.split("{")[0])
+    return {n for n in names if n.startswith("zero")}
+
+
 def gate_metrics(art: dict, rep: Report) -> None:
-    mr = scrape_metrics(art["rust"].container)
-    mt = scrape_metrics(art["ts"].container)
+    mr = scrape_metrics(art["rust"].container) \
+        or scrape_collector(art["rust"].container, include_rust_sdk=True)
+    mt = scrape_metrics(art["ts"].container) \
+        or scrape_collector(art["ts"].container)
     if not mr and not mt:
         rep.add("G41 metrics-surface", "WATCH",
                 "neither side exposes a scrapeable metrics endpoint "
