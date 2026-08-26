@@ -11,6 +11,7 @@ From the `mono-v1.7` checkout on `rust-cvr-v1.0.0`:
 ```bash
 docker build \
   --build-arg GIT_REVISION="$(git rev-parse HEAD)" \
+  --build-arg RUST_SYNCER_FEATURES=profiling \
   -t zero-cache-rust-syncer:local \
   -f Dockerfile .
 ```
@@ -21,6 +22,19 @@ dedicated image is the rollout opt-in; the TS control remains on the upstream
 Zero image. Build only from a committed tree: ART records the
 `org.opencontainers.image.revision` label and the immutable image digest in
 every report.
+
+**Profiling is baked into this candidate image** via
+`--build-arg RUST_SYNCER_FEATURES=profiling` (the Dockerfile threads it into
+`cargo build --features`). This enables the in-process CPU flamegraph endpoint
+`GET http://<HTTP_PORT>/debug/pprof/flamegraph?seconds=N` (see the rust-syncer
+`OPERATIONS.md` §9 Profiling). The pprof sampler only runs during an active
+request, so it adds negligible overhead while idle — safe for the
+initial-testing / candidate image. **Do NOT add this arg to the upstream prod
+release build** (`.github/workflows/release.yml`): profiling stays opt-in there,
+and the release image should ship the plain production binary. To also attribute
+a process-level RSS climb, rebuild once with
+`--build-arg RUST_SYNCER_FEATURES=dhat-heap` instead (heavier — per-allocation
+overhead — so only for a targeted heap-profiling run, not the standard gate).
 
 ## 2. Opt only the candidate into Rust
 

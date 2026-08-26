@@ -20,7 +20,7 @@ Production gate for the full Rust syncer in the xyne-spaces-test sandbox.
 The candidate must run ZERO_SYNCER=rust; the mirror must remain TypeScript.
 
 Options:
-  --mode MODE       code-only, smoke (default), soak, or release
+  --mode MODE       code-only, smoke (default), soak, release, or proxy
   --sandbox NAME    xyne-spaces-test sandbox name (default: rust-test)
   --skip-code       skip local Rust/TypeScript code gates
   -h, --help        show this help
@@ -48,8 +48,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$MODE" in
-  code-only|smoke|soak|release) ;;
-  *) echo "ERROR: --mode must be code-only, smoke, soak, or release" >&2; exit 2;;
+  code-only|smoke|soak|release|proxy) ;;
+  *) echo "ERROR: --mode must be code-only, smoke, soak, release, or proxy" >&2; exit 2;;
 esac
 
 [ -d "$MONO_ROOT/packages/rust-syncer" ] || {
@@ -90,7 +90,7 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 IMAGE_REVISION="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
 if [ -z "$IMAGE_REVISION" ] || [ "$IMAGE_REVISION" = "<no value>" ] || [ "$IMAGE_REVISION" = "unknown" ]; then
   echo "ERROR: $IMAGE has no immutable org.opencontainers.image.revision label" >&2
-  echo "Rebuild with --build-arg GIT_REVISION=\"\$(git rev-parse HEAD)\"" >&2
+  echo "Rebuild with --build-arg GIT_REVISION=\"\$(git rev-parse HEAD)\" --build-arg RUST_SYNCER_FEATURES=profiling" >&2
   exit 1
 fi
 docker run --rm --entrypoint sh "$IMAGE" -lc '
@@ -124,6 +124,13 @@ run_art() {
   fi
 }
 case "$MODE" in
+  proxy)
+    # Encryption sync-proxy E2E (encryption OFF, mirror ON): stands up the proxy pod on
+    # sandbox-net (Traefik enc.<sandbox>.localhost) and runs transparency + lifecycle +
+    # mirror-convergence + mirror-failure-isolation. Proves the MITM proxy is safe in the
+    # critical path before it fronts real traffic.
+    SANDBOX="$SANDBOX" exec "$DIR/test-encryption-proxy.sh"
+    ;;
   smoke)
     run_art --sandbox "$SANDBOX" --bootstrap --clean \
       --image "$IMAGE" \
