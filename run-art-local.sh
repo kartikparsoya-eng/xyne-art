@@ -352,9 +352,17 @@ elif [ "$SWAP" = "1" ]; then
   MIRROR_POD="xyne-sandbox-${SANDBOX}-zero-cache"
   MIRROR_URL="ws://${SANDBOX}.localhost/zero"
   PPROF_FLAGS=(--pprof '')   # TS pod is Node — no Go pprof endpoint
+elif [ "$BOOTSTRAP" = "1" ]; then
+  # Bootstrapped rust -art candidate (the common release/smoke path): the
+  # container maps host ${OVERRIDE_PPROF_PORT:-6061} -> container 3200 (first
+  # shard HTTP), which serves /census + /debug/pprof/flamegraph. Default to the
+  # rust flavor here so the sampler captures a flamegraph instead of falling
+  # back to its Go default (localhost:6060 → Connection refused). This is the
+  # path that was silently Go-flavor before, defeating the whole B1 fix.
+  PPROF_FLAGS=(--pprof "http://localhost:${OVERRIDE_PPROF_PORT:-6061}" --pprof-flavor rust)
 elif [ -n "$HTTP_PORT" ]; then
-  # No explicit --pprof-port and not a --swap (TS) run: the rust candidate's
-  # flamegraph lives on the syncer HTTP port. Capture it in rust flavor (B1).
+  # Explicit --http-port, not a --swap (TS) run: the rust candidate's flamegraph
+  # lives on that syncer HTTP port. Capture it in rust flavor (B1).
   PPROF_FLAGS=(--pprof "http://localhost:$HTTP_PORT" --pprof-flavor rust)
 fi
 MUTATE_URL="$OVERRIDE_MUTATE_URL"
