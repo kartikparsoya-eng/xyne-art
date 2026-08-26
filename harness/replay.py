@@ -98,6 +98,11 @@ class Config:
     # --- impact-aware mutation targeting (G14; see workload.ImpactIndex) ---
     impact_path: Optional[str] = None
     impact_bias: float = 0.75         # P(aim at a subscribed query's entity)
+    # --- G29 coverage sweep (reports/g29-shape-analysis.md fix 1) ---
+    # ON by default: one dedicated extra client round-robins the FULL catalog
+    # so every resolvable shape hydrates at least once per run regardless of
+    # prod weight. Disable with --no-coverage-sweep.
+    coverage_sweep: bool = True
 
 
 def post_direct_mutation(url: str, body: dict[str, Any], auth_token: Optional[str],
@@ -176,6 +181,16 @@ class Stats:
     # client_latency_steady_ms.
     lat_by_query: dict[str, list] = field(default_factory=dict)
     hydrated_queries: set[str] = field(default_factory=set)  # names that got a gotQueriesPatch put
+    # G29 coverage sweep (run_sweep_client): tallied SEPARATELY from the
+    # organic weighted-sampler stats so the run report can distinguish
+    # organic vs sweep-driven coverage.
+    sweep_puts: int = 0
+    sweep_dels: int = 0
+    sweep_rotations: int = 0          # full catalog passes completed
+    sweep_sessions: int = 0
+    sweep_per_query: dict[str, int] = field(default_factory=dict)
+    sweep_hydrated: set[str] = field(default_factory=set)
+    sweep_unresolvable: set[str] = field(default_factory=set)
     per_mutation: dict[str, int] = field(default_factory=dict)
     per_error: dict[str, int] = field(default_factory=dict)
     per_tag: dict[str, int] = field(default_factory=dict)
@@ -215,6 +230,14 @@ class Stats:
         self.latencies_ms.extend(o.latencies_ms)
         self.latencies_initial_ms.extend(o.latencies_initial_ms)
         self.hydrated_queries |= o.hydrated_queries
+        self.sweep_puts += o.sweep_puts
+        self.sweep_dels += o.sweep_dels
+        self.sweep_rotations += o.sweep_rotations
+        self.sweep_sessions += o.sweep_sessions
+        self.sweep_hydrated |= o.sweep_hydrated
+        self.sweep_unresolvable |= o.sweep_unresolvable
+        for k, v in o.sweep_per_query.items():
+            self.sweep_per_query[k] = self.sweep_per_query.get(k, 0) + v
         self.impact_edges |= o.impact_edges
         self.impact_targeted += o.impact_targeted
         self.impact_fallback += o.impact_fallback
@@ -645,6 +668,189 @@ async def run_client(cfg: Config, sampler: WeightedSampler, resolver: ArgResolve
             await asyncio.sleep(0.25 + rng.random() * 0.5)
 
 
+# G29 coverage sweep: at most this many sweep puts are desired at once. The
+# server caps desired queries at 100 per client; the sweep is its own client,
+# so a rolling window well under the cap keeps it safe while giving each shape
+# window*interval seconds of dwell before its del.
+SWEEP_WINDOW = 20
+
+
+def sweep_interval_s(cfg: Config, catalog_len: int) -> float:
+    """Pacing so one full catalog rotation fits comfortably in the run window
+    (~60% of duration), clamped to [0.15s, 2s]."""
+    return min(2.0, max(0.15, (cfg.duration_s * 0.6) / max(catalog_len, 1)))
+
+
+async def run_sweep_client(cfg: Config, catalog: list, resolver: ArgResolver,
+                           stats: Stats, deadline: float,
+                           rng: random.Random) -> None:
+    """Dedicated coverage-sweep client (reports/g29-shape-analysis.md fix 1).
+
+    Weight-faithful sampling cannot cover the 3%-mass tail of the prod shape
+    distribution in a few hundred draws (Poisson-expected ~82 never-drawn
+    shapes per 870-put run), so G29 shape coverage was a coin flip. This one
+    EXTRA connection round-robins the FULL in-catalog shape list with
+    put -> (window dwell) -> del, deterministically desiring every resolvable
+    shape at least once per rotation and looping until the deadline.
+
+    * Respects the 100-desired-queries-per-client server cap via a rolling
+      SWEEP_WINDOW shard: shape i is deleted when shape i+SWEEP_WINDOW is put.
+    * All tallies go to stats.sweep_* (never per_query/hydrated_queries), so
+      the run report separates organic vs sweep coverage.
+    * Catalog position persists across reconnects (Rehome etc.) so a rotation
+      completes despite session churn.
+    """
+    import websockets  # lazy: only needed for live runs
+
+    idrng = random.SystemRandom()
+    cgid = "art-swp" + "".join(idrng.choice("abcdefghijklmnop0123456789") for _ in range(8))
+    cid = "art-swp" + "".join(idrng.choice("abcdefghijklmnop0123456789") for _ in range(8))
+
+    auth_token, user_id = cfg.auth_token, None
+    if cfg.auth_pool:
+        entry = cfg.auth_pool[0]
+        auth_token, user_id = entry["token"], entry.get("userID")
+    headers = {}
+    if cfg.cookie:
+        headers["Cookie"] = cfg.cookie
+
+    n = len(catalog)
+    if n == 0:
+        return
+    interval = sweep_interval_s(cfg, n)
+    pos = 0                       # catalog cursor, persists across sessions
+    window: list[str] = []        # hashes currently desired (rolling shard)
+    hash_name: dict[str, str] = {}
+
+    while time.perf_counter() < deadline:
+        init_msg = init_connection_message(
+            [], user_query_url=cfg.user_query_url,
+            client_schema=cfg.client_schema)
+        sec = encode_sec_protocols(None if cfg.post_handshake else init_msg,
+                                   auth_token)
+        url = build_connect_url(cfg, cgid, cid, user_id=user_id)
+        connect_kwargs: dict[str, Any] = {"subprotocols": [sec], "open_timeout": 20,
+                                          "max_size": None, "ping_interval": None,
+                                          "compression": None}
+        try:
+            connect_kwargs["additional_headers"] = headers or None
+            conn = websockets.connect(url, **connect_kwargs)
+        except TypeError:
+            connect_kwargs.pop("additional_headers", None)
+            connect_kwargs["extra_headers"] = headers or None
+            conn = websockets.connect(url, **connect_kwargs)
+
+        stop = asyncio.Event()
+
+        async def sleep_or_stop(seconds: float) -> bool:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0 or stop.is_set():
+                return False
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=min(seconds, remaining))
+                return False
+            except asyncio.TimeoutError:
+                return time.perf_counter() < deadline and not stop.is_set()
+
+        try:
+            async with conn as ws:
+                stats.sweep_sessions += 1
+                if cfg.post_handshake:
+                    await ws.send(json.dumps(init_msg))
+
+                async def sweeper() -> None:
+                    nonlocal pos
+                    while time.perf_counter() < deadline and not stop.is_set():
+                        op = catalog[pos % n]
+                        pos += 1
+                        args, ok = resolver.resolve(op)
+                        if ok:
+                            put = query_put(op.name, args, ttl_ms=cfg.ttl_ms)
+                            patch = [put]
+                            window.append(put["hash"])
+                            hash_name[put["hash"]] = op.name
+                            while len(window) > SWEEP_WINDOW:
+                                patch.append(query_del(window.pop(0)))
+                                stats.sweep_dels += 1
+                            try:
+                                await ws.send(json.dumps(
+                                    change_desired_queries_message(patch)))
+                            except Exception:
+                                return
+                            stats.sweep_puts += 1
+                            stats.sweep_per_query[op.name] = \
+                                stats.sweep_per_query.get(op.name, 0) + 1
+                        else:
+                            # required-arg miss: skip (dry-run/report surfaces
+                            # it via resolver.unresolved + coverage.sweep)
+                            stats.sweep_unresolvable.add(op.name)
+                        if pos % n == 0:
+                            stats.sweep_rotations += 1
+                        # unresolvable skips pace at 10ms (yield, no busy spin);
+                        # real puts pace at the rotation interval
+                        if not await sleep_or_stop(interval if ok else 0.01):
+                            return
+
+                async def reader() -> None:
+                    while time.perf_counter() < deadline and not stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        except Exception:
+                            return
+                        stats.messages += 1
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        if not isinstance(msg, list) or not msg:
+                            continue
+                        tag = msg[0]
+                        if isinstance(tag, str):
+                            stats.per_tag[tag] = stats.per_tag.get(tag, 0) + 1
+                        if tag == "error":
+                            body = msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
+                            kind = body.get("kind", "unknown")
+                            key = f"{kind}: {str(body.get('message', ''))[:80]}"
+                            stats.per_error[key] = stats.per_error.get(key, 0) + 1
+                            if kind == "Rehome":
+                                stats.rehomes += 1
+                                stop.set()
+                                return
+                            stats.errors += 1
+                            if kind in ("InvalidConnectionRequest", "Unauthorized",
+                                        "AuthInvalidated", "ClientNotFound",
+                                        "InvalidMessage", "VersionNotSupported",
+                                        "SchemaVersionNotSupported", "Internal"):
+                                stop.set()
+                                return
+                        elif tag == "transformError":
+                            # same attribution as run_client so sweep-driven
+                            # never-hydrated shapes get a root cause in the report
+                            details = msg[1] if len(msg) > 1 else None
+                            items = details if isinstance(details, list) else [details]
+                            for it in items:
+                                d = it if isinstance(it, dict) else {"raw": str(it)[:80]}
+                                key = (f"transformError: {d.get('name', '?')}: "
+                                       f"{str(d.get('message', d.get('details', '')))[:70]}")
+                                stats.per_error[key] = stats.per_error.get(key, 0) + 1
+                        elif tag == "pokePart":
+                            body = msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
+                            for got in body.get("gotQueriesPatch", []) or []:
+                                if got.get("op") != "put":
+                                    continue
+                                h = got.get("hash")
+                                if h in hash_name:
+                                    stats.sweep_hydrated.add(hash_name[h])
+
+                await asyncio.gather(sweeper(), reader())
+        except Exception:
+            pass  # dropped mid-run: back off briefly and reconnect below
+        if time.perf_counter() < deadline:
+            await asyncio.sleep(0.25 + rng.random() * 0.5)
+
+
 async def run_live(cfg: Config, sampler, resolver,
                    msampler: Optional[MutationSampler] = None) -> Stats:
     stats = Stats()
@@ -663,6 +869,13 @@ async def run_live(cfg: Config, sampler, resolver,
         tasks.append(asyncio.create_task(one(i)))
         if cfg.connections > 20:
             await asyncio.sleep(5.0 / cfg.connections)
+
+    # G29 coverage sweep: one EXTRA connection (not counted in cfg.connections,
+    # outside the semaphore) that deterministically covers the full catalog.
+    if cfg.coverage_sweep:
+        tasks.append(asyncio.create_task(run_sweep_client(
+            cfg, sampler.ops, resolver, stats, deadline,
+            random.Random(cfg.seed ^ 0x5EED))))
 
     async def ticker():
         while time.perf_counter() < deadline:
@@ -739,6 +952,17 @@ def dry_run(cfg: Config, sampler, resolver, n: int,
           f"{100*fully//n}% fully-resolved args")
     if resolver.unresolved:
         print("unresolved keys:", sorted(resolver.unresolved.items(), key=lambda kv: -kv[1])[:8])
+    if resolver.optional_omitted:
+        print("optional keys omitted (schema-sanctioned, not failures):",
+              sorted(resolver.optional_omitted.items(), key=lambda kv: -kv[1])[:8])
+    if cfg.coverage_sweep:
+        catalog = sampler.ops
+        resolvable = sum(1 for op in catalog if resolver.resolve(op)[1])
+        print(f"coverage sweep: ON — {resolvable}/{len(catalog)} catalog shapes "
+              f"resolvable, one put per ~{sweep_interval_s(cfg, len(catalog)):.2f}s "
+              f"(rolling window {SWEEP_WINDOW}, respects the 100-desired/client cap)")
+    else:
+        print("coverage sweep: OFF (--no-coverage-sweep)")
     print("\nOK: plan is valid. Add --target + auth and drop --dry-run to drive load.")
 
 
@@ -752,6 +976,11 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
             return round(s[min(len(s) - 1, int(p * len(s)))], 1)
         return {"samples": len(s), "p50": pct(0.50), "p95": pct(0.95),
                 "p99": pct(0.99)}
+    # G29 coverage: gates read the MERGED (organic + sweep) sets; the sweep
+    # breakdown below keeps them distinguishable.
+    all_driven = set(stats.per_query) | set(stats.sweep_per_query)
+    all_hydrated = stats.hydrated_queries | stats.sweep_hydrated
+    never_hydrated = sorted(all_driven - all_hydrated)
     summary = {
         "mode": "A-replay", "target": cfg.target,
         "window": {"start": start_iso, "end": end_iso, "duration_s": cfg.duration_s},
@@ -761,7 +990,9 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
         # distribution wholesale).
         "config": {"connections": cfg.connections, "working_set": cfg.working_set,
                    "churn_ms": cfg.churn_ms, "lifecycle": cfg.lifecycle,
-                   "zipf_s": cfg.zipf_s, "profile": cfg.profile},
+                   "zipf_s": cfg.zipf_s, "profile": cfg.profile,
+                   # ignored by local_gate.shape_key (reads specific keys only)
+                   "coverage_sweep": cfg.coverage_sweep},
         "counters": {"opened": stats.opened, "failed_open": stats.failed_open,
                      "puts_sent": stats.puts_sent, "dels_sent": stats.dels_sent,
                      "pokes": stats.pokes, "messages": stats.messages, "errors": stats.errors,
@@ -786,8 +1017,11 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
         "top_queries_driven": sorted(stats.per_query.items(), key=lambda kv: -kv[1])[:15],
         # Complete query-name map for coverage gates. top_queries_driven is a
         # presentation sample and must not be used as evidence of full shape
-        # coverage.
+        # coverage. queries_driven stays ORGANIC-only (weighted sampler);
+        # sweep-driven puts are tagged apart in queries_driven_sweep so G29
+        # consumers can distinguish organic vs sweep coverage.
         "queries_driven": dict(sorted(stats.per_query.items())),
+        "queries_driven_sweep": dict(sorted(stats.sweep_per_query.items())),
         # steady-phase latency dist per query name (>=5 samples) — diff two
         # runs' maps to attribute an aggregate regression to specific queries.
         "latency_by_query": {
@@ -800,22 +1034,40 @@ def write_summary(cfg: Config, stats: Stats, start_iso: str, end_iso: str, out_d
             # driven = distinct query names we desired; hydrated = names that
             # got at least one gotQueriesPatch ack. never_hydrated is the
             # blind-spot list: desired but never delivered (build drift or bug).
-            "queries_driven": len(stats.per_query),
-            "queries_hydrated": len(stats.hydrated_queries),
-            "query_names_hydrated": sorted(stats.hydrated_queries),
-            "never_hydrated": sorted(set(stats.per_query) - stats.hydrated_queries),
+            # All four are MERGED organic+sweep (G29 reads query_names_hydrated);
+            # the "sweep" sub-object attributes what only the sweep covered.
+            "queries_driven": len(all_driven),
+            "queries_hydrated": len(all_hydrated),
+            "query_names_hydrated": sorted(all_hydrated),
+            "never_hydrated": never_hydrated,
             # blind spot root cause (#4): for each never_hydrated query, show
             # the error kind if we have one (transformError:queryName:msg),
             # else "no error" (truly unexplained — possible delivery bug)
             "never_hydrated_errors": {
                 q: [k for k in stats.per_error if k.startswith(f"transformError: {q}:")]
-                for q in sorted(set(stats.per_query) - stats.hydrated_queries)
+                for q in never_hydrated
                 if any(k.startswith(f"transformError: {q}:") for k in stats.per_error)
             },
             "never_hydrated_no_error": sorted(
-                q for q in (set(stats.per_query) - stats.hydrated_queries)
+                q for q in never_hydrated
                 if not any(k.startswith(f"transformError: {q}:") for k in stats.per_error)
             ),
+            # G29 coverage sweep attribution (run_sweep_client): organic =
+            # weighted-sampler clients only; sweep_only = shapes the run would
+            # have missed without the sweep.
+            "sweep": {
+                "enabled": cfg.coverage_sweep,
+                "puts": stats.sweep_puts,
+                "dels": stats.sweep_dels,
+                "sessions": stats.sweep_sessions,
+                "rotations_completed": stats.sweep_rotations,
+                "queries_driven": len(stats.sweep_per_query),
+                "queries_hydrated": len(stats.sweep_hydrated),
+                "query_names_hydrated_organic": sorted(stats.hydrated_queries),
+                "query_names_hydrated_sweep_only": sorted(
+                    stats.sweep_hydrated - stats.hydrated_queries),
+                "unresolvable": sorted(stats.sweep_unresolvable),
+            },
         },
         "mutations_driven": sorted(stats.per_mutation.items(), key=lambda kv: -kv[1]),
         "note": "client_latency is best-effort (rowsPatch queryHash attribution); "
@@ -914,6 +1166,11 @@ def main() -> int:
     ap.add_argument("--auth-pool", default=None,
                     help="JSON file: [{token, userID}, ...] — clients round-robin "
                          "identities (multi-user write contention)")
+    ap.add_argument("--no-coverage-sweep", dest="coverage_sweep",
+                    action="store_false", default=True,
+                    help="disable the G29 coverage-sweep client (one extra "
+                         "connection that round-robins the full catalog so every "
+                         "resolvable shape hydrates at least once per run)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out-dir", default=os.path.join(os.path.dirname(__file__), "..", "reports"))
     ap.add_argument("--dry-run", action="store_true")
@@ -987,17 +1244,24 @@ def main() -> int:
         profile=profile_name,
         impact_path=a.impact,
         impact_bias=a.impact_bias,
+        coverage_sweep=a.coverage_sweep,
     )
 
     rng = random.Random(a.seed)
     bl = load_baseline(a.baseline)
     stale_queries: list[str] = []
+    current_query_schemas: Optional[dict] = None
     if a.current_query_schema and os.path.exists(a.current_query_schema):
         with open(a.current_query_schema) as f:
-            current_names = set((json.load(f).get("queries") or {}).keys())
+            current_query_schemas = json.load(f).get("queries") or {}
+        current_names = set(current_query_schemas.keys())
         stale_queries = [op.name for op in bl.queries if op.name not in current_names]
         bl.queries = [op for op in bl.queries if op.name in current_names]
-    resolver = ArgResolver.from_pool_file(a.id_pool, rng, zipf_s=a.zipf_s)
+    # query_schemas teaches the resolver which unknown arg keys are OPTIONAL
+    # in the current source schema (omit instead of failing the shape — G29
+    # fix 2; required-unknown keys still fail exactly as before).
+    resolver = ArgResolver.from_pool_file(a.id_pool, rng, zipf_s=a.zipf_s,
+                                          query_schemas=current_query_schemas)
     sampler = WeightedSampler(bl.queries, rng)
     print(f"baseline v{bl.version}: {len(bl.queries)} queries | "
           f"id-pool {'none' if not a.id_pool else a.id_pool} "
@@ -1041,6 +1305,11 @@ def main() -> int:
               f"{cfg.resume_pct:.0%} cookie resumes")
     if cfg.auth_pool:
         print(f"AUTH POOL: {len(cfg.auth_pool)} identities round-robin")
+    if cfg.coverage_sweep:
+        print(f"COVERAGE SWEEP ON: 1 extra client round-robins all "
+              f"{len(bl.queries)} catalog shapes (one per "
+              f"~{sweep_interval_s(cfg, len(bl.queries)):.2f}s, window "
+              f"{SWEEP_WINDOW}); disable with --no-coverage-sweep")
 
     if a.dry_run:
         dry_run(cfg, sampler, resolver, 20000, msampler)
@@ -1070,6 +1339,12 @@ def main() -> int:
           f"rehomes={stats.rehomes} reconnects={stats.reconnects} "
           f"errors={stats.errors} latency_samples={len(stats.latencies_ms)}"
           f"+{len(stats.latencies_initial_ms)}init")
+    if cfg.coverage_sweep:
+        print(f"coverage sweep: puts={stats.sweep_puts} "
+              f"rotations={stats.sweep_rotations} "
+              f"hydrated={len(stats.sweep_hydrated)} "
+              f"sweep-only={len(stats.sweep_hydrated - stats.hydrated_queries)} "
+              f"unresolvable={len(stats.sweep_unresolvable)}")
     if cfg.lifecycle:
         print(f"lifecycle: sessions={stats.sessions} resumes={stats.resumes} "
               f"aborts={stats.aborts} zombies={stats.zombies} "

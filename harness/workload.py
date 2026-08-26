@@ -111,6 +111,11 @@ class WeightedSampler:
             i = len(self._ops) - 1
         return self._ops[i]
 
+    @property
+    def ops(self) -> list[Op]:
+        """The full catalog this sampler draws from (for the coverage sweep)."""
+        return list(self._ops)
+
     def coverage_after(self, n: int) -> int:
         """How many distinct ops are expected to appear in n samples (probabilistic upper bound helper for tests)."""
         return min(n, len(self._ops))
@@ -160,11 +165,21 @@ class ArgResolver:
     # skew (gen_id_pool_db.py hotness-ranks pools so index 0 = hottest).
     zipf_s: float = 0.0
     unresolved: dict[str, int] = field(default_factory=dict)
+    # Per-query arg schemas from raw/arg-schemas.source.json ({queryName ->
+    # {argKey -> serialized zod schema}}). When present, resolve() uses them to
+    # tell OPTIONAL unknown keys (omission is valid — real clients omit optional
+    # args they don't use) from REQUIRED unknown keys (a real unresolvable-args
+    # signal). See reports/g29-shape-analysis.md fix 2.
+    arg_schemas: dict[str, dict] = field(default_factory=dict)
+    # Diagnostic twin of `unresolved` for keys omitted because the current
+    # schema marks them optional (does NOT fail resolution).
+    optional_omitted: dict[str, int] = field(default_factory=dict)
     _zipf_cdf: dict[int, list[float]] = field(default_factory=dict)
 
     @classmethod
     def from_pool_file(cls, path: Optional[str], rng: random.Random,
-                       zipf_s: float = 0.0) -> "ArgResolver":
+                       zipf_s: float = 0.0,
+                       query_schemas: Optional[dict] = None) -> "ArgResolver":
         ids: dict[str, list[Any]] = {}
         scalars = {k: list(v) for k, v in DEFAULT_SCALARS.items()}
         if path:
@@ -174,7 +189,16 @@ class ArgResolver:
             for k, v in pool.get("scalars", {}).items():
                 if v:
                     scalars[k] = list(v)
-        return cls(ids=ids, scalars=scalars, rng=rng, zipf_s=zipf_s)
+        arg_schemas = {}
+        if query_schemas:
+            # accepts the "queries" map of raw/arg-schemas.source.json:
+            # {name: {"args": {key: schema}}} (or a pre-flattened {name: {key: schema}})
+            for name, entry in query_schemas.items():
+                if isinstance(entry, dict):
+                    arg_schemas[name] = entry.get("args") if "args" in entry else entry
+        return cls(ids=ids, scalars=scalars, rng=rng, zipf_s=zipf_s,
+                   arg_schemas={k: v for k, v in arg_schemas.items()
+                                if isinstance(v, dict)})
 
     def _pick(self, pool: list[Any]) -> Any:
         """Rank-based Zipf pick over a hotness-ordered pool (uniform when zipf_s<=0)."""
@@ -191,8 +215,12 @@ class ArgResolver:
             self._zipf_cdf[n] = cdf
         return pool[bisect.bisect_left(cdf, self.rng.random())]
 
-    def _resolve_key(self, key: str) -> tuple[Any, bool]:
-        """Return (value, resolved?). Handles Id/Ids plurals and scalar fallbacks."""
+    def _resolve_key(self, key: str, record: bool = True) -> tuple[Any, bool]:
+        """Return (value, resolved?). Handles Id/Ids plurals and scalar fallbacks.
+
+        record=False leaves the unresolved-diagnostics bookkeeping to the
+        caller (resolve() classifies optional vs required misses itself);
+        direct callers (mutation arg builders) keep the default."""
         if key in self.ids:
             return self._pick(self.ids[key]), True
         if key in self.scalars:
@@ -215,19 +243,45 @@ class ArgResolver:
         # beyond the validation error path. Omission lets optional-arg queries
         # hydrate and turns required-arg misses into plain "Required" errors
         # (same unresolvable-args class as before, cleaner attribution).
-        self.unresolved[key] = self.unresolved.get(key, 0) + 1
+        if record:
+            self.unresolved[key] = self.unresolved.get(key, 0) + 1
         return None, False
+
+    def _omittable(self, query_name: str, key: str) -> bool:
+        """True when the CURRENT source schema says omitting `key` is valid:
+        the key is marked optional / has a default, or the current schema does
+        not know the key at all (a baseline key the backend no longer takes —
+        e.g. kanbanTicketsPage.dynamicFieldDateRanges — cannot be required by
+        it; zod strips unknown keys anyway). Returns False when we have no
+        schema for the query: then an unknown key keeps failing exactly as
+        before (that miss is a real signal)."""
+        schema = self.arg_schemas.get(query_name)
+        if not isinstance(schema, dict):
+            return False
+        s = schema.get(key)
+        if s is None:
+            return True
+        return bool(s.get("optional") or s.get("hasDefault"))
 
     def resolve(self, op: Op) -> tuple[dict[str, Any], bool]:
         """Build an args object for `op`. Returns (argsObj, fully_resolved?).
-        Unresolved keys are omitted from the args object (see _resolve_key)."""
+        Unresolved keys are omitted from the args object (see _resolve_key);
+        unresolved-but-OPTIONAL keys (per arg_schemas) omit WITHOUT failing —
+        resolver-suppression of optional-arg shapes was G29's fix-2 class
+        (kanbanTicketsPage, hierarchyCanvases, *CanvasesPaginated,
+        supportTicketsFilteredV3)."""
         args: dict[str, Any] = {}
         ok = True
         for key in op.args_keys:
-            val, resolved = self._resolve_key(key)
+            val, resolved = self._resolve_key(key, record=False)
             if resolved:
                 args[key] = val
-            ok = ok and resolved
+                continue
+            if self._omittable(op.name, key):
+                self.optional_omitted[key] = self.optional_omitted.get(key, 0) + 1
+                continue
+            self.unresolved[key] = self.unresolved.get(key, 0) + 1
+            ok = False
         return args, ok
 
 

@@ -759,6 +759,26 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
                 sides, a, quiesce_s=a.resume_quiesce_s,
                 quiesce_max_s=max(60.0, a.resume_quiesce_s * 3))
 
+    # Version-equalization: quiesce proves poke-QUIET, not convergence — a side
+    # whose replica is still catching up sits quietly at an older stateVersion,
+    # and the row diff would then compare two different watermarks (the G8
+    # "convergence skew" false-positive class: terminal cookies differing only
+    # by replication lag). Keep the readers alive and wait — bounded — for the
+    # laggard's stateVersion to reach the leader's before diffing. Irreducible
+    # skew is recorded so a residual row mismatch is attributable to
+    # environment lag rather than syncer behavior.
+    def _sv(c: str) -> str:  # stateVersion segment of a version-string cookie
+        return (c or "").split(":")[0]
+    version_skew = None
+    if sides[0].target != sides[1].target:  # self-diff: same replica, no skew
+        eq_deadline = time.perf_counter() + a.version_equalize_max_s
+        while (_sv(sides[0].last_cookie) != _sv(sides[1].last_cookie)
+               and time.perf_counter() < eq_deadline):
+            await asyncio.sleep(2.0)
+        if _sv(sides[0].last_cookie) != _sv(sides[1].last_cookie):
+            version_skew = {"primary": sides[0].last_cookie,
+                            "mirror": sides[1].last_cookie}
+
     # Final teardown (covers both the no-resume and post-resume paths).
     stop.set()
     for t in readers:
@@ -829,6 +849,7 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         "mutations_sent": muts["sent"],
         "mutations_acked": sides[0].lmid_acked,
         "quiesced": quiesced,
+        "version_skew": version_skew,
         "resume": resume_info,
         "cookie_primary": cookie_invariants(sides[0].mat),
         "cookie_mirror": cookie_invariants(sides[1].mat),
@@ -991,6 +1012,12 @@ async def amain(a: argparse.Namespace) -> int:
         "resume_errors": [{"pair": r["pair"], "error": r["resume"]["error"]}
                           for r in resume_errors],
         "total_mismatches": total_mismatch,
+        # Pairs whose terminal stateVersions never equalized within
+        # --version-equalize-max-s: any row mismatch on such a pair is
+        # environment replication lag, not (necessarily) syncer behavior.
+        "version_skew_pairs": [
+            {"pair": r["pair"], **r["version_skew"]}
+            for r in results if r.get("version_skew")],
         "hydration_parity_gap": total_hydration_gap,
         "only_primary_hydrated": only_primary_hydrated,
         "only_mirror_hydrated": only_mirror_hydrated,
@@ -1193,6 +1220,11 @@ def main() -> int:
     ap.add_argument("--resume-settle-s", type=float, default=8.0,
                     help="seconds for disconnect-window writes to replicate to both "
                          "replicas before reconnecting")
+    ap.add_argument("--version-equalize-max-s", type=float, default=90.0,
+                    help="after quiesce, wait up to this long for both sides' "
+                         "terminal stateVersions to match before diffing "
+                         "(absorbs replica catch-up lag; irreducible skew is "
+                         "reported as version_skew, not a row mismatch)")
     ap.add_argument("--resume-quiesce-s", type=float, default=20.0,
                     help="poke-quiet time required on both sides after a resume "
                          "reconnect before diffing (short — the catch-up delta "
