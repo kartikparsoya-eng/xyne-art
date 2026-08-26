@@ -362,6 +362,15 @@ def diff_states(a: Materializer, b: Materializer, max_examples: int = 3) -> dict
             zero_dumps.append({"table": table, "side": "mirror-only",
                               "first_row": rb[first_k], "count_primary": 0,
                               "count_mirror": len(rb)})
+    dump_tbl = _os.environ.get("DIFF_ORACLE_DUMP_TABLE")
+    if dump_tbl:
+        import sys as _sys
+        pa = sorted(a.state.get(dump_tbl, {}).keys())
+        pb = sorted(b.state.get(dump_tbl, {}).keys())
+        shared = sorted(set(pa) & set(pb))
+        print(f"[dump] {dump_tbl} PRIMARY({len(pa)}): {pa}", file=_sys.stderr)
+        print(f"[dump] {dump_tbl} MIRROR({len(pb)}): {pb}", file=_sys.stderr)
+        print(f"[dump] {dump_tbl} SHARED({len(shared)}): {shared}", file=_sys.stderr)
     return {"mismatches": total, "per_table": per_table,
             "examples": examples, "column_diffs": column_diffs,
             "zero_result_dumps": zero_dumps}
@@ -486,6 +495,9 @@ async def reader(side: Side, stop: asyncio.Event) -> None:
         elif tag == "error":
             kind = body.get("kind", "unknown")
             side.mat.error_kinds[kind] = side.mat.error_kinds.get(kind, 0) + 1
+            import os as _os2, sys as _sys2
+            if _os2.environ.get("DIFF_ORACLE_LOG_ERRORS"):
+                print(f"[err] {side.target} kind={kind} body={json.dumps(body)[:600]}", file=_sys2.stderr)
         elif tag == "transformError":
             side.mat.error_kinds["transformError"] = \
                 side.mat.error_kinds.get("transformError", 0) + 1
