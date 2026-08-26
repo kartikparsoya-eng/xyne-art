@@ -670,6 +670,30 @@ def main() -> int:
             "steady_slope_per_hour": (round(steady_slope, 1)
                                       if steady_slope is not None else None),
         }
+    # G7 CVR drain metrics: for the ART client-group instance count, measure
+    # whether it DRAINS after its peak (clients leaving + server CVR-GC
+    # reclaiming) and how long the post-peak window was. The gate needs this to
+    # tell "GC never had a chance (post-peak window < inactivity threshold)"
+    # apart from "GC ran but reclaimed nothing" — the #113 distinction that a
+    # first/last/max summary alone cannot make. Computed off the full series.
+    art_series = [(r["ts"], r.get("cvr_art_instances")) for r in rows
+                  if r.get("cvr_art_instances") is not None]
+    if art_series and "cvr_art_instances" in summary:
+        peak_val = max(v for _, v in art_series)
+        peak_ts = next(ts for ts, v in art_series if v == peak_val)
+        after_peak = [v for ts, v in art_series if ts >= peak_ts]
+        min_after_peak = min(after_peak) if after_peak else peak_val
+        end_ts = art_series[-1][0]
+        post_peak_window_s = round(end_ts - peak_ts, 1)
+        drain_frac = (round((peak_val - min_after_peak) / peak_val, 4)
+                      if peak_val else 0.0)
+        summary["cvr_art_instances"].update({
+            "min_after_peak": min_after_peak,
+            "peak_ts": round(peak_ts, 1),
+            "post_peak_window_s": post_peak_window_s,
+            "drain_frac": drain_frac,
+        })
+
     spath = heap_prefix + ".summary.json"
 
     # G6b goroutine leak detection: if the run was >=15min, assert

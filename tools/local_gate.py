@@ -141,6 +141,11 @@ def main() -> int:
                     help="probe_readiness.py report json for gate G19 (default: skip)")
     ap.add_argument("--drain", default=None,
                     help="drain_test.py report json for gate G20 (default: skip)")
+    ap.add_argument("--cvr-gc-threshold-hours", type=float,
+                    default=float(os.environ.get(
+                        "ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS", "48")),
+                    help="server CVR-GC inactivity threshold; G7 only asserts drain "
+                         "once the post-peak window exceeds it (default: env or 48h)")
     ap.add_argument("--determinism", default=None,
                     help="determinism_oracle.py report json for gate G21 (default: skip)")
     ap.add_argument("--capacity", default=None,
@@ -462,27 +467,50 @@ def main() -> int:
         if wv in ("PASS", "FAIL", "WATCH"):
             results.append(("G6-WAL reclaim", wv, wr.get("note", "")))
 
-    # G7 CVR GC (WATCH) — enhanced with GC timing (#6)
+    # G7 CVR GC — threshold-aware drain assertion (#134).
+    #
+    # The old gate was WATCH-only ("still growing at run end") and could never
+    # FAIL, so a genuinely-broken server CVR-GC looked identical to a short run
+    # where GC was simply not yet eligible. The #113 investigation showed the
+    # deciding factor is the POST-PEAK WINDOW vs the GC inactivity threshold:
+    # CVR-GC only reclaims a client group after it has been idle for
+    # `garbageCollectionInactivityThresholdHours`. So:
+    #   - grew but drained from peak            -> PASS (GC reclaiming)
+    #   - grew, did NOT drain, and post-peak
+    #     window >= GC threshold (GC HAD a
+    #     chance)                               -> FAIL (GC not reclaiming)
+    #   - grew, did NOT drain, but post-peak
+    #     window < GC threshold (not eligible)  -> WATCH (inconclusive)
+    #   - never grew                            -> PASS (stable)
+    # drain_frac / post_peak_window_s come from the sampler's full time series.
+    DRAIN_MIN = 0.5  # must reclaim >=50% of the growth to count as drained
     if resources and "cvr_art_instances" in resources:
         v = resources["cvr_art_instances"]
-        growing = v["last"] >= v["max"] and v["last"] > v["first"]
-        detail = (f"art client groups {v['first']} -> {v['last']} "
-                  f"(max {v['max']})")
-        if growing:
-            detail += " — still growing at run end; check GC"
+        first, last, mx = v["first"], v["last"], v["max"]
+        grew = mx > first
+        drain_frac = v.get("drain_frac")
+        post_peak_s = v.get("post_peak_window_s")
+        gc_threshold_s = a.cvr_gc_threshold_hours * 3600.0
+        base = f"art client groups {first} -> {last} (max {mx})"
+        drained = drain_frac is not None and (
+            drain_frac >= DRAIN_MIN or last <= first * 1.1)
+        if not grew:
+            results.append(("G7 cvr-gc", "PASS", base + " — stable, no growth"))
+        elif drained:
+            results.append(("G7 cvr-gc", "PASS",
+                            f"{base} — drained {(drain_frac or 0) * 100:.0f}% "
+                            f"from peak (server CVR-GC reclaiming)"))
+        elif post_peak_s is not None and post_peak_s >= gc_threshold_s:
+            results.append(("G7 cvr-gc", "FAIL",
+                            f"{base} — reclaimed only {(drain_frac or 0) * 100:.0f}% "
+                            f"after {post_peak_s:.0f}s post-peak >= GC threshold "
+                            f"{a.cvr_gc_threshold_hours:g}h; server CVR-GC not draining"))
         else:
-            # CVR count decreased from peak — measure GC timing (#6)
-            declined = v["max"] - v["last"]
-            if declined > 0 and v["max"] > v["first"]:
-                # estimate GC delay: if count dropped, how much?
-                # We don't have per-sample timestamps in the summary, so
-                # report the decline amount — the resource sampler ndjson
-                # has the full time series for drill-down
-                detail += (f" — GC reclaimed {declined} CG(s) "
-                           f"(peak {v['max']} -> end {v['last']})")
-            else:
-                detail += " — stable"
-        results.append(("G7 cvr-gc", "WATCH" if growing else "PASS", detail))
+            pp = f"{post_peak_s:.0f}s" if post_peak_s is not None else "?"
+            results.append(("G7 cvr-gc", "WATCH",
+                            f"{base} — still elevated but post-peak window {pp} < GC "
+                            f"threshold {a.cvr_gc_threshold_hours:g}h; inconclusive "
+                            f"(CVR-GC not yet eligible — extend the idle window to assert)"))
     else:
         results.append(("G7 cvr-gc", "SKIP", "no resource summary"))
 
