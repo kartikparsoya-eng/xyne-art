@@ -200,10 +200,19 @@ bootstrap_art_container() {  # $1 = image
   # ZERO_SECRET not always set — fall back to ZERO_AUTH_SECRET (same value in sandbox)
   [ -z "$ZERO_SECRET" ] && ZERO_SECRET="$AUTH_SECRET"
   PPROF_PORT="${OVERRIDE_PPROF_PORT:-6061}"
+  # Expose the FIRST rust shard's HTTP port so the profiling endpoints (/census,
+  # and /debug/pprof/flamegraph when the image is built with
+  # RUST_SYNCER_FEATURES=profiling) are reachable at host:$PPROF_PORT. The rust
+  # syncer binds HTTP on RUST_SYNCER_HTTP_BASE_PORT + shard_id (default base
+  # 3200, main.ts:74) — NOT 6061. Mapping 6061:6061 reached nothing, which is
+  # why B1 got "Connection refused" even before the feature was baked. Map the
+  # real base port (override with ART_RUST_HTTP_BASE_PORT if the dispatcher's
+  # ZERO_RUST_SYNCER_HTTP_BASE_PORT is customized).
+  RUST_HTTP_BASE_PORT="${ART_RUST_HTTP_BASE_PORT:-3200}"
   docker run -d \
     --name "$ART_NAME" \
     --network sandbox-net \
-    -p ${PPROF_PORT}:6061 \
+    -p ${PPROF_PORT}:${RUST_HTTP_BASE_PORT} \
     -p 127.0.0.1::4848 \
     $CPU_FLAGS $MEM_FLAGS \
     -e ZERO_AUTH_SECRET="$AUTH_SECRET" \
