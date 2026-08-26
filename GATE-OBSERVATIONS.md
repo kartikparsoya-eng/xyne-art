@@ -55,9 +55,27 @@ Wire the ported planner into the engine, mirroring TS `buildPipeline`:
   unit tests unchanged).
 - `rust-syncer/.../pipeline_driver.rs::build_engine`: pass the replica
   `SharedConn` via `set_cost_model_conn` for the TableSource-backed path.
-PERF NOTE: this adds `COUNT(*)`-per-table per hydrate; switch to
-`create_snapshot_cost_model_cached` (keyed by replica version) before the G25/
-capacity gate if it shows up.
+PERF NOTE: this adds `COUNT(*)`-per-table per hydrate. A batch-shared cache
+(`8521d0ec4`) bounds it to once-per-table per hydration. Further amortization
+across concurrent CGs (version-keyed `create_snapshot_cost_model_cached`) is a
+follow-up only if the capacity ladder needs it — see the validated latency
+below, which is already at TS parity.
+
+### VALIDATED END-TO-END (2026-08-27, image `zero-cache-rust-syncer:g8fix2`)
+Rebuilt the candidate image with the fix + batch-cache and re-ran the oracle vs
+the TS 1.9 mirror:
+- **`--only-ops myChannelParticipations` → 0 `channels` only_primary** (was 9).
+  primary rows=9/1t, mirror rows=9/1t, mismatches=0. G8 CLOSED.
+- **Full-catalog sweep → PASS, `catalog_driven=150/150`, 0 mismatches**, 0
+  protocol/connect/cookie/rowKey violations. The global planner change matches
+  TS across the ENTIRE query catalog — no new divergences.
+- **Latency (median per-query hydrate p50):** g8fix2 rust = **166.9 ms** vs TS
+  1.9 mirror = **153.1 ms** (~9% of TS). The planner-OFF old-rust was 87.9 ms
+  ONLY because it skipped planning (the bug); TS pays the same planning cost, so
+  wiring the planner brings rust to TS latency parity, NOT a regression. Both
+  containers sat at ~0% CPU through the sweep (COUNT is IO, not CPU-bound).
+Repro: `xyne-art/validate-g8fix2.sh` (single-op) + full-catalog via
+`diff_oracle --full-catalog`.
 
 ### (historical) earlier misreads, now corrected
 - "strict superset, 18 vs 9 channels" — the 9 shared rows are
