@@ -218,7 +218,11 @@ bootstrap_art_container() {  # $1 = image
     -e ZERO_MUTATE_URL="http://xyne-sandbox-rust-test-backend:3001/api/zero/push" \
     -e ZERO_SYNCER=rust \
     -e ZERO_RUST_SYNCER_PATH=/usr/local/bin/rust-syncer \
-    -e ZERO_NUM_SYNC_WORKERS=4 \
+    -e ZERO_NUM_SYNC_WORKERS="${SYNC_WORKERS:-4}" \
+    ${SYNCER_SHARDS:+-e ZERO_SYNCER_SHARDS=$SYNCER_SHARDS} \
+    ${CVR_CONNS:+-e ZERO_CVR_MAX_CONNS=$CVR_CONNS} \
+    -e ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS="${CVR_GC_THRESHOLD_HOURS:-1}" \
+    -e ZERO_CVR_GARBAGE_COLLECTION_INITIAL_INTERVAL_SECONDS="${CVR_GC_INTERVAL_SECONDS:-30}" \
     -e OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_ENDPOINT:-http://otel-collector:4318}" \
     -e OTEL_METRIC_EXPORT_INTERVAL=5000 \
     -v zero_cache_art_rust_test:/var/zero \
