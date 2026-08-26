@@ -326,7 +326,11 @@ if curl -sf --connect-timeout 2 "$PROM_URL" >/dev/null 2>&1; then
   PROM_AVAILABLE=1
 fi
 if [ -n "$OVERRIDE_PPROF_PORT" ]; then
-  PPROF_FLAGS=(--pprof "http://localhost:$OVERRIDE_PPROF_PORT")
+  # The rust candidate has no Go pprof runtime; when built with the profiling
+  # feature (baked into the candidate image via RUST_SYNCER_FEATURES=profiling)
+  # it serves /debug/pprof/flamegraph on this port. Capture in rust flavor so
+  # the sampler grabs a flamegraph SVG instead of failing on Go endpoints (B1).
+  PPROF_FLAGS=(--pprof "http://localhost:$OVERRIDE_PPROF_PORT" --pprof-flavor rust)
 elif [ "$SWAP" = "1" ]; then
   # --swap: TS 1.7 becomes the PRIMARY (replay/negative/sampler/clean target),
   # Go becomes the oracle MIRROR. Validates the reference itself: TS latency
@@ -339,6 +343,10 @@ elif [ "$SWAP" = "1" ]; then
   MIRROR_POD="xyne-sandbox-${SANDBOX}-zero-cache"
   MIRROR_URL="ws://${SANDBOX}.localhost/zero"
   PPROF_FLAGS=(--pprof '')   # TS pod is Node — no Go pprof endpoint
+elif [ -n "$HTTP_PORT" ]; then
+  # No explicit --pprof-port and not a --swap (TS) run: the rust candidate's
+  # flamegraph lives on the syncer HTTP port. Capture it in rust flavor (B1).
+  PPROF_FLAGS=(--pprof "http://localhost:$HTTP_PORT" --pprof-flavor rust)
 fi
 MUTATE_URL="$OVERRIDE_MUTATE_URL"
 if [ -z "$MUTATE_URL" ]; then

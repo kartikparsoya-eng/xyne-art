@@ -109,6 +109,23 @@ def snapshot_cpu_profile(base: str, path: str, duration_s: int = 30) -> None:
         print(f"  (cpu profile failed: {e})", file=sys.stderr)
 
 
+def snapshot_flamegraph(base: str, path: str, seconds: int = 30) -> None:
+    """Capture an on-CPU flamegraph SVG from the RUST syncer.
+
+    The rust syncer has no Go pprof runtime; when built with the `profiling`
+    feature (baked into the candidate image via RUST_SYNCER_FEATURES=profiling)
+    it serves `GET /debug/pprof/flamegraph?seconds=N` on its HTTP port, sampling
+    the whole process at 99Hz and returning a flamegraph SVG. This is the rust
+    analog of the Go cpu-profile capture (B1)."""
+    try:
+        url = f"{base}/debug/pprof/flamegraph?seconds={seconds}"
+        with urllib.request.urlopen(url, timeout=seconds + 15) as r:
+            with open(path, "wb") as f:
+                f.write(r.read())
+    except Exception as e:
+        print(f"  (rust flamegraph capture failed: {e})", file=sys.stderr)
+
+
 def snapshot_trace(base: str, path: str, duration_s: int = 10) -> None:
     """Capture a runtime/trace for GC pause analysis (#3).
     go tool trace shows GC pause durations, syscall blocking, and scheduler
@@ -553,7 +570,14 @@ def main() -> int:
                     help="ZERO_APP_ID — used to construct the shard and cvr schema names")
     ap.add_argument("--cvr-schema", default="sandbox_rust_test_0/cvr")
     ap.add_argument("--pprof", default="http://localhost:6060",
-                    help="Go pprof base URL ('' to disable)")
+                    help="profiler base URL ('' to disable). For --pprof-flavor go "
+                         "this is the Go pprof base; for rust it is the syncer HTTP "
+                         "port that serves /debug/pprof/flamegraph")
+    ap.add_argument("--pprof-flavor", choices=("go", "rust"), default="go",
+                    help="go = Node/Go-runtime pprof (heap/cpu/trace + goroutine/heap "
+                         "per-sample); rust = the rust syncer, which has NO Go runtime "
+                         "— capture a flamegraph SVG at start+end and skip the Go-only "
+                         "per-sample calls (fixes B1 'Connection refused')")
     ap.add_argument("--prom", default="",
                     help="Prometheus /metrics URL (e.g. http://localhost:9464/metrics) for OTel latency histograms")
     ap.add_argument("--interval", type=float, default=10.0)
@@ -570,11 +594,17 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_sig)
     signal.signal(signal.SIGINT, on_sig)
 
+    is_rust = a.pprof_flavor == "rust"
     heap_prefix = re.sub(r"\.ndjson$", "", a.out)
     if a.pprof:
-        snapshot_heap(a.pprof, heap_prefix + ".heap-first.pb.gz")
-        snapshot_cpu_profile(a.pprof, heap_prefix + ".cpu-profile.pb.gz", duration_s=30)
-        snapshot_trace(a.pprof, heap_prefix + ".trace.pb.gz", duration_s=10)
+        if is_rust:
+            # Rust has no Go pprof endpoints — capture an on-CPU flamegraph SVG
+            # from the profiling-feature endpoint instead (B1).
+            snapshot_flamegraph(a.pprof, heap_prefix + ".flame-first.svg", seconds=30)
+        else:
+            snapshot_heap(a.pprof, heap_prefix + ".heap-first.pb.gz")
+            snapshot_cpu_profile(a.pprof, heap_prefix + ".cpu-profile.pb.gz", duration_s=30)
+            snapshot_trace(a.pprof, heap_prefix + ".trace.pb.gz", duration_s=10)
 
     t0 = time.time()
     rows: list[dict] = []
@@ -582,7 +612,10 @@ def main() -> int:
         while not stop and (a.duration <= 0 or time.time() - t0 < a.duration):
             s: dict = {"ts": round(time.time() - t0, 1)}
             s.update(docker_stats(a.container))
-            if a.pprof:
+            # Go-runtime per-sample metrics (goroutines/heap/GC) only exist on the
+            # Node/Go pprof endpoint. The rust syncer has none — calling them would
+            # just spam "Connection refused" every interval (B1), so skip them.
+            if a.pprof and not is_rust:
                 s.update(go_runtime(a.pprof))
                 # GC pause tracking (#3): sample gc stats every interval
                 # so we can see if a latency spike correlates with a GC pause
@@ -607,8 +640,11 @@ def main() -> int:
                 time.sleep(0.1)
 
     if a.pprof:
-        snapshot_heap(a.pprof, heap_prefix + ".heap-last.pb.gz")
-        snapshot_cpu_profile(a.pprof, heap_prefix + ".cpu-profile-end.pb.gz", duration_s=30)
+        if is_rust:
+            snapshot_flamegraph(a.pprof, heap_prefix + ".flame-last.svg", seconds=30)
+        else:
+            snapshot_heap(a.pprof, heap_prefix + ".heap-last.pb.gz")
+            snapshot_cpu_profile(a.pprof, heap_prefix + ".cpu-profile-end.pb.gz", duration_s=30)
 
     metrics = ["cpu_pct", "rss_bytes", "goroutines", "heapalloc", "heapinuse",
                "heapsys", "cvr_instances", "cvr_art_instances",
