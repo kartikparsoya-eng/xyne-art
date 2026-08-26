@@ -299,6 +299,8 @@ def rowkey_invariants(mat: Materializer) -> dict:
 
 
 def diff_states(a: Materializer, b: Materializer, max_examples: int = 3) -> dict:
+    import os as _os
+    max_examples = int(_os.environ.get("DIFF_ORACLE_MAX_EXAMPLES", max_examples))
     """Diff two converged states. Returns {mismatches, per_table, examples,
     column_diffs, zero_result_dumps}.
 
@@ -540,8 +542,11 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         stale_catalog: list[str] = []
         seen: set[str] = set()
         unique_ops = []
+        only = getattr(a, "only_ops_set", None)
         for op in baseline.queries:
             if op.name in seen:
+                continue
+            if only is not None and op.name not in only:
                 continue
             seen.add(op.name)
             unique_ops.append(op)
@@ -906,6 +911,8 @@ def check_versions(target: str) -> str | None:
 
 async def amain(a: argparse.Namespace) -> int:
     baseline = load_baseline(a.baseline)
+    a.only_ops_set = (set(x.strip() for x in a.only_ops.split(",") if x.strip())
+                      if getattr(a, "only_ops", None) else None)
     a.current_query_names = None
     a.current_schema_doc = None
     if a.current_query_schema:
@@ -1193,6 +1200,10 @@ def main() -> int:
     ap.add_argument("--catalog-batch-size", type=int, default=50,
                     help="maximum full-catalog queries per client (default 50; "
                          "must remain below the server's desired-query limit)")
+    ap.add_argument("--only-ops", default=None,
+                    help="comma-separated query names: restrict --full-catalog to "
+                         "just these (for isolating a single diverging query — "
+                         "pair with --catalog-batch-size 1 to make each its own pair)")
     ap.add_argument("--current-query-schema", default="raw/arg-schemas.source.json",
                     help="source-derived current query catalog; baseline-only names are "
                          "reported as stale instead of sent to the app transformer")

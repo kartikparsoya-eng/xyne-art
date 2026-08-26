@@ -1111,8 +1111,14 @@ if [ "$IMAGEAUDIT" = "1" ]; then
   fi
   if [ -n "$IMAGE" ]; then
     echo "== image supply-chain audit (G23): $IMAGE =="
+    # Size budget split (B-SIZE / #149): the rust-syncer release images run
+    # 665-735MB (static SQLite + the wal2 build + tokio/reqwest), and the
+    # profiling-enabled candidate adds ~1MB of sampling symbols. The old
+    # 600/700 split FAILed every real image; 700/800 keeps a WATCH signal for
+    # unexpected growth past a lean 700MB while only hard-FAILing on genuine
+    # bloat >800MB (= image_audit.py's own default hard limit).
     set +e; "$PY" tools/image_audit.py --image "$IMAGE" \
-      --size-budget-mb 600 --size-hard-mb 700 \
+      --size-budget-mb 700 --size-hard-mb 800 \
       --expected-base sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 \
       --require-label org.opencontainers.image.base.name \
       --require-label org.opencontainers.image.revision \

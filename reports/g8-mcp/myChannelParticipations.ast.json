@@ -1,0 +1,133 @@
+{
+ "table": "channel_participants",
+ "where": {
+  "type": "and",
+  "conditions": [
+   {
+    "type": "simple",
+    "left": {
+     "type": "column",
+     "name": "userId"
+    },
+    "right": {
+     "type": "literal",
+     "value": "cms5vksku005e11z9mqhq1y2u"
+    },
+    "op": "="
+   },
+   {
+    "type": "simple",
+    "left": {
+     "type": "column",
+     "name": "role"
+    },
+    "right": {
+     "type": "literal",
+     "value": "ADMIN"
+    },
+    "op": "="
+   },
+   {
+    "type": "or",
+    "conditions": [
+     {
+      "type": "simple",
+      "left": {
+       "type": "column",
+       "name": "userId"
+      },
+      "right": {
+       "type": "literal",
+       "value": "cms5vksku005e11z9mqhq1y2u"
+      },
+      "op": "="
+     },
+     {
+      "type": "correlatedSubquery",
+      "related": {
+       "system": "client",
+       "correlation": {
+        "parentField": [
+         "channelId"
+        ],
+        "childField": [
+         "id"
+        ]
+       },
+       "subquery": {
+        "table": "channels",
+        "alias": "zsubq_channel",
+        "where": {
+         "type": "and",
+         "conditions": [
+          {
+           "type": "simple",
+           "left": {
+            "type": "column",
+            "name": "workspaceId"
+           },
+           "right": {
+            "type": "literal",
+            "value": "cms5vks5c001f11z9zud3tyfl"
+           },
+           "op": "="
+          },
+          {
+           "type": "or",
+           "conditions": [
+            {
+             "type": "simple",
+             "left": {
+              "type": "column",
+              "name": "visibility"
+             },
+             "right": {
+              "type": "literal",
+              "value": "PUBLIC"
+             },
+             "op": "="
+            },
+            {
+             "type": "correlatedSubquery",
+             "related": {
+              "system": "client",
+              "correlation": {
+               "parentField": [
+                "id"
+               ],
+               "childField": [
+                "channelId"
+               ]
+              },
+              "subquery": {
+               "table": "channel_participants",
+               "alias": "zsubq_participants",
+               "where": {
+                "type": "simple",
+                "left": {
+                 "type": "column",
+                 "name": "userId"
+                },
+                "right": {
+                 "type": "literal",
+                 "value": "cms5vksku005e11z9mqhq1y2u"
+                },
+                "op": "="
+               }
+              }
+             },
+             "op": "EXISTS"
+            }
+           ]
+          }
+         ]
+        }
+       }
+      },
+      "op": "EXISTS"
+     }
+    ]
+   }
+  ]
+ }
+}
