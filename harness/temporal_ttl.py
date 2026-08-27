@@ -83,14 +83,27 @@ async def main() -> int:
                 "ZERO_AUTH_SECRET unset — cannot mint a short-TTL token")
         return rep.finish()
 
-    # Derive sub + a fresh long-TTL token shape from the auth pool.
-    pool = []
-    try:
-        pool = load_auth() if callable(load_auth) else []
-    except Exception:
-        pool = []
-    pool_tok = (pool[0].get("token") if pool and isinstance(pool[0], dict) else None)
-    sub = os.environ.get("ART_TTL_SUB") or (_decode_sub(pool_tok) if pool_tok else None)
+    # Prefer an explicit ART_TTL_SUB; only touch the auth pool as a fallback.
+    # The pool may be a list[dict] or a dict keyed by userID (load_auth shape),
+    # so probe defensively — never index `pool[0]` blindly.
+    sub = os.environ.get("ART_TTL_SUB")
+    if not sub:
+        pool = None
+        try:
+            pool = load_auth() if callable(load_auth) else None
+        except Exception:
+            pool = None
+        first = None
+        if isinstance(pool, dict):
+            first = next(iter(pool.values()), None)
+        elif isinstance(pool, list) and pool:
+            first = pool[0]
+        pool_tok = None
+        if isinstance(first, dict):
+            pool_tok = first.get("token")
+        elif isinstance(first, str):
+            pool_tok = first
+        sub = _decode_sub(pool_tok) if pool_tok else None
     if not sub:
         rep.add("G-ttl", "SKIP", "no sub available (set ART_TTL_SUB)")
         return rep.finish()
