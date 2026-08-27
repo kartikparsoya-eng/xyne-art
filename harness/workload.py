@@ -310,6 +310,19 @@ def query_del(hash_: str) -> dict[str, Any]:
     return {"op": "del", "hash": hash_}
 
 
+def ast_query_put(ast: dict[str, Any], ttl_ms: int = 300_000) -> dict[str, Any]:
+    """A CLASSIC (client-AST) desired-query 'put' (queries-patch.ts: {op,hash,
+    ast,ttl}). Exercises the server's AST transform + read-permissions path
+    (read-authorizer transformAndHashQuery), which named custom queries skip —
+    the L8 path differential showed that path got zero differential traffic."""
+    return {
+        "op": "put",
+        "hash": stable_hash("__ast__" + ast.get("table", ""), ast),
+        "ast": ast,
+        "ttl": ttl_ms,
+    }
+
+
 def init_connection_message(
     desired_puts: list[dict[str, Any]],
     user_query_url: Optional[str] = None,

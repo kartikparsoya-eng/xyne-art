@@ -51,7 +51,8 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from workload import (  # noqa: E402
     ArgResolver, SchemaSynthesizer, WeightedSampler, MutationSampler, load_baseline,
-    query_put, query_del, change_desired_queries_message, init_connection_message,
+    ast_query_put, query_put, query_del, change_desired_queries_message,
+    init_connection_message,
     custom_mutation, push_message,
 )
 from protocol import encode_sec_protocols, DEFAULT_PROTOCOL_VERSION  # noqa: E402
@@ -586,6 +587,14 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
                 s.mat.hash_query[put["hash"]] = op.name
         for s in sides:
             s.mat.unresolved = unresolved
+            # One CLASSIC client-AST query rides along with the catalog so the
+            # AST-transform + read-permissions path gets differential traffic
+            # on BOTH sides (L8 blind spot). Deterministic shape => same hash.
+            initial_puts.append(ast_query_put({
+                "table": "channels",
+                "orderBy": [["id", "asc"]],
+                "limit": 5,
+            }))
             s.mat.stale_catalog = stale_catalog
         if unresolved:
             print(f"  [full-catalog pair {pair_idx}] {len(initial_puts)} queries subscribed, "
