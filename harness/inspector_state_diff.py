@@ -82,6 +82,27 @@ async def _session_and_inspect(side, token, cs) -> dict:
         change_desired_queries_message([ast_query_put(SCAN_AST, ttl_ms=300_000)])))
     await quiesce([side], quiet_s=1.5, max_s=20.0)
 
+    # Inspector protocol AUTH gate: every op except `authenticate` requires the
+    # CG to be inspector-authenticated (rust inspect_handler.rs:35 / TS
+    # inspect-handler.ts:39). Send the authenticate handshake first, else the
+    # queries/metrics ops just get an `{op:"authenticated",value:false}` challenge.
+    # NOTE (finding 2026-08-28): with NO admin password configured, TS answered
+    # `queries` WITHOUT this handshake (CG defaulted authenticated) while rust
+    # returned authenticated:false — a default-inspector-auth-state divergence to
+    # investigate (isAdminPasswordValid no-password behavior vs rust's default).
+    auth_pw = os.environ.get("IN_INSPECT_PASSWORD", "")
+    rid = uuid.uuid4().hex[:8]
+    before = len(side.frames)
+    try:
+        await side.ws.send(json.dumps(
+            ["inspect", {"op": "authenticate", "id": rid, "value": auth_pw}]))
+        await asyncio.sleep(1.0)
+    except Exception:
+        pass
+    authed = any(f.tag == "inspect" and f.body.get("op") == "authenticated"
+                 and f.body.get("value") is True for f in side.frames[before:])
+    side.step = 1 if authed else 0  # stash for the caller's note
+
     replies: dict[str, object] = {}
     for op in OPS:
         rid = uuid.uuid4().hex[:8]

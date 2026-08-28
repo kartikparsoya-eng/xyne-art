@@ -232,9 +232,13 @@ async def _stall_until_shed(side: Side, token: str, uid: str, cs: dict,
     fill. Capture the last frame before/at close and the close code."""
     init = ["initConnection", {"desiredQueriesPatch": [], "clientSchema": cs}]
     await open_side(side, token, init, extra=_extra(uid))
-    # Subscribe a broad query to generate backpressure, then do NOT drain recv.
-    await side.ws.send(json.dumps(change_desired_queries_message(
-        [ast_query_put({"table": SCAN_AST["table"], "limit": 100000}, ttl_ms=300_000)])))
+    # Subscribe SEVERAL broad queries to generate backpressure, then do NOT drain
+    # recv. Multiple large scans across tables raise the odds of overflowing the
+    # send buffer within the window (single-table row counts may be too small).
+    tables = os.environ.get("IV_SHED_TABLES", SCAN_AST["table"]).split(",")
+    puts = [ast_query_put({"table": t.strip(), "limit": 1000000}, ttl_ms=300_000)
+            for t in tables if t.strip()]
+    await side.ws.send(json.dumps(change_desired_queries_message(puts)))
     # Read exactly ONE frame (the connected/first poke) then stall.
     err_frame = None
     close_code = None
@@ -358,6 +362,60 @@ async def gate_ownership(rep: Report, token: str, uid: str, cs: dict) -> None:
                 f"ownership-contest loser frame diverges: rust={rk!r} ts={tk!r}")
 
 
+# --------------------------------------------------------------------------- #
+# I-5 — Drop-based teardown / drain → clients rehome (graceful)
+# --------------------------------------------------------------------------- #
+async def gate_drain(rep: Report, token: str, uid: str, cs: dict) -> None:
+    """On drain (graceful shutdown) the view-syncer stops and connected clients
+    must be REHOMED (an error frame directing reconnect), identically on both.
+    Fully triggering a drain restarts the shared container, so this is opt-in:
+    set IV_DRAIN_CMD to a shell command that drains ONE side (e.g. a SIGTERM to a
+    throwaway candidate), else SKIP with the contract documented."""
+    cmd = os.environ.get("IV_DRAIN_CMD")
+    if not cmd:
+        rep.add("G49/I-5:drain", "SKIP",
+                "IV_DRAIN_CMD unset — drain restarts the shared container. Contract "
+                "(INVENTIONS.md I-5): on graceful drain, connected clients receive a "
+                "Rehome frame then close, identically on rust and TS. Wire a "
+                "throwaway-candidate drain to activate.")
+        return
+    rust, ts = make_sides()
+    frames = {}
+    for side in (rust, ts):
+        try:
+            init = ["initConnection", {"desiredQueriesPatch": [], "clientSchema": cs}]
+            await open_side(side, token, init, extra=_extra(uid))
+            stop = asyncio.Event()
+            asyncio.create_task(reader(side, stop))
+            await side.ws.send(json.dumps(
+                change_desired_queries_message([ast_query_put(SCAN_AST, ttl_ms=300_000)])))
+            await quiesce([side], quiet_s=1.0, max_s=10)
+        except Exception as e:
+            rep.add("G49/I-5:drain", "SKIP", f"setup failed: {e!r:.70}")
+            return
+    import subprocess
+    try:
+        subprocess.run(cmd, shell=True, timeout=30)
+    except Exception as e:
+        rep.add("G49/I-5:drain", "SKIP", f"drain cmd failed: {e!r:.70}")
+        return
+    await asyncio.sleep(5)
+    for side in (rust, ts):
+        errs = [f.body for f in side.frames if f.tag == "error"]
+        frames[side.name] = errs[-1] if errs else None
+    rk = (frames.get("rust") or {}).get("kind")
+    tk = (frames.get("ts") or {}).get("kind")
+    if rk == tk and rk is not None:
+        rep.add("G49/I-5:drain", "PASS",
+                f"drain rehomes both identically (kind={rk})")
+    elif rk == tk:
+        rep.add("G49/I-5:drain", "WATCH",
+                "neither side emitted a drain frame (drain may not have reached clients)")
+    else:
+        rep.add("G49/I-5:drain", "FAIL",
+                f"drain frame diverges: rust={rk!r} ts={tk!r}")
+
+
 async def run() -> int:
     rep = Report(os.path.join("reports", f"invention-{TAG}.json"))
     try:
@@ -366,7 +424,8 @@ async def run() -> int:
     except Exception as e:
         rep.add("G49/invention", "SKIP", f"setup unavailable: {e!r:.80}")
         return rep.finish()
-    for gate in (gate_connect_ack, gate_push_parity, gate_shed, gate_ownership):
+    for gate in (gate_connect_ack, gate_push_parity, gate_shed, gate_ownership,
+                 gate_drain):
         try:
             await gate(rep, token, uid, cs)
         except Exception as e:
