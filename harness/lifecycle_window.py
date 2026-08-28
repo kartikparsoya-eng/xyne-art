@@ -43,7 +43,7 @@ from workload import (  # noqa: E402
     ast_query_put, query_del, change_desired_queries_message,
 )
 from gate_introspect import (  # noqa: E402
-    docker_logs_since, scrape_metrics, sum_by_name,
+    docker_logs_since, scrape_metrics_for, sum_by_name,
 )
 
 TAG = os.environ.get("ART_TAG", time.strftime("%Y%m%d-%H%M%S"))
@@ -135,7 +135,7 @@ async def run() -> int:
     rust, ts = make_sides()
 
     # Baseline server counters BEFORE the disconnect, per side.
-    pre = {"rust": scrape_metrics(RUST_CONTAINER), "ts": scrape_metrics(TS_CONTAINER)}
+    pre = {"rust": scrape_metrics_for("rust"), "ts": scrape_metrics_for("ts")}
     if not pre["rust"] or not pre["ts"]:
         rep.add("B/lifecycle-window", "SKIP",
                 "metrics endpoint unavailable on one/both sides "
@@ -158,7 +158,7 @@ async def run() -> int:
     await asyncio.sleep(KEEPALIVE_HOLD_S)
     window_s = time.time() - window_start
 
-    post = {"rust": scrape_metrics(RUST_CONTAINER), "ts": scrape_metrics(TS_CONTAINER)}
+    post = {"rust": scrape_metrics_for("rust"), "ts": scrape_metrics_for("ts")}
     logs = {
         "rust": docker_logs_since(RUST_CONTAINER, window_s + 2),
         "ts": docker_logs_since(TS_CONTAINER, window_s + 2),

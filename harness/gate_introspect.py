@@ -91,6 +91,38 @@ def scrape_metrics(container: str) -> dict[str, float]:
     return parse_prom(scrape_metrics_text(container))
 
 
+def _http_get(url: str) -> str:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _filter_host(text: str, host: str) -> str:
+    """Keep only exposition lines whose series carries host_name="<host>"."""
+    if not host:
+        return text
+    needle = f'host_name="{host}"'
+    return "\n".join(ln for ln in text.splitlines()
+                     if ln.startswith("#") or needle in ln)
+
+
+def scrape_metrics_for(side: str) -> dict[str, float]:
+    """Metrics for one side ("rust"|"ts"). Prefers a shared Prometheus endpoint
+    (the otel-collector at AB_METRICS_URL) filtered by that side's `host_name`
+    (AB_{RUST,TS}_METRIC_HOST) — since zero-cache exports via OTLP push, not a
+    per-container scrape endpoint. Falls back to `docker exec … curl` on the
+    side's container (AB_{RUST,TS}_CONTAINER)."""
+    url = os.environ.get("AB_METRICS_URL")
+    if url:
+        host = os.environ.get(f"AB_{side.upper()}_METRIC_HOST", "")
+        return parse_prom(_filter_host(_http_get(url), host))
+    container = os.environ.get(f"AB_{side.upper()}_CONTAINER", "")
+    return scrape_metrics(container)
+
+
 def series_names(metrics: dict[str, float]) -> set[str]:
     """The set of (name{labels}) series keys present."""
     return set(metrics.keys())
