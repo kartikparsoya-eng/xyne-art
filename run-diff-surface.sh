@@ -64,5 +64,11 @@ echo
 echo "══ diff-surface: inspector state differential (G48/E — inspect content parity) ══"
 python3 harness/inspector_state_diff.py
 S8=$?
+echo
+echo "══ diff-surface: invention-contract differentials (G49 — I-1/I-3/I-4 + ownership) ══"
+# Runtime proofs of the INVENTIONS.md contracts — the seams both prod outages
+# lived in (connect-ack=I-1/I-2, push-relay=I-3). SKIP-safe per sub-gate.
+python3 harness/invention_oracles.py
+S9=$?
 
-exit $(( S1 || S2 || S3 || S4 || S5 || S6 || S7 || S8 ))
+exit $(( S1 || S2 || S3 || S4 || S5 || S6 || S7 || S8 || S9 ))

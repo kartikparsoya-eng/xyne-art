@@ -68,6 +68,45 @@ exit is 1 iff any sub-check `FAIL`ed.
 | `AB_METRICS_PORTS` | `8081,4848,9090,4849` | B/C | in-container ports to probe for `/metrics` |
 | `IN_OPS` | `queries,version,metrics` | E | inspect ops to diff |
 
+## G49 — invention-contract differentials (I-1/I-3/I-4 + ownership)
+
+`invention_oracles.py` gives each `parity/INVENTIONS.md` construct a RUNTIME
+differential (they were pinned only by in-process unit tests). Both prod outages
+lived here.
+
+| Sub-gate | Contract | Live result on gates-9fe30a683 |
+|---|---|---|
+| I-1/I-2 connect-ack | `connected` precedes hydrate (not serialized behind CG hydrate) | ✅ PASS (rust 137ms, ts 104ms) — **prod-bug-1 fix confirmed** |
+| I-3 push-parity | same mutation → same result + lmid, **zero 401** (stale-auth) | ✅ PASS (`markChannelAsViewed`, lmid advanced, no 401) — **prod-bug-2 fix confirmed** |
+| I-4 shed | slow consumer shed with a `Rehome` frame, not a bare drop | ⏭️ SKIP unless backpressure triggers — raise `IV_SHED_HOLD_S` / query breadth |
+| I-1 ownership | double-connect resolves with matching client frames | finding: rust sends `Rehome` on same-client supersede, TS none — investigate |
+
+Needs `harness/id-pool.sandbox.json` for the I-3 mutation args (`IV_ID_POOL`).
+
+## Live-run recipe (the pair the gates actually need)
+
+The gates are differential — they need BOTH a rust candidate and a client-serving
+TS reference, host-reachable, on the shared PG. In the rust-test sandbox:
+
+```bash
+# rust candidate on the new image, via the /zero-art traefik route
+#   (bootstrap_art_container in run-art-local.sh, or docker run … -l traefik…/zero-art)
+# TS reference: the /zero-ts route is MIRROR-ONLY (WS handshake times out), so
+#   republish the -ts container with a host port + its replica volume:
+docker run -d --name xyne-sandbox-rust-test-zero-cache-ts --network sandbox-net \
+  --env-file <ts.env> -e ZERO_SYNCER=ts -p 4849:4848 \
+  -v rust-test_zero_cache_ts_rust_test:/var/zero  <ts-image>
+
+export AB_RUST_WS=ws://rust-test.localhost/zero-art  AB_TS_WS=ws://localhost:4849
+export AB_RUST_CVR=sandbox_rust_test_art_0/cvr       AB_TS_CVR=sandbox_rust_test_ts_0/cvr
+export AB_RUST_CONTAINER=xyne-sandbox-rust-test-zero-cache-art
+export AB_TS_CONTAINER=xyne-sandbox-rust-test-zero-cache-ts
+# B/C metrics: zero-cache pushes via OTLP → scrape the collector, filter by host:
+export AB_METRICS_URL=http://localhost:9464/metrics
+export AB_RUST_METRIC_HOST=<rust-art container id>  AB_TS_METRIC_HOST=<ts container id>
+./run-diff-surface.sh          # G32–G49
+```
+
 ## Extending
 
 - **D**: enrich the `CANON` vocabulary from the #142 signature DB as coverage grows.
