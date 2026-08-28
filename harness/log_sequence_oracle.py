@@ -63,6 +63,10 @@ def _token() -> str:
     return load_auth()["token"]
 
 
+def _extra() -> dict:
+    return {"userID": load_auth().get("userID") or ""}
+
+
 def canonical_sequence(logs: str) -> list[str]:
     """Ordered list of canonical events recognized in the log text."""
     seq = []
@@ -84,7 +88,7 @@ def counts(seq: list[str]) -> dict[str, int]:
 
 async def _drive(side, token, cs) -> None:
     init = ["initConnection", {"desiredQueriesPatch": [], "clientSchema": cs}]
-    await open_side(side, token, init)
+    await open_side(side, token, init, extra=_extra())
     stop = asyncio.Event()
     rt = asyncio.create_task(reader(side, stop))
     put = ast_query_put(SCAN_AST, ttl_ms=SHORT_TTL_MS)

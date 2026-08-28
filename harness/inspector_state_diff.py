@@ -43,6 +43,10 @@ def _token() -> str:
     return load_auth()["token"]
 
 
+def _extra() -> dict:
+    return {"userID": load_auth().get("userID") or ""}
+
+
 def _norm_queries(value) -> set:
     """Canonicalize an inspect `queries` reply to a set of (name|id, got, deleted)."""
     rows = value if isinstance(value, list) else (value.get("value") if isinstance(value, dict) else [])
@@ -71,7 +75,7 @@ async def _session_and_inspect(side, token, cs) -> dict:
     """Establish a session, subscribe a query, then run every inspect op and
     return {op: reply_body}."""
     init = ["initConnection", {"desiredQueriesPatch": [], "clientSchema": cs}]
-    await open_side(side, token, init)
+    await open_side(side, token, init, extra=_extra())
     stop = asyncio.Event()
     rt = asyncio.create_task(reader(side, stop))
     await side.ws.send(json.dumps(

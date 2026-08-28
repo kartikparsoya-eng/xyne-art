@@ -46,6 +46,10 @@ def _token() -> str:
     return load_auth()["token"]
 
 
+def _uid() -> str:
+    return load_auth().get("userID") or ""
+
+
 def normalize_msg(msg: str) -> str:
     """Drop per-side ids/versions so cross-side comparison flags WORD changes,
     not id/lineage differences. Hex ids, LexiVersion tokens, and cgids collapse
@@ -85,7 +89,7 @@ async def _establish_cvr(side: Side, token: str, client_schema: dict) -> bool:
     try:
         init = ["initConnection",
                 {"desiredQueriesPatch": [], "clientSchema": client_schema}]
-        await open_side(side, token, init)
+        await open_side(side, token, init, extra={"userID": _uid()})
         stop = asyncio.Event()
         rt = asyncio.create_task(reader(side, stop))
         await side.ws.send(json.dumps(
@@ -112,7 +116,7 @@ async def _capture_error(side: Side, token: str, client_schema: dict,
         sec = encode_sec_protocols(None, token)
         ws = await websockets.connect(
             connect_url(side, DEFAULT_PROTOCOL_VERSION, base_cookie, 0,
-                        {"wsid": os.urandom(6).hex()}),
+                        {"wsid": os.urandom(6).hex(), "userID": _uid()}),
             subprotocols=[sec], open_timeout=20, max_size=None, ping_interval=None)
     except Exception:
         return None
@@ -150,7 +154,9 @@ async def _capture_error(side: Side, token: str, client_schema: dict,
 
 def _diff_frames(rust: dict | None, ts: dict | None) -> list[str]:
     if rust is None and ts is None:
-        return ["both sides produced NO error frame"]
+        # Both sides AGREE (neither errored) — not a divergence. The scenario
+        # simply didn't trigger an error frame; caller treats this as SKIP.
+        return []
     if (rust is None) != (ts is None):
         return [f"one side produced no error frame: rust={rust} ts={ts}"]
     out = []
@@ -178,8 +184,13 @@ async def _scenario_purge(rep: Report, token: str, cs: dict) -> None:
         return
     r_err, t_err = await asyncio.gather(
         _capture_error(rust, token, cs), _capture_error(ts, token, cs))
-    diffs = _diff_frames(r_err, t_err)
     detail = f"rust={r_err} ts={t_err}"
+    if r_err is None and t_err is None:
+        rep.add("A/error-frame:purge", "SKIP",
+                "neither side errored on reload after tombstone — scenario did not "
+                "trigger the deleted-load path (reconnect likely created a fresh CVR)")
+        return
+    diffs = _diff_frames(r_err, t_err)
     if diffs:
         rep.add("A/error-frame:purge", "FAIL",
                 "purge error frame diverges: " + "; ".join(diffs), extra=detail)

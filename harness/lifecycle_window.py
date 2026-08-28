@@ -65,6 +65,17 @@ def _token() -> str:
     return load_auth()["token"]
 
 
+def _uid() -> str:
+    a = load_auth()
+    return a.get("userID") or ""
+
+
+def _extra() -> dict:
+    # Authenticated connections REQUIRE a userID (rust: "Authenticated
+    # connections require a userID"); TS resolveAuth requires it too.
+    return {"userID": _uid()}
+
+
 def _evict_flush_signals(metrics: dict) -> dict:
     """Extract the window-sensitive counters from a /metrics scrape."""
     return {
@@ -89,7 +100,7 @@ async def _drive_one(side, token, client_schema) -> None:
     """Connect, subscribe a scan query, hydrate, inactivate with a short ttl,
     then disconnect the last (only) client."""
     init = ["initConnection", {"desiredQueriesPatch": [], "clientSchema": client_schema}]
-    await open_side(side, token, init)
+    await open_side(side, token, init, extra=_extra())
     stop = asyncio.Event()
     rtask = asyncio.create_task(reader(side, stop))
     # Subscribe the scan query (short ttl so it is eligible to expire soon).
