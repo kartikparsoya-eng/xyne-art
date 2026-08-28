@@ -476,6 +476,24 @@ ALLOWLIST: list[tuple[str, str]] = [
     # collector endpoint 404s); never a sync-correctness signal. The candidate's
     # own metric contract is guarded by G17, which scrapes the collector.
     ("otlp-export-404",     r"OTLPExporterError"),
+    # Deny-by-default read-permission warn: emitted by BOTH impls for any
+    # client-AST query on a table with no `row.select` rules (TS
+    # read-authorizer.ts:71; rust read_authorizer.rs — parity warn added with
+    # the 2026-08-28 fail-open fix, mono b4754f12d). The #158 oracle rider
+    # queries `channels` (rule-less) each full-catalog run, so this fires by
+    # design; G8 asserts both sides DENY identically.
+    ("no-permission-rules", r"No permission rules found for table"),
+    # Client-group user pinning rejection (TS syncer.ts pinnedUser check; rust
+    # router.rs check_and_pin_user): a connect with a different userID than the
+    # group's pinned user is refused with Unauthorized. The multi-user harness
+    # exercises this deliberately; the rejection IS the designed behavior.
+    ("user-pin-mismatch",   r"User ID mismatch: pinned="),
+    # Sanctioned whole-pipeline reset (TS ResetPipelinesSignal; rust
+    # ivm ResetPipelinesSignal port): scalar-subquery / schema-change /
+    # truncation / advancement-timeout resets destroy + rebuild the CG's
+    # pipelines BY DESIGN (cheaper than advancing; view-syncer.ts:569-586).
+    # Frequency is separately bounded by the resetting-pipelines rate check.
+    ("pipeline-reset",      r"pipeline reset \((scalar-subquery|schema-change|truncation|advancement-timeout|wall-clock)"),
 ]
 
 
