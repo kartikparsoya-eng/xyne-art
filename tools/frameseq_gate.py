@@ -126,9 +126,11 @@ def main():
         t2, tstripped = strip_k1(t)
         if (stripped and r2 == t) or (tstripped and r == t2) or (stripped and tstripped and r2 == t2):
             k1 += 1; continue
-        if tstripped and not stripped:
-            r2 = r
-        t = t2 if tstripped and not stripped else t
+        # Carry BOTH sides' K1-stripped sequences into the later checks (a
+        # both-sides K1 with a later K3 difference compared stripped rust
+        # against unstripped TS and was reported UNKNOWN).
+        if tstripped:
+            t = t2
         # rows-only difference (same tags/ops, different row chunking)?
         if no_rows(flat(r2)) == no_rows(flat(t)):
             rows_only += 1; continue
