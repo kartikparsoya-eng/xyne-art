@@ -62,6 +62,15 @@ from protocol import (  # noqa: E402
     DEFAULT_PROTOCOL_VERSION, encode_sec_protocols,
 )
 
+PK_BY_TABLE = {}  # table -> primary key columns (from --client-schema), for frame-log row identity
+
+def _rowkey(rp):
+    """op:table:{pk} — a put carries the row in `value`, a del its key in `id`."""
+    t = rp.get("tableName"); src = rp.get("value") if rp.get("op") == "put" else rp.get("id")
+    src = src if isinstance(src, dict) else {}
+    pk = PK_BY_TABLE.get(t) or ["id"]
+    return f"{rp.get('op')}:{t}:{json.dumps({c: src.get(c) for c in pk}, sort_keys=True)}"
+
 FRAME_LOG = open(os.environ["ART_FRAME_LOG"], "a") if os.environ.get("ART_FRAME_LOG") else None
 INITIAL_WINDOW_S = 3.0     # puts within this of connect = "initial" latency
 
@@ -268,8 +277,7 @@ async def play_session(sess: dict, a, mapper: TraceMapper, identity: dict,
                     "rows": len(body.get("rowsPatch") or []),
                     # row identity per part (op:table:pk) so the gate can tell coalesced
                     # runs of row pokes apart from real content differences (K4)
-                    "rowkeys": [f"{rp.get('op')}:{rp.get('tableName')}:{json.dumps(rp.get('id') or rp.get('rowKey') or {}, sort_keys=True)}"
-                                for rp in (body.get("rowsPatch") or []) if isinstance(rp, dict)],
+                    "rowkeys": [_rowkey(rp) for rp in (body.get("rowsPatch") or []) if isinstance(rp, dict)],
                     # mutation acks: {clientID: lastMutationID} (None when the part carries none)
                     "lmid": body.get("lastMutationIDChanges") or None,
                     # send-relative latency (ms) + query name for hashes this client still has pending
@@ -437,6 +445,8 @@ async def amain(a) -> int:
     resolver = ArgResolver.from_pool_file(a.id_pool, random.Random(7), zipf_s=0.0)
     a.resolver = resolver
     a.cschema = json.load(open(a.client_schema))
+    PK_BY_TABLE.update({t: (spec.get("primaryKey") or ["id"])
+                        for t, spec in (a.cschema.get("tables") or {}).items() if isinstance(spec, dict)})
     stats = TStats()
     cookie_jar: dict[str, str] = {}
     stop = asyncio.Event()

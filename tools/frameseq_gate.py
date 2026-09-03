@@ -129,7 +129,9 @@ def coalesce_row_runs(items, keys_by_index):
             while j < len(items) and rows_only_poke(items[j]):
                 keys.extend(keys_by_index.get(j, []) or ["<%d rows>" % sum(p[3] for p in items[j][1])])
                 j += 1
-            out.append(("rowrun", tuple(sorted(keys))))
+            # a SET, not a multiset: the same row poked twice on one side (two
+            # advance passes) vs once on the other (coalesced) is the same end state
+            out.append(("rowrun", tuple(sorted(set(keys)))))
             i = j
         else:
             out.append(items[i]); i += 1
