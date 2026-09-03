@@ -32,6 +32,25 @@ def merge(docs):
                 out[k] = "FAIL" if "FAIL" in (cur, v) else cur
             # str/None: keep first
     out["merged_from"] = len(docs)
+    # Per-slice verdicts are meaningless: each slice checks catalog completeness
+    # against the WHOLE catalog. Recompute over the union.
+    miss = [set(d.get("catalog_missing") or []) for d in docs if d.get("full_catalog")]
+    out["catalog_missing"] = sorted(set.intersection(*miss)) if miss else []
+    results = out.get("results") or []
+    terr = {side: sum((r.get(side, {}).get("errors") or {}).get("transformError", 0)
+                      for r in results if isinstance(r, dict)) for side in ("primary", "mirror")}
+    out["transform_errors"] = terr
+    # protocol errors: every non-transformError kind (both sides) + transformError ASYMMETRY only
+    out["protocol_errors"] = sum(
+        c for r in results if isinstance(r, dict) for side in ("primary", "mirror")
+        for k, c in (r.get(side, {}).get("errors") or {}).items()
+        if ":" not in k and k != "transformError") + abs(terr["primary"] - terr["mirror"])
+    out["connect_errors"] = sum(1 for r in results if isinstance(r, dict) and "error" in r)
+    failed = (out.get("total_mismatches", 0) > 0 or out.get("hydration_parity_gap", 0) > 0
+              or out["connect_errors"] > 0 or out["protocol_errors"] > 0
+              or out.get("cookie_violations", 0) > 0 or bool(out.get("resume_errors"))
+              or bool(out["catalog_missing"]) or not out.get("catalog_expected"))
+    out["verdict"] = "FAIL" if failed else "PASS"
     return out
 
 if __name__ == "__main__":

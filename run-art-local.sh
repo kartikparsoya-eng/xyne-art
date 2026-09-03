@@ -745,7 +745,9 @@ if [ "$TS_BASELINE" = "1" ]; then
 fi
 
 set +e
-if [ -n "$TRACE" ]; then
+if [ "${ORACLE_ONLY:-0}" = "1" ]; then
+  echo "== ORACLE_ONLY=1: skipping the load replay (oracle/bisect runs only) =="
+elif [ -n "$TRACE" ]; then
   # trace mutation timing comes from the trace itself — no rate flag
   TRACE_MUTFLAGS=()
   if [ "$MUTATIONS" = "1" ]; then
@@ -866,7 +868,10 @@ if [ "$ORACLE" = "1" ]; then
     # duration bounds the write window (no churn either way). 5s => the mutator
     # barely fires; give it 30s so full-catalog also exercises advance, not just
     # first-hydrate parity, now that writes are a default.
-    ORACLE_FULLCAT=(--full-catalog --catalog-batch-size 50); ORACLE_PAIRS=4; ORACLE_DURATION=30; ORACLE_QUIESCE=45
+    # ORACLE_BATCH / ORACLE_PAIRS_OVERRIDE: sub-slice the catalog (bisecting a
+    # memory-hog query); ORACLE_EXCLUDE: comma list of catalog names to skip.
+    ORACLE_FULLCAT=(--full-catalog --catalog-batch-size "${ORACLE_BATCH:-50}"); ORACLE_PAIRS="${ORACLE_PAIRS_OVERRIDE:-4}"; ORACLE_DURATION=30; ORACLE_QUIESCE=45
+    [ -n "${ORACLE_EXCLUDE:-}" ] && ORACLE_FULLCAT+=(--catalog-exclude "$ORACLE_EXCLUDE")
   fi
   # Resume/catch-up phase (default ON). Composes with full-catalog: after every
   # subscribed shape hydrates, each side reconnects from its own cookie and the
@@ -911,10 +916,26 @@ if [ "$ORACLE" = "1" ]; then
   }
   if [ "$FULLCATALOG" = "1" ] && [ "${ORACLE_SEQ:-0}" = "1" ]; then
     _parts=()
-    for _k in $(seq 0 $((ORACLE_PAIRS - 1))); do
-      echo "  [oracle slice $_k/$((ORACLE_PAIRS - 1))] sequential full-catalog pair"
-      run_oracle_once 1 "$_k" "reports/diff-$TAG-p$_k.json"
-      _parts+=("reports/diff-$TAG-p$_k.json")
+    for _k in ${ORACLE_SLICES:-$(seq 0 $((ORACLE_PAIRS - 1)))}; do
+      echo "  [oracle slice $_k/$((ORACLE_PAIRS - 1))] sequential full-catalog pair (batch ${ORACLE_BATCH:-50})"
+      # mem-guard: a catalog query whose IVM state explodes takes BOTH caches
+      # down (2026-09-03: slice 2 → rust 26.6 GB cgroup-kill, TS node 23 GB
+      # host-OOM). Kill the oracle CLIENT first so the caches survive and the
+      # slice is reported as aborted instead of the whole run dying.
+      ( _lim=$(( ${ORACLE_MEM_GUARD_GB:-20} * 1024 ))
+        while sleep 5; do
+          for _c in "xyne-sandbox-${SANDBOX}-zero-cache" "xyne-sandbox-${SANDBOX}-zero-cache-ts"; do
+            _m=$(docker stats --no-stream --format '{{.MemUsage}}' "$_c" 2>/dev/null | awk '{v=$1; if (v ~ /GiB/) {sub(/GiB/,"",v); v=v*1024} else if (v ~ /MiB/) {sub(/MiB/,"",v)} else {v=0}; printf "%d", v}')
+            if [ "${_m:-0}" -gt "$_lim" ]; then
+              echo "  [mem-guard] $_c at ${_m}MiB > ${_lim}MiB during slice $_k: killing diff_oracle.py"
+              pkill -f "harness/diff_oracle.py" || true
+              sleep 20
+            fi
+          done
+        done ) & _wd=$!
+      run_oracle_once 1 "$_k" "reports/diff-$TAG-p$_k.json" || echo "  [oracle slice $_k] ABORTED (exit $?)"
+      kill "$_wd" 2>/dev/null || true; wait "$_wd" 2>/dev/null || true
+      [ -f "reports/diff-$TAG-p$_k.json" ] && _parts+=("reports/diff-$TAG-p$_k.json")
       sleep 20   # let both caches reap the slice's client groups before the next one
     done
     "$PY" tools/merge_oracle_reports.py "$ORACLE_REPORT" "${_parts[@]}"

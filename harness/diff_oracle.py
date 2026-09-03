@@ -498,7 +498,7 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         seen: set[str] = set()
         unique_ops = []
         for op in baseline.queries:
-            if op.name in seen:
+            if op.name in seen or op.name in a.catalog_exclude_set:
                 continue
             seen.add(op.name)
             unique_ops.append(op)
@@ -884,12 +884,19 @@ async def amain(a: argparse.Namespace) -> int:
     catalog_unresolved = {q for r in results for q in r.get("catalog_unresolved", [])}
     catalog_stale = {q for r in results for q in r.get("catalog_stale", [])}
     catalog_missing = sorted(catalog_expected - catalog_hydrated)
+    # `transformError` is the app server rejecting a query (unresolvable catalog
+    # args, InputValidation, ...). Both caches forward it verbatim, so an EQUAL
+    # count per side is parity, not a protocol error; only the asymmetry counts.
+    transform_errors = {
+        side: sum((r.get(side, {}).get("errors") or {}).get("transformError", 0) for r in results)
+        for side in ("primary", "mirror")
+    }
     protocol_errors = sum(
         sum(count for kind, count in (r.get(side, {}).get("errors") or {}).items()
-            if ":" not in kind)
+            if ":" not in kind and kind != "transformError")
         for r in results for side in ("primary", "mirror")
-    )
-    catalog_total = len({op.name for op in baseline.queries})
+    ) + abs(transform_errors["primary"] - transform_errors["mirror"])
+    catalog_total = len({op.name for op in baseline.queries} - a.catalog_exclude_set)
     catalog_accounted = catalog_expected | catalog_unresolved | catalog_stale
     catalog_rows = {
         side: sum(r.get(side, {}).get("rows", 0) for r in results)
@@ -945,6 +952,8 @@ async def amain(a: argparse.Namespace) -> int:
         "resume_errors": [{"pair": r["pair"], "error": r["resume"]["error"]}
                           for r in resume_errors],
         "total_mismatches": total_mismatch,
+        "transform_errors": transform_errors,
+        "catalog_excluded": sorted(a.catalog_exclude_set),
         "hydration_parity_gap": total_hydration_gap,
         "only_primary_hydrated": only_primary_hydrated,
         "only_mirror_hydrated": only_mirror_hydrated,
@@ -1100,6 +1109,9 @@ def main() -> int:
                     help="subscribe EVERY resolvable catalog query on both sides "
                          "(no churn) so all ~151 query shapes get differential "
                          "coverage; bump --quiesce-max-s for the larger hydrate")
+    ap.add_argument("--catalog-exclude", default="",
+                    help="full-catalog: comma-separated query names to leave OUT (e.g. a "
+                         "query whose IVM state exceeds both caches' memory on the seeded data)")
     ap.add_argument("--catalog-pair-offset", type=int, default=0,
                     help="full-catalog: shift the pair->catalog-slice mapping by this many "
                          "slices so slices can run SEQUENTIALLY (--pairs 1 --catalog-pair-offset K) "
@@ -1146,6 +1158,7 @@ def main() -> int:
     a = ap.parse_args()
     if a.enable_mutations and not a.i_know_this_writes:
         ap.error("--enable-mutations writes real data; add --i-know-this-writes")
+    a.catalog_exclude_set = {n.strip() for n in a.catalog_exclude.split(",") if n.strip()}
     if a.full_catalog and a.catalog_batch_size <= 0:
         ap.error("--catalog-batch-size must be positive")
     return asyncio.run(amain(a))
