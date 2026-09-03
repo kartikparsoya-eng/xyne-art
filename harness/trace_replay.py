@@ -278,6 +278,8 @@ async def play_session(sess: dict, a, mapper: TraceMapper, identity: dict,
                     # row identity per part (op:table:pk) so the gate can tell coalesced
                     # runs of row pokes apart from real content differences (K4)
                     "rowkeys": [_rowkey(rp) for rp in (body.get("rowsPatch") or []) if isinstance(rp, dict)],
+                    # which keys a pokePart body carried (diagnoses "empty" parts)
+                    "partkeys": sorted(body.keys()) if tag == "pokePart" and isinstance(body, dict) else None,
                     # mutation acks: {clientID: lastMutationID} (None when the part carries none)
                     "lmid": body.get("lastMutationIDChanges") or None,
                     # send-relative latency (ms) + query name for hashes this client still has pending
