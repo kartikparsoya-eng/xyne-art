@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-art-dual.sh — SIMULTANEOUS trace A/B: the same prod trace replayed
-# against the Go primary AND the TS mirror in the same wall-clock window,
+# against the Rust primary AND the TS mirror in the same wall-clock window,
 # by two independent trace_replay processes.
 #
 # Why simultaneous (complements run-art-local.sh's sequential A/B):
@@ -35,11 +35,11 @@ done
 
 SLUG="${SANDBOX//-/_}"
 BACKEND="xyne-sandbox-${SANDBOX}-backend"
-GO_POD="xyne-sandbox-${SANDBOX}-zero-cache"
+RUST_POD="xyne-sandbox-${SANDBOX}-zero-cache"
 TS_POD="xyne-sandbox-${SANDBOX}-zero-cache-ts"
 PG="xyne-sandbox-postgres"
 DB="sandbox_${SLUG}_db"
-GO_URL="ws://${SANDBOX}.localhost/zero"
+RUST_URL="ws://${SANDBOX}.localhost/zero"
 TS_URL="ws://${SANDBOX}.localhost/zero-ts"
 POOL="harness/id-pool.trace.json"
 CSCHEMA="harness/client-schema.json"
@@ -47,7 +47,7 @@ AUTH_POOL="harness/auth-pool.json"
 PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
 psql_q() { docker exec "$PG" psql -U xyne -d "$DB" -Atc "$1"; }
 
-for c in "$BACKEND" "$GO_POD" "$TS_POD" "$PG"; do
+for c in "$BACKEND" "$RUST_POD" "$TS_POD" "$PG"; do
   docker ps --format '{{.Names}}' | grep -qx "$c" \
     || { echo "ERROR: container $c is not running" >&2; exit 1; }
 done
@@ -56,13 +56,17 @@ done
 echo "== purging art-% CVR rows (both schemas) + restarting both pods =="
 psql_q "DELETE FROM \"sandbox_${SLUG}_0/cvr\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
 psql_q "DELETE FROM \"sandbox_${SLUG}_ts_0/cvr\".instances WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
-docker restart "$GO_POD" "$TS_POD" >/dev/null
+for _app in "sandbox_${SLUG}_0" "sandbox_${SLUG}_ts_0"; do   # backend LMID state, else mutations are "already processed"
+  psql_q "DELETE FROM \"$_app\".mutations WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+  psql_q "DELETE FROM \"$_app\".clients   WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+done
+docker restart "$RUST_POD" "$TS_POD" >/dev/null
 for _ in $(seq 1 45); do
-  ST="$(docker inspect -f '{{.State.Health.Status}}' "$GO_POD" 2>/dev/null || echo none)"
+  ST="$(docker inspect -f '{{.State.Health.Status}}' "$RUST_POD" 2>/dev/null || echo none)"
   [ "$ST" = "healthy" ] && break
   sleep 2
 done
-[ "$ST" = "healthy" ] || echo "WARNING: $GO_POD not healthy yet ($ST)" >&2
+[ "$ST" = "healthy" ] || echo "WARNING: $RUST_POD not healthy yet ($ST)" >&2
 # TS pod has no healthcheck: wait for replication drain (cold pod = minutes
 # behind; its catch-up would poison the first minutes of the A/B)
 waited=0
@@ -75,6 +79,14 @@ while [ "$waited" -lt 150 ]; do
   fi
   sleep 5; waited=$((waited + 5))
 done
+
+# --- resolve TS target DIRECTLY by container IP:4848. traefik has NO /zero-ts
+# route: PathPrefix(`/zero`) string-matches `/zero-ts` and lands on the RUST
+# candidate, so ws://host/zero-ts sends the TS replay to rust -> a rust-vs-rust
+# non-comparison (both replays collide on the same trace cgids). Mirror
+# run-art-local.sh's IP resolution. (2026-09-01: fixes the broken dual A/B.)
+TS_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TS_POD" 2>/dev/null | tr -d "[:space:]")"
+if [ -n "$TS_IP" ]; then TS_URL="ws://$TS_IP:4848"; echo "  TS target resolved directly: $TS_URL"; else echo "WARNING: TS_POD IP unresolved; TS_URL=$TS_URL may misroute to rust!" >&2; fi
 
 # --- identities / seeds / pool (same steps as --trace in run-art-local.sh) ---
 "$PY" tools/build_auth_pool.py --backend-container "$BACKEND" \
@@ -101,50 +113,56 @@ PYEOF
 TAG="$(date +%Y%m%d-%H%M%S)"
 echo "== dual trace A/B: $TRACE @ ${TCOMPRESS}x, ~${DURATION}s, tag $TAG =="
 
-# --- samplers (Go gets pprof; TS is Node — no Go pprof endpoint) --------------
-"$PY" tools/resource_sampler.py --container "$GO_POD" --pg-container "$PG" \
+# --- samplers -----------------------------------------------------------------
+# Rust exposes prometheus metrics on :3200 (published to host :13200 by the
+# override); it has NO Go pprof endpoint, so scrape --prom and disable --pprof.
+# (2026-09-01: replaces the dead Go-sidecar-era pprof :6060 capture path.)
+"$PY" tools/resource_sampler.py --container "$RUST_POD" --pg-container "$PG" \
   --db "$DB" --cvr-schema "sandbox_${SLUG}_0/cvr" \
-  --out "reports/resources-$TAG-go.ndjson" --interval 10 --duration $((DURATION + 60)) &
-SAMPLER_GO=$!
+  --pprof '' --prom "http://localhost:13200/metrics" \
+  --out "reports/resources-$TAG-rust.ndjson" --interval 10 --duration $((DURATION + 60)) &
+SAMPLER_RUST=$!
 "$PY" tools/resource_sampler.py --container "$TS_POD" --pg-container "$PG" \
   --db "$DB" --cvr-schema "sandbox_${SLUG}_ts_0/cvr" --pprof '' \
   --out "reports/resources-$TAG-ts.ndjson" --interval 10 --duration $((DURATION + 60)) &
 SAMPLER_TS=$!
-trap 'kill "$SAMPLER_GO" "$SAMPLER_TS" 2>/dev/null || true' EXIT
+trap 'kill "$SAMPLER_RUST" "$SAMPLER_TS" 2>/dev/null || true' EXIT
 
 RUN_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e
-"$PY" harness/trace_replay.py --trace "$TRACE" --target "$GO_URL" \
+"$PY" harness/trace_replay.py --trace "$TRACE" --target "$RUST_URL" \
   --auth-pool "$AUTH_POOL" --id-pool "$POOL" --client-schema "$CSCHEMA" \
-  --time-compress "$TCOMPRESS" --run-tag "$TAG-go" \
-  > "reports/dual-$TAG-go.log" 2>&1 &
-REPLAY_GO=$!
+  --time-compress "$TCOMPRESS" --run-tag "$TAG-rust" \
+  ${ART_MUTATIONS:+--enable-mutations --i-know-this-writes} \
+  > "reports/dual-$TAG-rust.log" 2>&1 &
+REPLAY_RUST=$!
 "$PY" harness/trace_replay.py --trace "$TRACE" --target "$TS_URL" \
   --auth-pool "$AUTH_POOL" --id-pool "$POOL" --client-schema "$CSCHEMA" \
   --time-compress "$TCOMPRESS" --run-tag "$TAG-ts" \
+  ${ART_MUTATIONS:+--enable-mutations --i-know-this-writes} \
   > "reports/dual-$TAG-ts.log" 2>&1 &
 REPLAY_TS=$!
-echo "== both replays launched (logs: reports/dual-$TAG-{go,ts}.log) =="
-wait "$REPLAY_GO"; RC_GO=$?
+echo "== both replays launched (logs: reports/dual-$TAG-{rust,ts}.log) =="
+wait "$REPLAY_RUST"; RC_RUST=$?
 wait "$REPLAY_TS"; RC_TS=$?
 set -e
-echo "replay exit: go=$RC_GO ts=$RC_TS"
+echo "replay exit: rust=$RC_RUST ts=$RC_TS"
 sleep 30                                  # let samplers catch the settle
-kill "$SAMPLER_GO" "$SAMPLER_TS" 2>/dev/null || true
-wait "$SAMPLER_GO" "$SAMPLER_TS" 2>/dev/null || true
+kill "$SAMPLER_RUST" "$SAMPLER_TS" 2>/dev/null || true
+wait "$SAMPLER_RUST" "$SAMPLER_TS" 2>/dev/null || true
 trap - EXIT
 
 # --- per-side G13 + gate -------------------------------------------------------
 set +e
-"$PY" tools/log_gate.py --containers "$GO_POD" --since "$RUN_START_ISO" \
-  --out "reports/logs-$TAG-go.json"
+"$PY" tools/log_gate.py --containers "$RUST_POD" --since "$RUN_START_ISO" \
+  --out "reports/logs-$TAG-rust.json"
 "$PY" tools/log_gate.py --containers "$TS_POD" --since "$RUN_START_ISO" \
   --out "reports/logs-$TAG-ts.json"
 echo ""
-echo "===== Go gate ====="
-"$PY" tools/local_gate.py --run "reports/run-$TAG-go.json" \
-  --resources "reports/resources-$TAG-go.summary.json" \
-  --logs "reports/logs-$TAG-go.json" --out "reports/gate-$TAG-go.json"
+echo "===== Rust gate ====="
+"$PY" tools/local_gate.py --run "reports/run-$TAG-rust.json" \
+  --resources "reports/resources-$TAG-rust.summary.json" \
+  --logs "reports/logs-$TAG-rust.json" --out "reports/gate-$TAG-rust.json"
 echo ""
 echo "===== TS gate ====="
 "$PY" tools/local_gate.py --run "reports/run-$TAG-ts.json" \
@@ -157,7 +175,7 @@ echo ""
 "$PY" - "$TAG" <<'PYEOF'
 import json, sys
 tag = sys.argv[1]
-go = json.load(open(f"reports/run-{tag}-go.json"))
+rust = json.load(open(f"reports/run-{tag}-rust.json"))
 ts = json.load(open(f"reports/run-{tag}-ts.json"))
 def logrep(side):
     try:
@@ -168,28 +186,28 @@ def logrep(side):
         return heal, block
     except Exception:
         return "-", "-"
-gh, gb = logrep("go"); th, tb = logrep("ts")
+rh, rb = logrep("rust"); th, tb = logrep("ts")
 print(f"== head-to-head (same wall-clock window; read RATIOS, not absolutes) ==")
-print(f"{'metric':26} {'Go':>10} {'TS':>10} {'Go/TS':>7}")
+print(f"{'metric':26} {'Rust':>10} {'TS':>10} {'Rust/TS':>8}")
 for label, key, sub in [("steady p50", "client_latency_steady_ms", "p50"),
                         ("steady p95", "client_latency_steady_ms", "p95"),
                         ("steady p99", "client_latency_steady_ms", "p99"),
                         ("initial p50", "client_latency_initial_ms", "p50"),
                         ("initial p95", "client_latency_initial_ms", "p95"),
                         ("sched-lag p95", "scheduling_lag_ms", "p95")]:
-    a, b = go[key].get(sub), ts[key].get(sub)
+    a, b = rust[key].get(sub), ts[key].get(sub)
     r = f"{a/b:.2f}" if a and b else "-"
-    print(f"{label:26} {a!s:>10} {b!s:>10} {r:>7}")
+    print(f"{label:26} {a!s:>10} {b!s:>10} {r:>8}")
 for label, key in [("errors", "errors"), ("failed_open", "failed_open"),
                    ("pokes", "pokes"), ("dedup_puts", "dedup_puts")]:
-    print(f"{label:26} {go['counters'][key]!s:>10} {ts['counters'][key]!s:>10}")
-print(f"{'self-heal / blocking':26} {f'{gh}/{gb}':>10} {f'{th}/{tb}':>10}")
-gq, tq = go.get("latency_by_query", {}), ts.get("latency_by_query", {})
-common = [q for q in gq if q in tq
-          and gq[q]["samples"] >= 10 and tq[q]["samples"] >= 10]
-worst = sorted(common, key=lambda q: -(gq[q]["p50"] / max(tq[q]["p50"], .1)))[:6]
-print(f"\nworst Go/TS per-query p50 ratios (n>=10 both):")
+    print(f"{label:26} {rust['counters'][key]!s:>10} {ts['counters'][key]!s:>10}")
+print(f"{'self-heal / blocking':26} {f'{rh}/{rb}':>10} {f'{th}/{tb}':>10}")
+rq, tq = rust.get("latency_by_query", {}), ts.get("latency_by_query", {})
+common = [q for q in rq if q in tq
+          and rq[q]["samples"] >= 10 and tq[q]["samples"] >= 10]
+worst = sorted(common, key=lambda q: -(rq[q]["p50"] / max(tq[q]["p50"], .1)))[:6]
+print(f"\nworst Rust/TS per-query p50 ratios (n>=10 both):")
 for q in worst:
-    print(f"  {q:38} {gq[q]['p50']:>8} vs {tq[q]['p50']:>8}  "
-          f"{gq[q]['p50']/max(tq[q]['p50'],.1):.2f}x")
+    print(f"  {q:38} {rq[q]['p50']:>8} vs {tq[q]['p50']:>8}  "
+          f"{rq[q]['p50']/max(tq[q]['p50'],.1):.2f}x")
 PYEOF

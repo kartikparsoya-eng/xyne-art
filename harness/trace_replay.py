@@ -256,14 +256,26 @@ async def play_session(sess: dict, a, mapper: TraceMapper, identity: dict,
             body = msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
             if FRAME_LOG is not None:  # ART_FRAME_LOG=<path>: per-client frame-sequence oracle
                 dq = body.get("desiredQueriesPatches")
+                _now = time.perf_counter()
+                _dq_puts = [g for d in (dq.values() if isinstance(dq, dict) else []) for g in (d or [])]
                 FRAME_LOG.write(json.dumps({
-                    "cg": cgid, "t": round(time.perf_counter() - connected_at, 3), "tag": tag,
+                    "cg": cgid, "t": round(_now - connected_at, 3), "tag": tag,
                     "pokeID": body.get("pokeID"), "cookie": body.get("cookie"),
                     "cancel": body.get("cancel"),
                     "got": [(g.get("op"), g.get("hash")) for g in (body.get("gotQueriesPatch") or [])],
                     "desired": [[(g.get("op"), g.get("hash")) for g in (d or [])] for d in dq.values()]
                                if isinstance(dq, dict) else None,
                     "rows": len(body.get("rowsPatch") or []),
+                    # mutation acks: {clientID: lastMutationID} (None when the part carries none)
+                    "lmid": body.get("lastMutationIDChanges") or None,
+                    # send-relative latency (ms) + query name for hashes this client still has pending
+                    "gotlat": [(g.get("hash"), pending[g["hash"]][2], round((_now - pending[g["hash"]][0]) * 1000, 1))
+                               for g in (body.get("gotQueriesPatch") or [])
+                               if isinstance(g, dict) and g.get("op") == "put" and g.get("hash") in pending],
+                    "deslat": [(g.get("hash"), round((_now - pending[g["hash"]][0]) * 1000, 1))
+                               for g in _dq_puts
+                               if isinstance(g, dict) and g.get("op") == "put" and g.get("hash") in pending],
+                    "err": [body.get("kind"), str(body.get("message", ""))[:80]] if tag == "error" else None,
                 }) + "\n"); FRAME_LOG.flush()
             if tag == "pokeEnd":
                 stats.pokes += 1

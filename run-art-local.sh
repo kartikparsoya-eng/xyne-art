@@ -425,6 +425,11 @@ if [ "$CLEAN" = "1" ]; then
     psql_q "DELETE FROM \"$_schema\".rows       WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
     psql_q "DELETE FROM \"$_schema\".\"rowsVersion\" WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
     psql_q "DELETE FROM \"$_schema\".instances  WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+    # Backend lastMutationID state for art-% client groups ("<app>_0".clients/mutations):
+    # without this every replayed mutation is "already processed" and never acked.
+    _app="${_schema%/cvr}"
+    psql_q "DELETE FROM \"$_app\".mutations WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
+    psql_q "DELETE FROM \"$_app\".clients   WHERE \"clientGroupID\" LIKE 'art-%';" >/dev/null 2>&1 || true
   done
   docker restart "$ZCACHE" >/dev/null
   for _ in $(seq 1 45); do
