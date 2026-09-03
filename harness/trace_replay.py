@@ -266,6 +266,10 @@ async def play_session(sess: dict, a, mapper: TraceMapper, identity: dict,
                     "desired": [[(g.get("op"), g.get("hash")) for g in (d or [])] for d in dq.values()]
                                if isinstance(dq, dict) else None,
                     "rows": len(body.get("rowsPatch") or []),
+                    # row identity per part (op:table:pk) so the gate can tell coalesced
+                    # runs of row pokes apart from real content differences (K4)
+                    "rowkeys": [f"{rp.get('op')}:{rp.get('tableName')}:{json.dumps(rp.get('id') or rp.get('rowKey') or {}, sort_keys=True)}"
+                                for rp in (body.get("rowsPatch") or []) if isinstance(rp, dict)],
                     # mutation acks: {clientID: lastMutationID} (None when the part carries none)
                     "lmid": body.get("lastMutationIDChanges") or None,
                     # send-relative latency (ms) + query name for hashes this client still has pending
