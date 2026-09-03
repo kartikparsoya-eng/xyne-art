@@ -58,8 +58,15 @@ def merge(docs):
         for k in ("catalog_unresolved", "catalog_stale", "catalog_excluded"):
             accounted.update(d.get(k) or [])
         for r in d.get("results") or []:
-            if isinstance(r, dict): accounted.update(r.get("catalog_hydrated") or [])
+            # same rule as diff_oracle.py's catalog_accounted: a query that was
+            # DRIVEN (expected) counts even when both sides rejected it with the
+            # same transformError (symmetric errors are parity, checked above)
+            if isinstance(r, dict):
+                accounted.update(r.get("catalog_expected") or [])
+                accounted.update(r.get("catalog_hydrated") or [])
     out["catalog_total"] = total
+    for k in ("catalog_excluded", "catalog_unresolved", "catalog_stale"):
+        if isinstance(out.get(k), list): out[k] = sorted(set(out[k]))
     out["catalog_coverage"] = f"{len(accounted)}/{total}"
     if total and len(accounted) < total:
         failed = True
