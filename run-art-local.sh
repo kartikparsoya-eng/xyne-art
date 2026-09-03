@@ -892,16 +892,35 @@ if [ "$ORACLE" = "1" ]; then
   elif [ -n "$APORT" ]; then
     ORACLE_PRIMARY="ws://127.0.0.1:$APORT"
   fi
-  "$PY" harness/diff_oracle.py --primary "$ORACLE_PRIMARY" \
+  # ORACLE_SEQ=1: run the full-catalog slices ONE AT A TIME (--pairs 1 +
+  # --catalog-pair-offset K) and merge the per-slice reports. Peak IVM memory
+  # is then one 50-query slice instead of the whole catalog (2026-09-03: the
+  # 4-concurrent-pair run OOM-killed BOTH caches at 18 GiB -> invalid verdict).
+  run_oracle_once() {  # $1=pairs $2=offset $3=out
+    local _pairs="$1" _off="$2" _out="$3"
+    "$PY" harness/diff_oracle.py --primary "$ORACLE_PRIMARY" \
     ${MIRRORFLAGS[@]+"${MIRRORFLAGS[@]}"} \
-    --id-pool "$POOL" --client-schema "$CSCHEMA" \
-    --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
-    --pairs "$ORACLE_PAIRS" --duration "$ORACLE_DURATION" \
-    --quiesce-s "$ORACLE_QUIESCE" --quiesce-max-s 300 \
+      --id-pool "$POOL" --client-schema "$CSCHEMA" \
+      --auth-token "$JWT" --extra-param "userID=$FIRST_UID" \
+      --pairs "$_pairs" --catalog-pair-offset "$_off" --duration "$ORACLE_DURATION" \
+      --quiesce-s "$ORACLE_QUIESCE" --quiesce-max-s 300 \
     ${ORACLE_FULLCAT[@]+"${ORACLE_FULLCAT[@]}"} \
     ${ORACLE_RESUME[@]+"${ORACLE_RESUME[@]}"} \
     ${ZIPFFLAGS[@]+"${ZIPFFLAGS[@]}"} ${ORACLE_MUTFLAGS[@]+"${ORACLE_MUTFLAGS[@]}"} \
-    --out "$ORACLE_REPORT"
+      --out "$_out"
+  }
+  if [ "$FULLCATALOG" = "1" ] && [ "${ORACLE_SEQ:-0}" = "1" ]; then
+    _parts=()
+    for _k in $(seq 0 $((ORACLE_PAIRS - 1))); do
+      echo "  [oracle slice $_k/$((ORACLE_PAIRS - 1))] sequential full-catalog pair"
+      run_oracle_once 1 "$_k" "reports/diff-$TAG-p$_k.json"
+      _parts+=("reports/diff-$TAG-p$_k.json")
+      sleep 20   # let both caches reap the slice's client groups before the next one
+    done
+    "$PY" tools/merge_oracle_reports.py "$ORACLE_REPORT" "${_parts[@]}"
+  else
+    run_oracle_once "$ORACLE_PAIRS" 0 "$ORACLE_REPORT"
+  fi
   set -e
 fi
 

@@ -502,7 +502,7 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
                 continue
             seen.add(op.name)
             unique_ops.append(op)
-        start = pair_idx * a.catalog_batch_size
+        start = (pair_idx + a.catalog_pair_offset) * a.catalog_batch_size
         batch_ops = unique_ops[start:start + a.catalog_batch_size]
         for op in batch_ops:
             if a.current_query_names is not None and op.name not in a.current_query_names:
@@ -1094,6 +1094,10 @@ def main() -> int:
                     help="subscribe EVERY resolvable catalog query on both sides "
                          "(no churn) so all ~151 query shapes get differential "
                          "coverage; bump --quiesce-max-s for the larger hydrate")
+    ap.add_argument("--catalog-pair-offset", type=int, default=0,
+                    help="full-catalog: shift the pair->catalog-slice mapping by this many "
+                         "slices so slices can run SEQUENTIALLY (--pairs 1 --catalog-pair-offset K) "
+                         "instead of all at once (peak IVM memory = one slice, not the whole catalog)")
     ap.add_argument("--catalog-batch-size", type=int, default=50,
                     help="maximum full-catalog queries per client (default 50; "
                          "must remain below the server's desired-query limit)")
