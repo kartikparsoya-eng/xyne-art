@@ -10,9 +10,10 @@ harness/trace_replay.py with ART_FRAME_LOG=<path>. Usage:
 
 Known, documented deviations are counted as `known`, everything else as
 `unknown`; the gate FAILS only on unknown deviations.
-  K1: rust emits an extra EMPTY poke (pokeStart+pokeEnd, no pokePart) right
-      after the initial 00:01 poke = TS's first #stateChanges sync, which in
-      TS races the next client message (view-syncer.ts:538-606 vs :1163).
+  K1: an EMPTY poke (pokeStart+pokeEnd, no pokePart) right after the initial
+      00:01 poke = the first #stateChanges sync, which on BOTH sides races the
+      next client message (view-syncer.ts:538-606 vs :1163; rust I-15). Either
+      side may show it (2026-09-03 capture: 117 rust-only, 21 TS-only).
   K2: the pre-connect (initConnection) query hash differs between the two
       harness processes (harness arg resolution), so hashes are compared only
       for changeDesiredQueries-driven ops.
@@ -26,10 +27,12 @@ Known, documented deviations are counted as `known`, everything else as
 import argparse, collections, json, sys
 
 def load(path):
+    """Group by (clientGroupID, clientID): two concurrent sockets of one client
+    group interleave in wall-clock order, which is not a comparable sequence."""
     by = collections.defaultdict(list)
     for line in open(path):
         d = json.loads(line)
-        by[d["cg"]].append(d)
+        by[d["cg"] + ("/" + d["cid"] if d.get("cid") else "")].append(d)
     return by
 
 def part_desc(f):
@@ -120,8 +123,12 @@ def main():
         if r == t:
             same += 1; continue
         r2, stripped = strip_k1(r)
-        if stripped and r2 == t:
+        t2, tstripped = strip_k1(t)
+        if (stripped and r2 == t) or (tstripped and r == t2) or (stripped and tstripped and r2 == t2):
             k1 += 1; continue
+        if tstripped and not stripped:
+            r2 = r
+        t = t2 if tstripped and not stripped else t
         # rows-only difference (same tags/ops, different row chunking)?
         if no_rows(flat(r2)) == no_rows(flat(t)):
             rows_only += 1; continue

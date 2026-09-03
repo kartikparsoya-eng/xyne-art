@@ -527,6 +527,12 @@ async def run_pair(pair_idx: int, a: argparse.Namespace, baseline, results: list
         for s in sides:
             s.mat.unresolved = unresolved
             s.mat.stale_catalog = stale_catalog
+        if a.full_catalog and not initial_puts:
+            # Sequential slicing (--catalog-pair-offset) can address a slice past
+            # the end of the catalog: nothing to subscribe, nothing to diff.
+            print(f"  [full-catalog pair {pair_idx}] empty catalog slice "
+                  f"(offset {a.catalog_pair_offset}) — nothing to diff, skipping")
+            return
         if unresolved:
             print(f"  [full-catalog pair {pair_idx}] {len(initial_puts)} queries subscribed, "
                   f"{len(unresolved)} unresolvable (no id-pool args): "

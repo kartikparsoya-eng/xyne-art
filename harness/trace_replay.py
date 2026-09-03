@@ -259,7 +259,7 @@ async def play_session(sess: dict, a, mapper: TraceMapper, identity: dict,
                 _now = time.perf_counter()
                 _dq_puts = [g for d in (dq.values() if isinstance(dq, dict) else []) for g in (d or [])]
                 FRAME_LOG.write(json.dumps({
-                    "cg": cgid, "t": round(_now - connected_at, 3), "tag": tag,
+                    "cg": cgid, "cid": cid, "t": round(_now - connected_at, 3), "tag": tag,
                     "pokeID": body.get("pokeID"), "cookie": body.get("cookie"),
                     "cancel": body.get("cancel"),
                     "got": [(g.get("op"), g.get("hash")) for g in (body.get("gotQueriesPatch") or [])],
