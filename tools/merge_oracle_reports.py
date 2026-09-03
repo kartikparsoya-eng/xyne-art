@@ -50,14 +50,32 @@ def merge(docs):
               or out["connect_errors"] > 0 or out["protocol_errors"] > 0
               or out.get("cookie_violations", 0) > 0 or bool(out.get("resume_errors"))
               or bool(out["catalog_missing"]) or not out.get("catalog_expected"))
+    # Coverage against the WHOLE catalog (a sequential run that lost slices to
+    # OOM/mem-guard must not report PASS on the slices it happened to finish).
+    total = max((d.get("catalog_total") or 0) for d in docs)
+    accounted = set()
+    for d in docs:
+        for k in ("catalog_unresolved", "catalog_stale", "catalog_excluded"):
+            accounted.update(d.get(k) or [])
+        for r in d.get("results") or []:
+            if isinstance(r, dict): accounted.update(r.get("catalog_hydrated") or [])
+    out["catalog_total"] = total
+    out["catalog_coverage"] = f"{len(accounted)}/{total}"
+    if total and len(accounted) < total:
+        failed = True
+        out["catalog_missing"] = sorted(set(out.get("catalog_missing") or []) | {"<%d catalog names not covered>" % (total - len(accounted))})
     out["verdict"] = "FAIL" if failed else "PASS"
     return out
 
 if __name__ == "__main__":
     outp, ins = sys.argv[1], sys.argv[2:]
     docs = [json.load(open(p)) for p in ins]
-    m = merge(docs)
+    if not docs:
+        m = {"verdict": "FAIL", "merged_from": 0, "total_mismatches": 0,
+             "note": "no slice reports (every slice aborted — mem-guard/OOM)"}
+    else:
+        m = merge(docs)
     json.dump(m, open(outp, "w"), indent=1)
     print(f"merged {len(docs)} reports -> {outp}: verdict={m.get('verdict')} mismatches={m.get('total_mismatches')} "
-          f"parity_gap={m.get('hydration_parity_gap')} catalog={m.get('catalog_driven')}/{m.get('catalog_expected')} "
+          f"parity_gap={m.get('hydration_parity_gap')} catalog={m.get('catalog_driven')}/{m.get('catalog_expected')} coverage={m.get('catalog_coverage')} "
           f"protocol_errors={m.get('protocol_errors')} pairs={m.get('pairs')}")

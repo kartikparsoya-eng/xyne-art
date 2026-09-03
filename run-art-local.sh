@@ -936,7 +936,20 @@ if [ "$ORACLE" = "1" ]; then
       run_oracle_once 1 "$_k" "reports/diff-$TAG-p$_k.json" || echo "  [oracle slice $_k] ABORTED (exit $?)"
       kill "$_wd" 2>/dev/null || true; wait "$_wd" 2>/dev/null || true
       [ -f "reports/diff-$TAG-p$_k.json" ] && _parts+=("reports/diff-$TAG-p$_k.json")
-      sleep 20   # let both caches reap the slice's client groups before the next one
+      if [ "${ORACLE_RESTART_BETWEEN:-0}" = "1" ]; then
+        # memory-hog bisect: a killed oracle client does NOT stop an in-flight
+        # hydrate, and rust keeps the slice's RSS until the CG is torn down —
+        # restart both caches so every slice starts from a cold baseline.
+        for _c in "xyne-sandbox-${SANDBOX}-zero-cache" "xyne-sandbox-${SANDBOX}-zero-cache-ts"; do docker restart "$_c" >/dev/null 2>&1 || true; done
+        for _i in $(seq 1 60); do
+          _h1=$(docker inspect -f '{{.State.Health.Status}}' "xyne-sandbox-${SANDBOX}-zero-cache" 2>/dev/null)
+          _h2=$(docker inspect -f '{{.State.Health.Status}}' "xyne-sandbox-${SANDBOX}-zero-cache-ts" 2>/dev/null)
+          [ "$_h1" = healthy ] && [ "$_h2" = healthy ] && break; sleep 3
+        done
+        echo "  [restart-between] caches healthy=$_h1/$_h2 after $((_i*3))s"
+      else
+        sleep 20   # let both caches reap the slice's client groups before the next one
+      fi
     done
     "$PY" tools/merge_oracle_reports.py "$ORACLE_REPORT" "${_parts[@]}"
   else
