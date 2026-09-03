@@ -62,6 +62,7 @@ from protocol import (  # noqa: E402
     DEFAULT_PROTOCOL_VERSION, encode_sec_protocols,
 )
 
+FRAME_LOG = open(os.environ["ART_FRAME_LOG"], "a") if os.environ.get("ART_FRAME_LOG") else None
 INITIAL_WINDOW_S = 3.0     # puts within this of connect = "initial" latency
 
 
@@ -253,6 +254,17 @@ async def play_session(sess: dict, a, mapper: TraceMapper, identity: dict,
                 continue
             tag = msg[0]
             body = msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
+            if FRAME_LOG is not None:  # ART_FRAME_LOG=<path>: per-client frame-sequence oracle
+                dq = body.get("desiredQueriesPatches")
+                FRAME_LOG.write(json.dumps({
+                    "cg": cgid, "t": round(time.perf_counter() - connected_at, 3), "tag": tag,
+                    "pokeID": body.get("pokeID"), "cookie": body.get("cookie"),
+                    "cancel": body.get("cancel"),
+                    "got": [(g.get("op"), g.get("hash")) for g in (body.get("gotQueriesPatch") or [])],
+                    "desired": [[(g.get("op"), g.get("hash")) for g in (d or [])] for d in dq.values()]
+                               if isinstance(dq, dict) else None,
+                    "rows": len(body.get("rowsPatch") or []),
+                }) + "\n"); FRAME_LOG.flush()
             if tag == "pokeEnd":
                 stats.pokes += 1
                 ck = body.get("cookie")
