@@ -1109,9 +1109,27 @@ if [ "$TELEMETRY" = "1" ]; then
   # Metrics: the candidate exports OTLP -> otel-collector -> Prometheus text on
   # the collector's host port (rust binary has no direct :4849 scrape endpoint).
   # Events: frontend-origin telemetry cannot exist in a headless run -> NA local.
-  # Default to whatever PROM_URL resolved to above (the cache's own :3200 when
-  # reachable), not the bare OTel-collector default that is usually absent.
-  ART_METRICS_URL="${ART_METRICS_URL:-$PROM_URL}"
+  # G17 checks the OTel/OTLP contract (zero_sync_*_seconds_bucket, ...). Those
+  # instruments are exported over OTLP to a collector, which renders them as
+  # Prometheus text -- classically on :9464.
+  #
+  # They are NOT on the cache's own :3200. That endpoint is a separate,
+  # hand-rolled registry (rust-syncer render_prometheus()) with ~12 differently
+  # named series; scoring the OTLP contract against it reports every contract
+  # metric as "missing", which reads as a rust regression when it is just the
+  # wrong registry. An earlier version of this block did exactly that.
+  #
+  # So: only run G17 against something that actually serves the contract, and
+  # SKIP (no report) otherwise -- an unevaluated contract must not look like a
+  # failed one.
+  ART_METRICS_URL="${ART_METRICS_URL:-http://localhost:9464/metrics}"
+  if ! curl -sf --connect-timeout 2 "$ART_METRICS_URL" 2>/dev/null | grep -q "^zero_sync_"; then
+    echo "NOTE: G17 SKIPPED — no OTLP metrics endpoint serving the zero_sync_* contract" >&2
+    echo "      at $ART_METRICS_URL (otel-collector sidecar not running?)." >&2
+    echo "      The cache's own :3200 is a DIFFERENT hand-rolled registry and cannot" >&2
+    echo "      satisfy this contract — pointing G17 at it yields false 'missing'." >&2
+    TELEMETRY=0
+  fi
   set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json \
     --metrics-url "$ART_METRICS_URL" --events-mode na \
     --container "$ZCACHE" --since "$RUN_START_ISO" --out "$TELEMETRY_REPORT"; set -e
