@@ -139,10 +139,23 @@ async def probe_payload_cap(a) -> dict:
         return {"name": "payload-cap", "verdict": "ERROR",
                 "detail": f"connect failed: {type(e).__name__}: {e}"}
     try:
-        # 1) A normal-size unknown message must NOT kill the connection heap-
-        #    first: send ~100KB of valid JSON the server will just reject/ignore.
+        # 1) A large but SCHEMA-VALID message must be accepted (connection
+        #    survives). The padding goes in `traceparent`, a real optional
+        #    string on changeDesiredQueriesBodySchema (zero-protocol/src/
+        #    change-desired-queries.ts:4-8).
+        #
+        #    It used to pad an UNKNOWN key ("pad"), which cannot test the size
+        #    cap at all: zero parses upstream with strict valita
+        #    (zero-cache/src/workers/connection.ts:204), so an unrecognized key
+        #    closes the connection with InvalidMessage before size is ever
+        #    considered. Measured 2026-09-06 -- BOTH engines closed it and both
+        #    "failed" this probe: rust with `unknown field `pad`, expected
+        #    `desiredQueriesPatch` or `traceparent``, TS with `TypeError:
+        #    Invalid union value: [...]`. So step 1 could never pass, and
+        #    step 2's "rejected" was that same schema close, meaning the probe
+        #    would have passed even with NO size cap in the server.
         normal = json.dumps(["changeDesiredQueries",
-                             {"desiredQueriesPatch": [], "pad": "x" * 100_000}])
+                             {"desiredQueriesPatch": [], "traceparent": "x" * 100_000}])
         await ws.send(normal)
         await asyncio.sleep(0.5)
         alive_after_normal = True
@@ -153,8 +166,10 @@ async def probe_payload_cap(a) -> dict:
 
         # 2) An oversized (> cap) message must be rejected: the server closes
         #    (1009 message-too-big is the tungstenite/ws convention).
+        # Same schema-valid shape, over the cap -- so a rejection here is the
+        # SIZE cap and nothing else.
         big = json.dumps(["changeDesiredQueries",
-                          {"desiredQueriesPatch": [], "pad": "x" * (cap + 512 * 1024)}])
+                          {"desiredQueriesPatch": [], "traceparent": "x" * (cap + 512 * 1024)}])
         rejected, close_code = False, None
         try:
             await ws.send(big)

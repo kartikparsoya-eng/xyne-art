@@ -52,7 +52,7 @@ cd "$DIR"
 SANDBOX="rust-test"; CONNS=50; WORKING_SET=12; CHURN_MS=750; DURATION=180
 MUTATIONS=0; MUT_RATE=10; REFRESH=0; USER_ID=""; USERS=1; LIFECYCLE=0; SOAK=0; CLEAN=0; ZIPF=0; ORACLE=0; CHAOS=0; NEGATIVE=0; MUTMATRIX=0
 PROTOCOL=0; TELEMETRY=0; COLDSTART=0; READINESS=0; DRAIN=0; DETERMINISM=0; CAPACITY=0; IMAGEAUDIT=0; UPGRADE=0; PARITY=0; PARITY_FACTOR=2.0; CASCADE=0; OVERSAMPLE=0; WRITE_PARITY=0; PROD_BUDGET=0; PORTPROBES=0
-IMAGE=""; HTTP_PORT=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=50; DRAIN_BUDGET=30
+IMAGE=""; HTTP_PORT=""; READINESS_HTTP_OVERRIDE=""; CAPACITY_LADDER="10,25,50,100,200"; CAPACITY_BLESSED=50; DRAIN_BUDGET=30
 CHAOS_MEAN_GAP=45
 PROFILE=""; WS_SET=0; CHURN_SET=0; MUT_SET=0; SWAP=0
 CONNS_SET=0; DUR_SET=0; TRACE=""; TCOMPRESS=1
@@ -122,6 +122,11 @@ while [ $# -gt 0 ]; do
     --image) IMAGE="$2"; shift 2;;
     --image-audit) IMAGEAUDIT=1; shift;;
     --http-port) HTTP_PORT="$2"; shift 2;;
+    # zero-cache serves /healthz + /readyz at its ROOT (zero-dispatcher.ts:37-38),
+    # not under the WS path. Deriving the probe URL from the ws target yields
+    # http://host/zero/healthz, which Traefik does not route -> a permanent 404
+    # FAIL that tests nothing. Pass the cache's own base URL here.
+    --readiness-http) READINESS_HTTP_OVERRIDE="$2"; shift 2;;
     --drain-budget) DRAIN_BUDGET="$2"; shift 2;;
     --upgrade) UPGRADE=1; shift;;
     --parity) PARITY=1; shift;;
@@ -312,10 +317,38 @@ MIRROR_URL="ws://${SANDBOX}.localhost/zero-ts"
 [ -n "$OVERRIDE_CONTAINER" ] && ZCACHE="$OVERRIDE_CONTAINER"
 [ -n "$OVERRIDE_CVR_SCHEMA" ] && CVR_SCHEMA="$OVERRIDE_CVR_SCHEMA"
 [ -n "$OVERRIDE_MIRROR" ] && MIRROR_URL="$OVERRIDE_MIRROR"
+# `ws://<sandbox>.localhost/zero-ts` is NOT routed to the TS pod by Traefik --
+# it falls through to the RUST cache. On 2026-09-06 a G31 comparison "confirmed
+# TS behaves identically" while actually running against rust twice; the tell
+# was the TS container logging zero connection activity. The oracle path never
+# hit this because it resolves MIRROR_POD to its container IP (see below).
+# Do the same here so every mirror consumer addresses the real TS pod.
+MIRROR_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$MIRROR_POD" 2>/dev/null || true)
+if [ -n "$MIRROR_IP" ]; then
+  MIRROR_URL="ws://${MIRROR_IP}:4848"
+else
+  # A STOPPED mirror has no IP, and silently keeping the /zero-ts URL would put
+  # the trap straight back: it resolves to the RUST cache, so any "compare
+  # against TS" would compare rust with itself and look like agreement. Blank it
+  # and say so, so consumers SKIP instead of producing a confident wrong answer.
+  echo "WARN: cannot resolve $MIRROR_POD (not running?) — mirror comparisons will SKIP." >&2
+  echo "      NOT falling back to ws://${SANDBOX}.localhost/zero-ts: that path is not" >&2
+  echo "      routed to the TS pod and lands on the rust cache instead." >&2
+  MIRROR_URL=""
+fi
+
 PPROF_FLAGS=()
 PROM_FLAGS=()
-# OTel Prometheus endpoint: scrape if the collector sidecar is running
+# OTel Prometheus endpoint. `localhost:9464` is the OTel Prometheus-exporter
+# default and only exists if a collector sidecar is running on the HOST; the
+# rust cache exports its own registry on :3200 inside sandbox-net. With the
+# stale default G17 scraped nothing and reported "0/12 metrics checked" as an
+# ERROR, which reads like a rust regression rather than an unreachable URL.
 PROM_URL="http://localhost:9464/metrics"
+ZCACHE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ZCACHE" 2>/dev/null || true)
+if [ -n "$ZCACHE_IP" ] && curl -sf --connect-timeout 2 "http://${ZCACHE_IP}:3200/metrics" >/dev/null 2>&1; then
+  PROM_URL="http://${ZCACHE_IP}:3200/metrics"
+fi
 PROM_AVAILABLE=0
 if curl -sf --connect-timeout 2 "$PROM_URL" >/dev/null 2>&1; then
   PROM_FLAGS=(--prom "$PROM_URL")
@@ -1076,7 +1109,9 @@ if [ "$TELEMETRY" = "1" ]; then
   # Metrics: the candidate exports OTLP -> otel-collector -> Prometheus text on
   # the collector's host port (rust binary has no direct :4849 scrape endpoint).
   # Events: frontend-origin telemetry cannot exist in a headless run -> NA local.
-  ART_METRICS_URL="${ART_METRICS_URL:-http://localhost:9464/metrics}"
+  # Default to whatever PROM_URL resolved to above (the cache's own :3200 when
+  # reachable), not the bare OTel-collector default that is usually absent.
+  ART_METRICS_URL="${ART_METRICS_URL:-$PROM_URL}"
   set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json \
     --metrics-url "$ART_METRICS_URL" --events-mode na \
     --container "$ZCACHE" --since "$RUN_START_ISO" --out "$TELEMETRY_REPORT"; set -e
@@ -1084,7 +1119,9 @@ fi
 if [ "$READINESS" = "1" ]; then
   READINESS_REPORT="reports/readiness-$TAG.json"
   READINESS_HTTP="http${TARGET#ws}"
-  if [ -n "$HTTP_PORT" ]; then
+  if [ -n "$READINESS_HTTP_OVERRIDE" ]; then
+    READINESS_HTTP="$READINESS_HTTP_OVERRIDE"
+  elif [ -n "$HTTP_PORT" ]; then
     READINESS_TARGET="${TARGET#*://}"
     READINESS_HOST="${READINESS_TARGET%%/*}"
     READINESS_PATH="/${READINESS_TARGET#*/}"
@@ -1126,9 +1163,18 @@ if [ "$UPGRADE" = "1" ]; then
       UPGRADE_REPORT=""
     fi
   elif docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
-    echo "NOTE: no previous image ($PREV_IMAGE) — falling back to cross-syncer handover vs the mirror" >&2
-    echo "      (only meaningful if the mirror shares the candidate's CVR schema)" >&2
-    set +e; "$PY" tools/upgrade_path.py --baseline-target "$MIRROR_URL" --candidate-target "$TARGET" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --out "$UPGRADE_REPORT"; set -e
+    # The mirror runs a DIFFERENT app-id, so it writes a different CVR schema and
+    # the candidate rightly rejects the resume with ClientNotFound. As the block
+    # comment above says, this path "can only produce false FAILs" -- so do not
+    # run it and do not emit a report: no report => G24 SKIPs, which is honest.
+    # A real G24 needs the previously blessed image, e.g.
+    #   docker tag zero-cache-rust-syncer:<prev-commit> zero-cache-rust-syncer:prev
+    # (or PREV_RUST_IMAGE=...) and --bootstrap, which does the actual swap.
+    echo "NOTE: G24 SKIPPED — no previous image ($PREV_IMAGE)." >&2
+    echo "      The mirror has a different app-id; a cross-pod resume is rejected by" >&2
+    echo "      design and would be a false FAIL. Tag the last blessed rust image as" >&2
+    echo "      '$PREV_IMAGE' and re-run with --bootstrap for a real upgrade test." >&2
+    UPGRADE_REPORT=""
   else
     echo "NOTE: $MIRROR_POD not running — G24 needs a second image target (start zero-cache-ts)" >&2
   fi
@@ -1225,6 +1271,21 @@ if [ "$DRAIN" = "1" ]; then
   DRAIN_REPORT="reports/drain-$TAG.json"
   echo "== SIGTERM drain test (G20) — KILLS $ZCACHE =="
   set +e; "$PY" tools/drain_test.py --target "$TARGET" --container "$ZCACHE" "${AUTHFLAGS[@]}" --id-pool "$POOL" --client-schema "$CSCHEMA" --drain-budget-s "$DRAIN_BUDGET" --out "$DRAIN_REPORT"; set -e
+  # drain_test.py leaves $ZCACHE STOPPED. The cold-start block above already
+  # restarts + sleeps for exactly this reason; drain did not, so every gate
+  # after this point (D4 park-site, the wedge check, the resource summary) ran
+  # against a dead server -- and the NEXT run aborted at its container
+  # precondition ("ERROR: container ... is not running"). Both happened on
+  # 2026-09-06. Bring it back and wait for healthy before continuing.
+  echo "  (restarting $ZCACHE after the drain test)"
+  docker start "$ZCACHE" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    st=$(docker inspect -f '{{.State.Health.Status}}{{end}}' "$ZCACHE" 2>/dev/null \
+         || docker inspect -f '{{.State.Status}}' "$ZCACHE" 2>/dev/null)
+    case "$st" in healthy|running) break;; esac
+    sleep 2
+  done
+  sleep 3
 fi
 
 # --- 6f) park-site invariant (D4) ----------------------------------------------

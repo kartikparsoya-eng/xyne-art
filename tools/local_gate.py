@@ -111,8 +111,21 @@ def load_baseline_shapes(path: str) -> dict:
 
 
 def newest(pattern: str) -> str | None:
-    files = sorted(glob.glob(pattern))
-    return files[-1] if files else None
+    # Sort by MODIFICATION TIME, not by name.
+    #
+    # `sorted(glob(...))` is lexicographic, so ANY run report whose name does not
+    # start with the timestamp sorts after every run-YYYYMMDD-HHMMSS.json and
+    # shadows the real one forever ('c' > '2'). On 2026-09-06 one such file,
+    # run-cpuclock-20260906-122839-ts.json (a 60-minute A/B TS arm, opened=1060),
+    # silently supplied G1/G2/G4/G9/G13/G29 with another run's numbers on every
+    # gate table of the day -- runs that had actually opened 8 connections were
+    # judged on 1060 sessions, 427 errors and 0/4001 mutations from a different
+    # engine. A gate reading the wrong input is worse than no gate.
+    #
+    # run-art-local.sh already uses `ls -t` (mtime) at its own two sites; this
+    # makes the gate agree with them.
+    files = glob.glob(pattern)
+    return max(files, key=os.path.getmtime) if files else None
 
 
 def main() -> int:

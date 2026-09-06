@@ -703,7 +703,15 @@ async def amain(a: argparse.Namespace) -> int:
               file=sys.stderr)
         # Name the divergence instead of aborting blind: which tables/keys and
         # which rows differ between the two sides right now.
-        from diff_oracle import diff_states
+        #
+        # NB: no local `from diff_oracle import diff_states` here. It is already
+        # imported at module scope (top of file), and a function-local import
+        # binds the name as a LOCAL for the whole enclosing function -- so the
+        # other call below (in the diverged-wave branch) raised
+        #   NameError: free variable 'diff_states' referenced before assignment
+        #              in enclosing scope
+        # whenever a wave diverged without this early-convergence branch having
+        # run first, killing G15 outright (2026-09-06).
         d = diff_states(sides[0].mat, sides[1].mat, max_examples=8)
         print(f"INFRA-DIAG: total diff = {d.get('mismatches')} "
               f"(rows primary={sides[0].mat.rows_applied} "
