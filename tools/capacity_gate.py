@@ -65,6 +65,27 @@ def _run_point(path: str) -> dict | None:
             "opened": int(c.get("opened", 0))}
 
 
+def mutation_flags(a) -> list[str]:
+    """replay.py mutation flags for a rung, or [] when writes are off.
+
+    The mutate URL is the APP's push endpoint, which is the same for both arms:
+    a mutation is POSTed to the app, lands in Postgres, and reaches candidate
+    and mirror alike through their own replicas — so the A/B sees the same
+    write load.
+    """
+    if not a.enable_mutations:
+        return []
+    url = a.mutate_url
+    if not url:
+        base = (a.target or "").split("/zero")[0]
+        base = base.replace("wss://", "https://").replace("ws://", "http://")
+        url = base + "/api/zero/push"
+    flags = ["--enable-mutations", "--i-know-this-writes", "--mutate-url", url]
+    if a.mutations_per_min is not None:
+        flags += ["--mutations-per-min", str(a.mutations_per_min)]
+    return flags
+
+
 def drive_rung(target: str, auth_token: str | None, id_pool: str,
                conns: int, duration: int, extra: list[str], protocol: int,
                tag: str, client_schema: str | None = None,
@@ -186,6 +207,19 @@ def main() -> int:
     ap.add_argument("--id-pool", default="harness/id-pool.json")
     ap.add_argument("--client-schema", default=None)
     ap.add_argument("--extra-param", action="append", default=[])
+    # A read-only ladder measures only the read path. Prod clients also WRITE,
+    # and one mutation costs the syncer a push relay + a replica advance + a
+    # poke to every subscriber of the touched rows, so the knee under writes is
+    # the number that matters. Same flags run-art-local.sh uses for its replay
+    # stages (--enable-mutations --i-know-this-writes --mutate-url).
+    ap.add_argument("--enable-mutations", action="store_true",
+                    help="drive read-tracking custom mutations on every rung "
+                         "(WRITES to the target DB)")
+    ap.add_argument("--mutate-url", default=None,
+                    help="app direct-mutation endpoint; default: derived from "
+                         "--target (ws://host/zero -> http://host/api/zero/push)")
+    ap.add_argument("--mutations-per-min", type=int, default=None,
+                    help="mutations per client per minute (replay default 4)")
     ap.add_argument("--ladder", default="10,25,50,100,200",
                     help="comma-sep conn counts, or 'auto' to binary-search the knee")
     ap.add_argument("--search-start", type=int, default=4,
@@ -234,6 +268,7 @@ def main() -> int:
         extra = []
         for p in a.extra_param:
             extra += ["--extra-param", p]
+        extra += mutation_flags(a)
         if a.ladder.strip().lower() == "auto":
             # Binary-search the knee rather than walking a fixed ladder.
             print(f"== auto knee search: start={a.search_start} max={a.search_max} "
@@ -275,6 +310,7 @@ def main() -> int:
         extra = []
         for p in a.extra_param:
             extra += ["--extra-param", p]
+        extra += mutation_flags(a)
         mpaths = []
         if a.ladder.strip().lower() == "auto":
             # Same gallop+bisect against the reference build so the A/B

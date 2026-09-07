@@ -275,6 +275,7 @@ def compute_write_parity(primary_pokes: list[float], mirror_pokes: list[float],
 # Drive mode: invoke replay.py against primary + mirror
 # --------------------------------------------------------------------------- #
 def drive_replay(target: str, auth_token: str | None, id_pool: str,
+                 auth_pool: str | None = None, *,
                  conns: int, working_set: int, churn_ms: int, duration: int,
                  extra: list[str], protocol: int, tag: str, label: str,
                  profile: str | None = None) -> str:
@@ -285,7 +286,12 @@ def drive_replay(target: str, auth_token: str | None, id_pool: str,
            "--churn-ms", str(churn_ms), "--duration", str(duration),
            "--protocol-version", str(protocol), "--out-dir", out_dir,
            "--client-schema", "harness/client-schema.json"]
-    if auth_token:
+    if auth_pool:
+        # One identity per connection (replay.py round-robins the pool). With a
+        # single token every connection shares ONE backend rate-limit bucket on
+        # the custom-query transform and the 429 storm reads as latency.
+        cmd += ["--auth-pool", auth_pool]
+    elif auth_token:
         cmd += ["--auth-token", auth_token]
     if profile:
         cmd += ["--profile", profile]
@@ -330,10 +336,20 @@ def validate_run(path: str) -> tuple[dict | None, str | None]:
 # --------------------------------------------------------------------------- #
 # Oversample mode: targeted single-query probe for low-weight queries
 # --------------------------------------------------------------------------- #
+def load_auth_pool(path: str | None) -> list[dict]:
+    """The identities replay.py round-robins over. Returns [] when unset."""
+    if not path:
+        return []
+    with open(path) as fh:
+        doc = json.load(fh)
+    return doc if isinstance(doc, list) else doc.get("users", [])
+
+
 async def oversample_query(target: str, version: int, auth_token: str | None,
                            extra_params: list[tuple[str, str]], query_name: str,
                            resolver: ArgResolver, client_schema: dict | None,
-                           n_samples: int, timeout_s: float = 5.0) -> list[float]:
+                           n_samples: int, timeout_s: float = 5.0,
+                           auth_pool: list[dict] | None = None) -> list[float]:
     """Fire one query n_samples times across fresh connections, collecting
     hydration latencies. Decouples sample count from prod weight."""
     import websockets
@@ -343,19 +359,34 @@ async def oversample_query(target: str, version: int, auth_token: str | None,
     if op is None:
         return []
     times: list[float] = []
-    for _ in range(n_samples):
+    for _i in range(n_samples):
+        # One identity per sample, round-robin (replay.py's rule): a tail sweep
+        # fires n_samples x 2 arms of fresh connections, which on ONE identity
+        # trips the backend's 300/60s per-user transform limit and returns 429s
+        # instead of latencies.
+        tok, user_id = auth_token, None
+        if auth_pool:
+            _ident = auth_pool[_i % len(auth_pool)]
+            tok = _ident.get("token") or auth_token
+            user_id = _ident.get("userID")
         args, _ = resolver.resolve(op)
         put = query_put(query_name, args, ttl_ms=60_000)
         init = init_connection_message([put], client_schema=client_schema)
         rng = random.Random()
         cgid = "art-os-" + "".join(rng.choice("abc012") for _ in range(10))
+        _use_tok = tok  # picked above; oversample's own connection identity
         cid = "art-os-" + "".join(rng.choice("abc012") for _ in range(10))
         params = {"clientGroupID": cgid, "clientID": cid, "baseCookie": "",
                   "ts": str(time.time() * 1000), "lmid": "0"}
+        if user_id:
+            # The server closes an authenticated connection that carries no
+            # userID (TS resolveAuth, auth.ts); replay.py:250 sets it the same
+            # way, from the identity whose token it sends.
+            params["userID"] = user_id
         params.update(extra_params)
         url = (target.rstrip("/") + f"/sync/v{version}/connect?"
                + urllib.parse.urlencode(params))
-        sec = encode_sec_protocols(None, auth_token)
+        sec = encode_sec_protocols(None, _use_tok)
         t0 = time.perf_counter()
         try:
             async with websockets.connect(url, subprotocols=[sec], open_timeout=15,
@@ -370,7 +401,9 @@ async def oversample_query(target: str, version: int, auth_token: str | None,
                     except Exception:
                         break
                     msg = json.loads(raw) if raw else None
-                    if isinstance(msg, list) and msg and msg[0] == "poke":
+                    # v51 splits a poke into pokeStart / pokePart* / pokeEnd;
+                    # there is no bare "poke" frame (replay.py:546-571).
+                    if isinstance(msg, list) and msg and msg[0] == "pokeEnd":
                         times.append(round((time.perf_counter() - t0) * 1000, 1))
                         break
         except Exception:
@@ -502,7 +535,9 @@ async def cascade_probe(target: str, version: int, auth_token: str | None,
                     except Exception:
                         break
                     msg = json.loads(raw) if raw else None
-                    if isinstance(msg, list) and msg and msg[0] == "poke":
+                    # v51 splits a poke into pokeStart / pokePart* / pokeEnd;
+                    # there is no bare "poke" frame (replay.py:546-571).
+                    if isinstance(msg, list) and msg and msg[0] == "pokeEnd":
                         hydrate_times.append(round((time.perf_counter() - t0) * 1000, 1))
                         break
         except Exception:
@@ -615,13 +650,17 @@ async def amain(a: argparse.Namespace) -> dict:
             extra += ["--extra-param", p]
         try:
             p_path = drive_replay(a.primary_target, a.auth_token, a.id_pool,
-                                  a.connections, a.working_set, a.churn_ms,
-                                  a.duration, extra, a.protocol_version, tag, "primary",
-                                  a.profile)
+                                  a.auth_pool,
+                                  conns=a.connections, working_set=a.working_set,
+                                  churn_ms=a.churn_ms, duration=a.duration,
+                                  extra=extra, protocol=a.protocol_version,
+                                  tag=tag, label="primary", profile=a.profile)
             m_path = drive_replay(a.mirror_target, a.auth_token, a.id_pool,
-                                  a.connections, a.working_set, a.churn_ms,
-                                  a.duration, extra, a.protocol_version, tag, "mirror",
-                                  a.profile)
+                                  a.auth_pool,
+                                  conns=a.connections, working_set=a.working_set,
+                                  churn_ms=a.churn_ms, duration=a.duration,
+                                  extra=extra, protocol=a.protocol_version,
+                                  tag=tag, label="mirror", profile=a.profile)
         except (OSError, subprocess.SubprocessError) as e:
             checks.append({"name": "drive", "verdict": "ERROR",
                            "detail": f"replay invocation failed: {type(e).__name__}: {e}"})
@@ -671,6 +710,13 @@ async def amain(a: argparse.Namespace) -> dict:
     result = compute_ratios(primary_pq, mirror_pq, a.factor, a.min_delta_ms,
                             a.min_samples, a.min_baseline_ms, a.quantile)
     checks.append({"name": "ratio", "verdict": result["verdict"],
+                   # Persist the per-query numbers, not just the verdict: the
+                   # threshold is a policy, the measurements are the evidence,
+                   # and a report without them cannot be re-read at a stricter
+                   # factor or plotted over time.
+                   "quantile": a.quantile,
+                   "ratios": result.get("ratios"),
+                   "offenders": result.get("offenders"),
                    "detail": f"{result['compared']} queries compared; "
                              f"{len(result['offenders'])} parity violation(s)"})
     for o in result["offenders"][:8]:
@@ -688,16 +734,55 @@ async def amain(a: argparse.Namespace) -> dict:
             client_schema = json.load(open(a.client_schema)) if a.client_schema else None
             extra_params = [tuple(p.split("=", 1)) for p in a.extra_param]
             sampled = []
+            # BOTH sides. Probing only the primary gave the catalog tail a
+            # rust number with nothing to compare it to, so "parity across the
+            # catalog" silently meant "parity across the top --working-set by
+            # prod weight". Same query, same args (one resolver, seeded), same
+            # sample count against each target.
+            tail_pool = load_auth_pool(a.auth_pool)
+            seen = set()
+            tail_offenders = []
             for u in undersampled[:a.oversample_queries]:
-                times = await oversample_query(
+                qname = u["query"]
+                if qname in seen:
+                    continue
+                seen.add(qname)
+                p_times = await oversample_query(
                     a.primary_target, a.protocol_version, a.auth_token,
-                    extra_params, u["query"], resolver, client_schema,
-                    a.min_samples)
-                sampled.append({"query": u["query"], "collected": len(times),
-                                 "p95": sorted(times)[int(len(times) * 0.95)] if times else None})
-            checks.append({"name": "oversample", "verdict": "PASS",
-                           "detail": f"boosted {len(sampled)} low-weight queries to "
-                                     f"{a.min_samples} samples"})
+                    extra_params, qname, resolver, client_schema, a.min_samples,
+                    auth_pool=tail_pool)
+                m_times = []
+                if a.mirror_target:
+                    m_times = await oversample_query(
+                        a.mirror_target, a.protocol_version, a.auth_token,
+                        extra_params, qname, resolver, client_schema, a.min_samples,
+                        auth_pool=tail_pool)
+
+                def _p95(xs):
+                    return sorted(xs)[int(len(xs) * 0.95)] if xs else None
+
+                p95_p, p95_m = _p95(p_times), _p95(m_times)
+                ratio = (p95_p / p95_m) if (p95_p and p95_m) else None
+                row = {"query": qname, "collected": len(p_times),
+                       "mirror_collected": len(m_times),
+                       "p95": p95_p, "mirror_p95": p95_m, "ratio": ratio}
+                sampled.append(row)
+                # Same admission rule as the weighted comparison: a ratio only
+                # counts when both sides have samples and the absolute delta is
+                # worth reporting.
+                if (ratio is not None and ratio > a.factor
+                        and p95_p is not None and p95_m is not None
+                        and (p95_p - p95_m) >= a.min_delta_ms
+                        and p95_m >= a.min_baseline_ms):
+                    tail_offenders.append(row)
+            compared = sum(1 for r in sampled if r.get("ratio") is not None)
+            checks.append({"name": "oversample",
+                           "verdict": "FAIL" if tail_offenders else "PASS",
+                           "queries": sampled,
+                           "offenders": tail_offenders,
+                           "detail": f"tail: {len(sampled)} low-weight queries at "
+                                     f"{a.min_samples} samples/side, {compared} compared "
+                                     f"vs mirror, {len(tail_offenders)} over {a.factor}x"})
         else:
             checks.append({"name": "oversample", "verdict": "PASS",
                            "detail": "all queries above sample floor"})
@@ -776,6 +861,10 @@ def main() -> int:
     ap.add_argument("--auth-token", default=None)
     ap.add_argument("--extra-param", action="append", default=[])
     ap.add_argument("--id-pool", default="harness/id-pool.json")
+    ap.add_argument("--auth-pool", default=None,
+                    help="JSON [{token,userID},...]: connections round-robin "
+                         "across identities so a per-user backend rate limit "
+                         "cannot masquerade as latency")
     ap.add_argument("--client-schema", default=None)
     ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
     ap.add_argument("--connections", type=int, default=50)
