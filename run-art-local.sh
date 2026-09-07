@@ -1143,16 +1143,28 @@ if [ "$TELEMETRY" = "1" ]; then
   # SKIP (no report) otherwise -- an unevaluated contract must not look like a
   # failed one.
   ART_METRICS_URL="${ART_METRICS_URL:-$PROM_URL}"
-  if ! curl -sf --connect-timeout 2 "$ART_METRICS_URL" 2>/dev/null | grep -q "^zero_sync_"; then
+  # Three tries: one transient miss (6d 2026-09-07 printed SKIPPED against a
+  # collector that answered a second later) must not decide the gate.
+  METRICS_UP=0
+  for _try in 1 2 3; do
+    if curl -sf --connect-timeout 2 --max-time 10 "$ART_METRICS_URL" 2>/dev/null | grep -q "^zero_sync_"; then
+      METRICS_UP=1; break
+    fi
+    sleep 2
+  done
+  if [ "$METRICS_UP" != "1" ]; then
     echo "NOTE: G17 SKIPPED — no OTLP metrics endpoint serving the zero_sync_* contract" >&2
     echo "      at $ART_METRICS_URL (otel-collector sidecar not running?)." >&2
     echo "      The cache's own :3200 is a DIFFERENT hand-rolled registry and cannot" >&2
     echo "      satisfy this contract — pointing G17 at it yields false 'missing'." >&2
     TELEMETRY=0
+  else
+    # Only run when the endpoint answered: before, the NOTE printed and the
+    # contract ran anyway, so a SKIP announcement was followed by a FAIL verdict.
+    set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json \
+      --metrics-url "$ART_METRICS_URL" --events-mode na \
+      --container "$ZCACHE" --since "$RUN_START_ISO" --out "$TELEMETRY_REPORT"; set -e
   fi
-  set +e; "$PY" tools/telemetry_contract.py --baseline art-baseline.json \
-    --metrics-url "$ART_METRICS_URL" --events-mode na \
-    --container "$ZCACHE" --since "$RUN_START_ISO" --out "$TELEMETRY_REPORT"; set -e
 fi
 if [ "$READINESS" = "1" ]; then
   READINESS_REPORT="reports/readiness-$TAG.json"
