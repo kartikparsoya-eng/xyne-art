@@ -1142,7 +1142,7 @@ if [ "$TELEMETRY" = "1" ]; then
   # So: only run G17 against something that actually serves the contract, and
   # SKIP (no report) otherwise -- an unevaluated contract must not look like a
   # failed one.
-  ART_METRICS_URL="${ART_METRICS_URL:-http://localhost:9464/metrics}"
+  ART_METRICS_URL="${ART_METRICS_URL:-$PROM_URL}"
   if ! curl -sf --connect-timeout 2 "$ART_METRICS_URL" 2>/dev/null | grep -q "^zero_sync_"; then
     echo "NOTE: G17 SKIPPED — no OTLP metrics endpoint serving the zero_sync_* contract" >&2
     echo "      at $ART_METRICS_URL (otel-collector sidecar not running?)." >&2
