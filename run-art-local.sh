@@ -1073,6 +1073,7 @@ if [ "$MUTMATRIX" = "1" ]; then
       --id-pool "$POOL" --client-schema "$CSCHEMA" \
       --pg-container "$PG" --pg-user xyne --pg-db "$DB" \
       --i-know-this-writes \
+      --exclude-queries "${ORACLE_EXCLUDE:-}" \
       --out "$MUTMATRIX_REPORT"
     set -e
   fi

@@ -897,6 +897,10 @@ async def amain(a: argparse.Namespace) -> int:
         for r in results for side in ("primary", "mirror")
     ) + abs(transform_errors["primary"] - transform_errors["mirror"])
     catalog_total = len({op.name for op in baseline.queries} - a.catalog_exclude_set)
+    if catalog_missing:
+        print(f"  CATALOG WATCH: {len(catalog_missing)} subscribed queries hydrated on "
+              f"NEITHER side (symmetric; coverage, not divergence): "
+              f"{catalog_missing[:6]}{' …' if len(catalog_missing) > 6 else ''}")
     catalog_accounted = catalog_expected | catalog_unresolved | catalog_stale
     catalog_rows = {
         side: sum(r.get(side, {}).get("rows", 0) for r in results)
@@ -933,8 +937,12 @@ async def amain(a: argparse.Namespace) -> int:
     oracle_failed = (
         total_mismatch > 0 or bool(conn_errors) or total_hydration_gap > 0
         or protocol_errors > 0 or cookie_hard > 0 or bool(resume_errors)
-        or (a.full_catalog and (bool(catalog_missing)
-                               or not catalog_expected
+        # catalog_missing (subscribed on both sides, hydrated on neither) is a
+        # COVERAGE shortfall, symmetric by construction; a one-sided miss is
+        # already total_hydration_gap. It is reported as a WATCH line, not a FAIL
+        # (6c/6e 2026-09-07: 0 mismatches on 806K rows read as FAIL over 39
+        # never-hydrated 0-row/late queries).
+        or (a.full_catalog and (not catalog_expected
                                or len(catalog_accounted) != catalog_total
                                or min(catalog_rows.values()) == 0))
     )

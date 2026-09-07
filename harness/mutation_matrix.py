@@ -653,8 +653,9 @@ async def amain(a: argparse.Namespace) -> int:
     resolver = ArgResolver.from_pool_file(a.id_pool, rng, zipf_s=0.0)
     current_query_names = set((schemas_doc.get("queries") or {}).keys())
     puts = []
+    excluded = {n.strip() for n in (a.exclude_queries or "").split(",") if n.strip()}
     for op in baseline.queries:
-        if op.name not in current_query_names:
+        if op.name not in current_query_names or op.name in excluded:
             continue
         args, ok = resolver.resolve(op)
         if ok:
@@ -1116,6 +1117,11 @@ def main() -> int:
     ap.add_argument("--pg-db", default="sandbox_rust_test_db")
     ap.add_argument("--include", default=None,
                     help="regex filter on mutator names")
+    ap.add_argument("--exclude-queries", default="",
+                    help="comma-separated catalog query names NOT to subscribe "
+                         "(same list as the oracle's --catalog-exclude): one "
+                         "795K-row query costs ~25 GB rust / ~32 GB TS per CG "
+                         "and cap-kills both arms (6e 2026-09-07)")
     ap.add_argument("--max-mutators", type=int, default=0)
     ap.add_argument("--wave-size", type=int, default=8)
     ap.add_argument("--gap-ms", type=int, default=120)
