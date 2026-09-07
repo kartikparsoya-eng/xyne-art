@@ -1256,7 +1256,13 @@ if [ "$CAPACITY" = "1" ]; then
   if docker ps --format '{{.Names}}' | grep -qx "$MIRROR_POD"; then
     CAP_MIRROR_FLAGS=(--mirror-target "$MIRROR_URL")
   fi
-  set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${AUTHFLAGS[@]}" \
+  # AUTHFLAGS is reset to the single-token form for the single-identity probes
+  # above (line ~1113), so rebuild the pool flags here: every rung connection
+  # must be its own user or the backend's per-user transform limit (300/60s)
+  # trips at 8 connections and reads as the knee (7a 2026-09-07: 183x 429).
+  CAP_AUTH=(--auth-token "$JWT" --extra-param "userID=$FIRST_UID")
+  if [ "$N_IDENT" -gt 1 ]; then CAP_AUTH=(--auth-pool "$AUTH_POOL"); fi
+  set +e; "$PY" tools/capacity_gate.py --drive --target "$TARGET" "${CAP_AUTH[@]}" \
     --id-pool "$POOL" --client-schema "$CSCHEMA" --ladder "$CAPACITY_LADDER" \
     --blessed-conns "$CAPACITY_BLESSED" "${CAP_MIRROR_FLAGS[@]}" \
     --out "$CAPACITY_REPORT"; set -e
