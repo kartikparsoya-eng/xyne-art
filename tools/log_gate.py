@@ -476,6 +476,17 @@ ALLOWLIST: list[tuple[str, str]] = [
     # collector endpoint 404s); never a sync-correctness signal. The candidate's
     # own metric contract is guarded by G17, which scrapes the collector.
     ("otlp-export-404",     r"OTLPExporterError"),
+    # Negative suite with >=2 identities (--users N, xyne-art f02544f): the
+    # wrong-user-pinned-group case connects a second user to a CG pinned to the
+    # first, and update-auth-invalid rotates to a bad token. Both are the
+    # server REJECTING as designed (TS answers Unauthorized / AuthInvalidated;
+    # rust logs these WARNs first) — the suite asserts the rejection.
+    ("pinned-user-mismatch", r"User ID mismatch: pinned="),
+    ("update-auth-rejected", r"updateAuth verification failed"),
+    # The app's own input validation on a custom-query transform, relayed to
+    # the client verbatim as a transformError (same class as "Validation
+    # failed" above): synthetic args drift, not a server fault.
+    ("app-input-validation", r"InputValidationError"),
 ]
 
 

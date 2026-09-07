@@ -206,7 +206,15 @@ async def probe(a: argparse.Namespace) -> dict:
     checks.append({"name": "pass-B", "verdict": "PASS",
                    "detail": f"materialized {mat_b.rows_applied} rows, {len(mat_b.state)} tables"})
 
-    protocol_errors = sum(mat_a.error_kinds.values()) + sum(mat_b.error_kinds.values())
+    # transformError is the app's own answer (validation / query-not-found)
+    # forwarded verbatim; the diff oracle already treats it as non-protocol
+    # (only the cross-arm ASYMMETRY counts there). Same here: it must not turn
+    # two byte-identical row corpora into a "non-evidentiary" run (6d 2026-09-07:
+    # rows=1294/1294 yet FAIL on 2 InputValidationError transformErrors).
+    protocol_errors = sum(
+        c for k, c in list(mat_a.error_kinds.items()) + list(mat_b.error_kinds.items())
+        if k != "transformError"
+    )
     if mat_a.rows_applied == 0 or mat_b.rows_applied == 0 or protocol_errors:
         verdict = "FAIL"
         detail = (f"non-evidentiary run: rows={mat_a.rows_applied}/{mat_b.rows_applied}, "
