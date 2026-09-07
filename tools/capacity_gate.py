@@ -85,17 +85,84 @@ def drive_rung(target: str, auth_token: str | None, id_pool: str,
     return runs[-1] if runs else out_dir
 
 
+def is_healthy(p: dict, p95_threshold: float) -> bool:
+    """A rung is healthy iff it served every connection inside the p95 budget
+    with no errors. Shared by the fixed ladder and the binary search so both
+    agree on where the knee is."""
+    return (p["p95"] is not None and p["p95"] <= p95_threshold
+            and p["errors"] == 0 and p["failed_open"] == 0
+            and p["opened"] == p["connections"])
+
+
 def find_cliff(points: list[dict], p95_threshold: float) -> dict:
     """Highest rung where p95 <= threshold AND errors==0 AND failed_open==0."""
-    healthy = [p for p in points
-               if p["p95"] is not None and p["p95"] <= p95_threshold
-               and p["errors"] == 0 and p["failed_open"] == 0
-               and p["opened"] == p["connections"]]
+    healthy = [p for p in points if is_healthy(p, p95_threshold)]
     if not healthy:
         return {"cliff_conns": 0, "healthy_rungs": []}
     cliff = max(healthy, key=lambda p: p["connections"])
     return {"cliff_conns": cliff["connections"], "healthy_rungs": healthy,
             "cliff_point": cliff}
+
+
+def search_knee(probe, lo_start: int, hi_max: int, tol: int,
+                p95_threshold: float) -> list[dict]:
+    """Locate the capacity knee by GALLOP then BISECT instead of walking a fixed
+    ladder.
+
+    A fixed ladder spends most of its runs far from the knee and resolves it
+    only to the gap between two rungs — `10,25,50,100,200` can say no more than
+    "somewhere between 50 and 100". Galloping brackets the knee in
+    O(log hi_max) probes, then bisection narrows that bracket to `tol`
+    connections in O(log range) more, for a much tighter answer at a comparable
+    number of runs.
+
+    `probe(conns) -> point|None` drives one rung and returns its run point.
+    Returns every point probed, so the report still shows the whole curve.
+    """
+    points: list[dict] = []
+
+    def health(conns: int):
+        pt = probe(conns)
+        if pt is None:
+            return None
+        points.append(pt)
+        ok = is_healthy(pt, p95_threshold)
+        print(f"  probe {conns:>5}c -> p95={pt['p95']} errors={pt['errors']} "
+              f"failed_open={pt['failed_open']} -> {'healthy' if ok else 'UNHEALTHY'}",
+              flush=True)
+        return ok
+
+    # --- gallop: double until a rung breaks, so the bracket is [lo, hi] -------
+    lo = 0                      # highest known-healthy
+    hi = None                   # lowest known-unhealthy
+    conns = max(1, lo_start)
+    while conns <= hi_max:
+        ok = health(conns)
+        if ok is None:
+            break               # no usable report; stop rather than guess
+        if ok:
+            lo = conns
+            conns *= 2
+        else:
+            hi = conns
+            break
+    if hi is None:
+        # never broke inside the ceiling — the knee is at or above hi_max
+        return points
+
+    # --- bisect the bracket ---------------------------------------------------
+    while hi - lo > tol:
+        mid = (lo + hi) // 2
+        if mid == lo or mid == hi:
+            break
+        ok = health(mid)
+        if ok is None:
+            break
+        if ok:
+            lo = mid
+        else:
+            hi = mid
+    return points
 
 
 def main() -> int:
@@ -107,7 +174,14 @@ def main() -> int:
     ap.add_argument("--id-pool", default="harness/id-pool.json")
     ap.add_argument("--client-schema", default=None)
     ap.add_argument("--extra-param", action="append", default=[])
-    ap.add_argument("--ladder", default="10,25,50,100,200", help="comma-sep conn counts")
+    ap.add_argument("--ladder", default="10,25,50,100,200",
+                    help="comma-sep conn counts, or 'auto' to binary-search the knee")
+    ap.add_argument("--search-start", type=int, default=4,
+                    help="auto mode: first rung; doubles until a rung breaks")
+    ap.add_argument("--search-max", type=int, default=512,
+                    help="auto mode: stop galloping here (knee reported as >= this)")
+    ap.add_argument("--search-tolerance", type=int, default=2,
+                    help="auto mode: stop bisecting once the bracket is this narrow")
     ap.add_argument("--duration", type=int, default=120, help="per-rung duration (drive mode)")
     ap.add_argument("--protocol-version", type=int, default=DEFAULT_PROTOCOL_VERSION)
     ap.add_argument("--p95-threshold", type=float, default=5000.0,
@@ -148,10 +222,25 @@ def main() -> int:
         extra = []
         for p in a.extra_param:
             extra += ["--extra-param", p]
-        for conns in [int(x) for x in a.ladder.split(",")]:
-            paths.append(drive_rung(a.target, a.auth_token, a.id_pool, conns,
-                                    a.duration, extra, a.protocol_version, tag,
-                                    a.client_schema))
+        if a.ladder.strip().lower() == "auto":
+            # Binary-search the knee rather than walking a fixed ladder.
+            print(f"== auto knee search: start={a.search_start} max={a.search_max} "
+                  f"tolerance={a.search_tolerance} p95<={a.p95_threshold}ms ==", flush=True)
+
+            def probe(conns: int):
+                rp = drive_rung(a.target, a.auth_token, a.id_pool, conns,
+                                a.duration, extra, a.protocol_version, tag,
+                                a.client_schema)
+                paths.append(rp)
+                return _run_point(rp)
+
+            search_knee(probe, a.search_start, a.search_max,
+                        a.search_tolerance, a.p95_threshold)
+        else:
+            for conns in [int(x) for x in a.ladder.split(",")]:
+                paths.append(drive_rung(a.target, a.auth_token, a.id_pool, conns,
+                                        a.duration, extra, a.protocol_version, tag,
+                                        a.client_schema))
 
     points = [rp for rp in (_run_point(p) for p in paths) if rp is not None]
     points.sort(key=lambda p: p["connections"])

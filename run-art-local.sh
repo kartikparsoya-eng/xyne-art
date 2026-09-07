@@ -511,8 +511,24 @@ else
                    FROM scored
                  )
                  SELECT id, email, name, \"memberId\", \"workspaceId\", \"orgId\"
-                 FROM ranked WHERE workspace_rank = 1
-                 ORDER BY memberships DESC, id LIMIT $USERS;")"
+                 FROM ranked
+                 -- Round-robin ACROSS workspaces instead of hard-capping at one
+                 -- user per workspace. `workspace_rank = 1` discarded every
+                 -- identity beyond the first in each workspace, so --users N
+                 -- silently capped at the workspace COUNT: this sandbox has
+                 -- 1,977 users in 7 workspaces and the pool was 1. Every
+                 -- connection then authenticated as the same identity and piled
+                 -- onto one backend rate-limit bucket -- 16 connections
+                 -- produced 6,514 `429 Too Many Requests` on the custom-query
+                 -- transform, which reads as a capacity cliff but is a
+                 -- single-identity artifact. Production spreads N connections
+                 -- over N users, so the pool must too.
+                 --
+                 -- Ordering by workspace_rank FIRST preserves the original
+                 -- intent: N=1 still picks the single best-connected user, and
+                 -- larger N takes one from every workspace before taking a
+                 -- second from any.
+                 ORDER BY workspace_rank, memberships DESC, id LIMIT $USERS;")"
 fi
 [ -n "$ROWS" ] || { echo "ERROR: no suitable user found in $DB" >&2; exit 1; }
 
