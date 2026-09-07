@@ -1155,8 +1155,9 @@ if [ "$TELEMETRY" = "1" ]; then
   if [ "$METRICS_UP" != "1" ]; then
     echo "NOTE: G17 SKIPPED — no OTLP metrics endpoint serving the zero_sync_* contract" >&2
     echo "      at $ART_METRICS_URL (otel-collector sidecar not running?)." >&2
-    echo "      The cache's own :3200 is a DIFFERENT hand-rolled registry and cannot" >&2
-    echo "      satisfy this contract — pointing G17 at it yields false 'missing'." >&2
+    echo "      Rust has no pull endpoint any more (hand-rolled /metrics removed in" >&2
+    echo "      mono 204359376, 2026-09-07): like TS it is OTLP-push only, so the" >&2
+    echo "      collector is the ONLY place this contract can be checked." >&2
     TELEMETRY=0
   else
     # Only run when the endpoint answered: before, the NOTE printed and the
