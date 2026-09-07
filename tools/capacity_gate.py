@@ -67,7 +67,8 @@ def _run_point(path: str) -> dict | None:
 
 def drive_rung(target: str, auth_token: str | None, id_pool: str,
                conns: int, duration: int, extra: list[str], protocol: int,
-               tag: str, client_schema: str | None = None) -> str:
+               tag: str, client_schema: str | None = None,
+               auth_pool: str | None = None) -> str:
     """Run replay.py at one rung; return the report path."""
     out_dir = f"reports/capacity-{tag}-{conns}c"
     cmd = [sys.executable, "harness/replay.py",
@@ -79,6 +80,12 @@ def drive_rung(target: str, auth_token: str | None, id_pool: str,
         cmd += ["--auth-token", auth_token]
     if client_schema:
         cmd += ["--client-schema", client_schema]
+    if auth_pool:
+        # One identity per connection (replay.py round-robins the pool), the
+        # way prod spreads N connections over N users. With a single token
+        # every rung shares ONE backend rate-limit bucket on the custom-query
+        # transform and the resulting 429 storm reads as the knee.
+        cmd += ["--auth-pool", auth_pool]
     cmd += extra
     subprocess.run(cmd, check=False, timeout=duration + 120)
     runs = sorted(glob.glob(os.path.join(out_dir, "run-*.json")))
@@ -171,6 +178,11 @@ def main() -> int:
     ap.add_argument("--drive", action="store_true", help="invoke replay.py at each rung")
     ap.add_argument("--target", default=None)
     ap.add_argument("--auth-token", default=None)
+    ap.add_argument("--auth-pool", default=None,
+                    help="JSON [{token,userID},...]: connections round-robin "
+                         "across identities (replay.py --auth-pool), so a "
+                         "per-user backend rate limit cannot masquerade as "
+                         "the knee")
     ap.add_argument("--id-pool", default="harness/id-pool.json")
     ap.add_argument("--client-schema", default=None)
     ap.add_argument("--extra-param", action="append", default=[])
@@ -230,7 +242,7 @@ def main() -> int:
             def probe(conns: int):
                 rp = drive_rung(a.target, a.auth_token, a.id_pool, conns,
                                 a.duration, extra, a.protocol_version, tag,
-                                a.client_schema)
+                                a.client_schema, auth_pool=a.auth_pool)
                 paths.append(rp)
                 return _run_point(rp)
 
@@ -240,7 +252,7 @@ def main() -> int:
             for conns in [int(x) for x in a.ladder.split(",")]:
                 paths.append(drive_rung(a.target, a.auth_token, a.id_pool, conns,
                                         a.duration, extra, a.protocol_version, tag,
-                                        a.client_schema))
+                                        a.client_schema, auth_pool=a.auth_pool))
 
     points = [rp for rp in (_run_point(p) for p in paths) if rp is not None]
     points.sort(key=lambda p: p["connections"])
@@ -264,11 +276,27 @@ def main() -> int:
         for p in a.extra_param:
             extra += ["--extra-param", p]
         mpaths = []
-        for conns in [int(x) for x in a.ladder.split(",")]:
-            mpaths.append(drive_rung(a.mirror_target, a.auth_token, a.id_pool,
-                                     conns, a.duration, extra,
-                                     a.protocol_version, tag + "-mirror",
-                                     a.client_schema))
+        if a.ladder.strip().lower() == "auto":
+            # Same gallop+bisect against the reference build so the A/B
+            # compares two knees, not a knee against a fixed rung list.
+            print("== auto knee search (mirror) ==", flush=True)
+
+            def probe_mirror(conns: int):
+                rp = drive_rung(a.mirror_target, a.auth_token, a.id_pool, conns,
+                                a.duration, extra, a.protocol_version,
+                                tag + "-mirror", a.client_schema,
+                                auth_pool=a.auth_pool)
+                mpaths.append(rp)
+                return _run_point(rp)
+
+            search_knee(probe_mirror, a.search_start, a.search_max,
+                        a.search_tolerance, a.p95_threshold)
+        else:
+            for conns in [int(x) for x in a.ladder.split(",")]:
+                mpaths.append(drive_rung(a.mirror_target, a.auth_token, a.id_pool,
+                                         conns, a.duration, extra,
+                                         a.protocol_version, tag + "-mirror",
+                                         a.client_schema, auth_pool=a.auth_pool))
         mpoints = [rp for rp in (_run_point(p) for p in mpaths) if rp is not None]
         mpoints.sort(key=lambda p: p["connections"])
         if mpoints:
