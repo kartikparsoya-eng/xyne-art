@@ -344,10 +344,14 @@ PROM_FLAGS=()
 # rust cache exports its own registry on :3200 inside sandbox-net. With the
 # stale default G17 scraped nothing and reported "0/12 metrics checked" as an
 # ERROR, which reads like a rust regression rather than an unreachable URL.
+# The cache's own :3200 pull endpoint is GONE (mono: rust-syncer no longer ships
+# a hand-rolled Prometheus registry — TS never had one; it pushes OTLP only).
+# Both arms now export OTLP to the otel-collector, which renders Prometheus text
+# on :9464. Prefer the collector on sandbox-net, fall back to a host-local one.
 PROM_URL="http://localhost:9464/metrics"
-ZCACHE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ZCACHE" 2>/dev/null || true)
-if [ -n "$ZCACHE_IP" ] && curl -sf --connect-timeout 2 "http://${ZCACHE_IP}:3200/metrics" >/dev/null 2>&1; then
-  PROM_URL="http://${ZCACHE_IP}:3200/metrics"
+COLLECTOR_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' otel-collector 2>/dev/null || true)
+if [ -n "$COLLECTOR_IP" ] && curl -sf --connect-timeout 2 "http://${COLLECTOR_IP}:9464/metrics" >/dev/null 2>&1; then
+  PROM_URL="http://${COLLECTOR_IP}:9464/metrics"
 fi
 PROM_AVAILABLE=0
 if curl -sf --connect-timeout 2 "$PROM_URL" >/dev/null 2>&1; then
