@@ -663,6 +663,11 @@ def main() -> int:
                 f"unknown-signatures: {len(unknown)} new ERROR/WARN signature(s): "
                 + "; ".join(list(unknown)[:3]))
     report["signature_counts"] = {"total": len(all_sigs), "baseline": len(baseline), "unknown": len(unknown)}
+    # Keep the WHOLE list, not just the three the verdict line quotes: a
+    # 16-signature FAIL (stage 6, 2026-09-07) left 13 signatures unrecorded
+    # anywhere, so "were the logs healthy?" could not be answered after the
+    # container was recreated.
+    report["unknown_signatures"] = sorted(unknown)
 
     # --- G13b inverted gate: unrecognized ERROR/WARN => FAIL/WATCH. Additive;
     #     the HARD_BLOCKING/SELF_HEAL/WATCH behavior above is untouched. ---
