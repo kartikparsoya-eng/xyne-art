@@ -10,7 +10,8 @@ catches. This gate:
 
   1. opens N client connections with live desired queries (in-flight syncs)
   2. sends SIGTERM to the container (`docker kill -s TERM <name>`)
-  3. asserts each client receives a clean close (1001/1000) or a documented
+  3. asserts each client receives a clean close (1001/1000, or a status-less
+     close frame, 1005, as TS's `ws.close()` sends) or a documented
      reconnect-control message — NOT an abrupt TCP drop (1006)
   4. asserts the drain completes within --drain-budget-s (must be < the
      kube grace period) and the container exits 0
@@ -48,7 +49,17 @@ def rid() -> str:
 def client_outcomes(results: list, expected: int) -> tuple[dict[str, int], bool]:
     counts = {
         "abrupt": sum(r[1] == "closed" and r[2] == 1006 for r in results),
-        "clean": sum(r[1] == "closed" and r[2] in (1000, 1001) for r in results),
+        # 1005 = a close frame carrying NO status code (the websockets library
+        # reports it so). That is what `ws.close()` with no arguments sends and
+        # it is how TS zero-cache ends a drained connection (`Connection.close`
+        # -> `ws.close()`, no error frame). Measured 2026-09-09 with
+        # `run-art-local.sh --swap --drain` against the TS arm: 10/10 clients
+        # read "unnotified" under the 1000/1001-only rule. rust matched TS once
+        # d11e0f171 made its drain frame-less like `#cleanup()`; before that it
+        # sent Rehome frames, which is what this rule was written against. A
+        # status-less close is still the graceful close handshake, not the
+        # abrupt 1006 TCP drop this gate exists to catch, so it counts as clean.
+        "clean": sum(r[1] == "closed" and r[2] in (1000, 1001, 1005) for r in results),
         "controlled": sum(r[1] == "control" for r in results),
         "failed": sum(r[1] == "connect-failed" for r in results),
     }
